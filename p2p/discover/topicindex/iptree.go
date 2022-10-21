@@ -2,6 +2,7 @@ package topicindex
 
 import (
 	"fmt"
+	"math"
 	"net"
 )
 
@@ -52,7 +53,10 @@ func (it *ipTree) insert(ip net.IP) float64 {
 			*node = new(ipTreeNode)
 		}
 		n := *node
-		sum += n.counter
+		balanced := float64(it.root.counter) / math.Pow(2, float64(depth))
+		if float64(n.counter) > balanced {
+			sum++
+		}
 		n.counter++
 
 		if ipBit(ip, depth) {
@@ -74,7 +78,10 @@ func (it *ipTree) score(ip net.IP) float64 {
 			break
 		}
 		n := *node
-		sum += n.counter
+		balanced := float64(it.root.counter) / math.Pow(2, float64(depth))
+		if float64(n.counter) > balanced {
+			sum++
+		}
 
 		if ipBit(ip, depth) {
 			node = &n.left
@@ -123,7 +130,7 @@ func (it *ipTree) computeScore(sum int, additional int) float64 {
 	if c == 0 {
 		return 0
 	}
-	sc := float64(sum) / float64(c*int(it.bits))
+	sc := float64(sum) / float64(int(it.bits))
 	// fmt.Printf("score sum:%d count:%d sc:%f\n", sum, c, sc)
 	return sc
 }
