@@ -68,7 +68,7 @@ func (it *ipTree) insert(ip net.IP) float64 {
 		}
 		n.counter++
 	}
-	return it.computeScore(sum, 0)
+	return it.computeScore(sum)
 }
 
 // score computes the score that the addition of an IP would return.
@@ -93,7 +93,7 @@ func (it *ipTree) score(ip net.IP) float64 {
 			sum++
 		}
 	}
-	return it.computeScore(sum, 1)
+	return it.computeScore(sum)
 }
 
 // remove removes an IP from the tree.
@@ -131,7 +131,7 @@ func (it *ipTree) count() int {
 	return it.root.counter
 }
 
-func (it *ipTree) computeScore(sum int, additional int) float64 {
+func (it *ipTree) computeScore(sum int) float64 {
 	c := it.count()
 	if c == 0 {
 		return 0
