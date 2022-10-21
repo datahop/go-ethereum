@@ -30,8 +30,7 @@ import (
 
 // wait time computation constants.
 const (
-	occupancyExp   = 10
-	baseMultiplier = 30
+	occupancyExp = 10
 )
 
 // If a node has less than this time to wait, they will be accepted anyway.
