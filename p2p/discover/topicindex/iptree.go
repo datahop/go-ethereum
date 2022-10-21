@@ -21,7 +21,7 @@ func newIPTree(bits byte) *ipTree {
 	if bits != 32 && bits != 128 {
 		panic(fmt.Errorf("invalid ipTree bits %d", bits))
 	}
-	return &ipTree{nil, bits}
+	return &ipTree{new(ipTreeNode), bits}
 }
 
 func (it *ipTree) normIP(ip net.IP) net.IP {
@@ -48,22 +48,25 @@ func (it *ipTree) insert(ip net.IP) float64 {
 	ip = it.normIP(ip)
 	sum := 0
 	node := &it.root
+	root_counter := float64(it.root.counter)
+	it.root.counter++
+
 	for depth := byte(0); depth < it.bits; depth++ {
+		if ipBit(ip, depth) {
+			node = &(*node).left
+		} else {
+			node = &(*node).right
+		}
 		if *node == nil {
 			*node = new(ipTreeNode)
 		}
 		n := *node
-		balanced := float64(it.root.counter) / math.Pow(2, float64(depth))
+
+		balanced := root_counter / math.Pow(2, float64(depth+1))
 		if float64(n.counter) > balanced {
 			sum++
 		}
 		n.counter++
-
-		if ipBit(ip, depth) {
-			node = &n.left
-		} else {
-			node = &n.right
-		}
 	}
 	return it.computeScore(sum, 0)
 }
@@ -73,20 +76,21 @@ func (it *ipTree) score(ip net.IP) float64 {
 	ip = it.normIP(ip)
 	sum := 0
 	node := &it.root
+	root_counter := float64(it.root.counter)
+
 	for depth := byte(0); depth < it.bits; depth++ {
+		if ipBit(ip, depth) {
+			node = &(*node).left
+		} else {
+			node = &(*node).right
+		}
 		if *node == nil {
 			break
 		}
 		n := *node
-		balanced := float64(it.root.counter) / math.Pow(2, float64(depth))
+		balanced := root_counter / math.Pow(2, float64(depth+1))
 		if float64(n.counter) > balanced {
 			sum++
-		}
-
-		if ipBit(ip, depth) {
-			node = &n.left
-		} else {
-			node = &n.right
 		}
 	}
 	return it.computeScore(sum, 1)
@@ -96,7 +100,14 @@ func (it *ipTree) score(ip net.IP) float64 {
 func (it *ipTree) remove(ip net.IP) {
 	ip = it.normIP(ip)
 	node := &it.root
+	it.root.counter--
+
 	for depth := byte(0); depth < it.bits; depth++ {
+		if ipBit(ip, depth) {
+			node = &(*node).left
+		} else {
+			node = &(*node).right
+		}
 		if *node == nil {
 			return
 		}
@@ -109,11 +120,6 @@ func (it *ipTree) remove(ip net.IP) {
 			return
 		}
 
-		if ipBit(ip, depth) {
-			node = &n.left
-		} else {
-			node = &n.right
-		}
 	}
 }
 
@@ -126,12 +132,11 @@ func (it *ipTree) count() int {
 }
 
 func (it *ipTree) computeScore(sum int, additional int) float64 {
-	c := it.count() + additional
+	c := it.count()
 	if c == 0 {
 		return 0
 	}
 	sc := float64(sum) / float64(int(it.bits))
-	// fmt.Printf("score sum:%d count:%d sc:%f\n", sum, c, sc)
 	return sc
 }
 
