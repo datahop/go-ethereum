@@ -25,9 +25,9 @@ var ipv4TestOps = []treeAddOp{
 
 var ipv6TestOps = []treeAddOp{
 	{"fe80::716b:dafc:774e:a826", 0.0},
-	{"fe80::716b:dafc:774e:a827", 0.5},
-	{"fe80::716b:dafc:774e:a828", 0.651041666},
-	{"abc2:2345:7a7b:774e:a828:f184:ee25:4545", 0.01171875},
+	{"fe80::716b:dafc:774e:a827", 0.9921875},
+	{"fe80::716b:dafc:774e:a828", 0.96875},
+	{"abc2:2345:7a7b:774e:a828:f184:ee25:4545", 0.0078125},
 }
 
 func TestIPTreeInsert(t *testing.T) {
@@ -43,7 +43,7 @@ func TestIPTreeInsert(t *testing.T) {
 			}
 		}
 	})
-	/*t.Run("IPv6", func(t *testing.T) {
+	t.Run("IPv6", func(t *testing.T) {
 		it := newIPTree(128)
 		for i, add := range ipv6TestOps {
 			sc := it.insert(net.ParseIP(add.ip))
@@ -54,7 +54,7 @@ func TestIPTreeInsert(t *testing.T) {
 				t.Errorf("wrong count %d at op %d", c, i)
 			}
 		}
-	})*/
+	})
 }
 
 func TestIPTreeScore(t *testing.T) {
@@ -74,12 +74,12 @@ func TestIPTreeScore(t *testing.T) {
 			randomAdd(t, it)
 		}
 	})
-	/*t.Run("IPv6", func(t *testing.T) {
+	t.Run("IPv6", func(t *testing.T) {
 		it := newIPTree(128)
 		for i := 0; i < 1000; i++ {
 			randomAdd(t, it)
 		}
-	})*/
+	})
 }
 
 func TestIPTreeRemove(t *testing.T) {
