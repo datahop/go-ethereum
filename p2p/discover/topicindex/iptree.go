@@ -48,7 +48,7 @@ func (it *ipTree) insert(ip net.IP) float64 {
 	ip = it.normIP(ip)
 	sum := 0
 	node := &it.root
-	root_counter := float64(it.root.counter)
+	rootCounter := float64(it.root.counter)
 	it.root.counter++
 
 	for depth := byte(0); depth < it.bits; depth++ {
@@ -62,7 +62,7 @@ func (it *ipTree) insert(ip net.IP) float64 {
 		}
 		n := *node
 
-		balanced := root_counter / math.Pow(2, float64(depth+1))
+		balanced := rootCounter / math.Pow(2, float64(depth+1))
 		if float64(n.counter) > balanced {
 			sum++
 		}
@@ -76,7 +76,7 @@ func (it *ipTree) score(ip net.IP) float64 {
 	ip = it.normIP(ip)
 	sum := 0
 	node := &it.root
-	root_counter := float64(it.root.counter)
+	rootCounter := float64(it.root.counter)
 
 	for depth := byte(0); depth < it.bits; depth++ {
 		if ipBit(ip, depth) {
@@ -88,7 +88,8 @@ func (it *ipTree) score(ip net.IP) float64 {
 			break
 		}
 		n := *node
-		balanced := root_counter / math.Pow(2, float64(depth+1))
+
+		balanced := rootCounter / math.Pow(2, float64(depth+1))
 		if float64(n.counter) > balanced {
 			sum++
 		}
