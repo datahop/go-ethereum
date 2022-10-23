@@ -187,7 +187,7 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	regCount := tab.all.Len()
 
 	occupancy := 1.0 - (float64(regCount) / float64(tab.config.AdCacheSize))
-	occupancyScore := float64(tab.config.AdLifetime/time.Millisecond) / math.Pow(occupancy, occupancyExp)
+	occupancyScore := tab.config.AdLifetime.Seconds() / math.Pow(occupancy, occupancyExp)
 
 	topicMod := float64(tab.topicSize(t)) / float64(regCount+1)
 	ipMod := tab.wt.ipModifier(n)
