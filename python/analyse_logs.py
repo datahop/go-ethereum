@@ -749,12 +749,15 @@ def plot_storage_per_node_over_time(fig_dir, storage_df):
     lgd = axes.legend(loc=9, bbox_to_anchor=(0.5,-0.09), ncol=4)
     fig.savefig(fig_dir + 'storage_time.'+form,format=form, bbox_extra_artists=(lgd,), bbox_inches='tight')
 
-def plot_heatmap(plotname, fig_dir, storage_df):
-    fig, axes = plt.subplots(figsize=(10, 4))
-    storage_df = storage_df.set_index('timestamp')
-    plt.figure(figsize=(15,15)) # large figure to display all the nodes in the y axis
-    sns.heatmap(storage_df.T, cmap='plasma', xticklabels=60)
-    plt.savefig(fig_dir + plotname + '.'+form,format=form)
+def plot_heatmap(figname, fig_dir, df):
+    df = df.set_index('timestamp') 
+    # convert the df into one that computes frequencies of values
+    df_frequency = df.apply(pd.Series.value_counts, axis=1).fillna(0)
+    plt.figure(figsize=(15,10)) # large figure to display all the nodes in the y axis
+    s = sns.heatmap(df_frequency.T, cmap='plasma', xticklabels=60)
+    s.set(xlabel='Time (seconds)', ylabel='Frequency')
+    plt.title(figname)
+    plt.savefig(fig_dir + figname + '.'+form,format=form)
 
 def plot_ads_per_node_over_time(fig_dir, adverts_df):
     fig, axes = plt.subplots(figsize=(10, 4))
