@@ -708,22 +708,18 @@ def plot_waiting_time(fig_dir,msg_df):
     df['topic'] = df['topic'].astype(int)
     df['total_wtime'] = df['total_wtime'].div(60000)
     fig, axes = plt.subplots(figsize=(10, 4))
-    y = []
-    stds = []
+
     counter  = 0
     for topic, group in df.groupby('topic'):
-        print("##############")
-        print(topic)
         #y.append(group['total_wtime'].mean())
         #stds.append(group['total_wtime'].std())
         print(group['total_wtime'])
         axes.bar(int(counter), group['total_wtime'].mean())#, yerr = group['total_wtime'].std())
         counter += 1
-    #print(y)
-    #print(stds)
+
     #fig, ax = plt.subplots(figsize=(10, 4))
     #sns.violinplot(x='topic',y='total_wtime', data=df, ax = ax, cut = True)
-    print("Counter", counter)
+
     axes.set_xticklabels([])
     axes.set_ylabel("Average waiting time[a]")
     axes.set_xlabel("Topic")
