@@ -191,11 +191,10 @@ class Workload:
             try:
                 async with self.client.post(url, json=payload, timeout=timeout_cfg) as req:
                     return await req.json()
-            except aiohttp.ClientConnectionError as e:
-                last_error e
             except aiohttp.ClientError as e:
                 last_error = e
-                break # no retry
+                if not isinstance(e, aiohttp.ClientConnectionError):
+                    break # no retry since request was performed
 
         if show_errors:
             print('Node {} HTTP error (retries={}): {}'.format(node, retries, str(last_error)))
