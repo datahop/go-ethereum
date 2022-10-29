@@ -151,7 +151,6 @@ class Workload:
     config: dict
     network: Network
     out_dir: str
-
     zipf: TruncatedZipfDist
     client: aiohttp.ClientSession
     logs_file: io.IOBase
