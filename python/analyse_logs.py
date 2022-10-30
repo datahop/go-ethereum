@@ -60,33 +60,25 @@ def get_search_dist_df(config_path):
                 #not a json line
                 continue
             jsons = json.loads(line)
-
-            if('adlifetime' not in jsons):
+            
+            if not jsons['msg'].startswith('<< TOPICNODES/v5') and not jsons['msg'].startswith('<< NODES/v5'):
                 continue
-            msg_type = jsons['msg'].split(' ')[1]
-            if msg_type != 'TOPICNODES/v5' and msg_type != 'NODESv5':
-                continue
-            total = int(jsons['tot'])
-
-            in_out_s = jsons['msg'].split(' ')[0]
-            if(in_out_s != '<<'):
-                continue
-            ok = jsons['ok']
-            if (ok != 'true'):
-                continue
-
             searcher = node_id_index[jsons['id']]
             if searcher not in msg_count[registrar].keys():
                 msg_count[registrar][searcher] = 1
             else:
                 msg_count[registrar][searcher] = msg_count[registrar][searcher] + 1
-
-            if msg_count[registrar][searcher] != total:
-                continue
+                
+            total = int(jsons['tot'])
 
             if(registrar == searcher):
                 print('This should not happen - node is sending itself a REGCONFIRMATION: ', line)
-            del msg_count[registrar][searcher]
+            if msg_count[registrar][searcher] == total:
+                del msg_count[registrar][searcher]
+            else:
+                continue
+            if not jsons['msg'].startswith('<< TOPICNODES/v5'):
+                continue
             # parse time
             dt = parse(jsons['t'])
             unix_time = int(time.mktime(dt.timetuple()))
@@ -99,7 +91,7 @@ def get_search_dist_df(config_path):
 
     # Read the registration events in order
     while len(search_events_heap) > 0:
-        timestamp, registrar, searcher = heapq.heappop(reg_events_heap)
+        timestamp, registrar, searcher = heapq.heappop(search_events_heap)
 
         # the first event will have timestamp of 0
         if init_time is None:
@@ -754,7 +746,7 @@ def plot_heatmap(figname, fig_dir, df):
     # convert the df into one that computes frequencies of values
     df_frequency = df.apply(pd.Series.value_counts, axis=1).fillna(0)
     plt.figure(figsize=(15,10)) # large figure to display all the nodes in the y axis
-    s = sns.heatmap(df_frequency.T, cmap='plasma', xticklabels=60)
+    s = sns.heatmap(df_frequency.T, cmap='rocket_r', xticklabels=30)
     s.set(xlabel='Time (seconds)', ylabel='Frequency')
     plt.title(figname)
     plt.savefig(fig_dir + figname + '.'+form,format=form)
@@ -863,6 +855,7 @@ def create_dfs(out_dir):
     storage_df_heatmap.to_json(os.path.join(df_dir, 'storage_heatmap_df.json'))
     advert_df_heatmap.to_json(os.path.join(df_dir, 'advert_heatmap_df.json'))
 
+    print('Getting search df')
     search_df = get_search_dist_df(out_dir)
     search_df.to_json(os.path.join(df_dir, 'search_df.json'))
 
@@ -896,17 +889,26 @@ def plot_dfs(out_dir):
 
     plot_mean_waiting_time(fig_dir,msg_df)
 
-    print("Reading storage dfs")
+    print("Reading advert dfs")
     advert_dist_df = pd.read_json(os.path.join(df_dir, 'advert_dist_df.json'))
+    print("Reading storage dfs")
     storage_df = pd.read_json(os.path.join(df_dir, 'storage_df.json'))
 
     plot_ads(fig_dir, storage_df, advert_dist_df)
 
+    print("Reading storage heatmap df")
     storage_df_heatmap = pd.read_json(os.path.join(df_dir, 'storage_heatmap_df.json'))
     plot_heatmap('storage_heatmap', fig_dir, storage_df_heatmap)
-
-    #search_df = pd.read_json(os.path.join(df_dir, 'search_df.json'))
-    #plot_heatmap('search_heatmap', fig_dir, storage_df_heatmap)
+    
+    print("Reading advert heatmap df")
+    advert_df_heatmap = pd.read_json(os.path.join(df_dir, 'advert_heatmap_df.json'))
+    plot_heatmap('advertisement_heatmap', fig_dir, storage_df_heatmap)
+    
+    print("Reading search heatmap df")
+    search_df = pd.read_json(os.path.join(df_dir, 'search_df.json'))
+    plot_heatmap('search_heatmap', fig_dir, search_df)
+    
+    print('Done plotting...')
     plt.close()
 
 
