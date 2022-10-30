@@ -6,6 +6,8 @@ import subprocess
 import time
 import glob
 
+import asyncio
+from asyncio.subprocess import create_subprocess_exec
 
 # This is the list of config parameters supported by cmd/devp2p.
 run_param = {
@@ -44,6 +46,9 @@ class Network:
     def stop(self):
         pass
 
+    def node_udp_endpoint(self, node: int):
+        raise NotImplementedError
+
 
 class NetworkLocal(Network):
     proc = []
@@ -51,11 +56,9 @@ class NetworkLocal(Network):
     node_env = os.environ.copy()
     node_env['GOMAXPROCS'] = '1'
 
-    # node_enr returns the ENR of node n.
-    def node_enr(self, path, n):
-        port = self.config['udpBasePort'] + n
-        url = os.popen("./devp2p key to-enr --ip 127.0.0.1 --tcp 0 --udp "+str(port)+" "+path+"keys/node-"+str(n)+".key").read().split('\n')
-        return url[0]
+    def node_udp_endpoint(self, node: int):
+        port = self.config['udpBasePort'] + node
+        return ('127.0.0.1', port)
 
     # node_api_url returns the RPC URL of node n.
     def node_api_url(self, n):
@@ -122,12 +125,10 @@ class NetworkDocker(Network):
             os.system('docker network rm ' + network_id)
         self.networks = []
 
-    # get_node_url returns the ENR of node n.
-    def node_enr(self, path, n):
+    def node_udp_endpoint(self, node: int):
         ip = self._node_ip(n)
         port = self.config['udpBasePort']
-        url = os.popen("./devp2p key to-enr --ip " + ip + " --tcp 0 --udp "+str(port)+" "+path+"keys/node-"+str(1)+".key").read().split('\n')
-        return url[0]
+        return (ip, port)
 
     # node_api_url returns the RPC URL of node n.
     def node_api_url(self, n):
@@ -223,31 +224,66 @@ class NetworkDocker(Network):
         #    print(p.stderr)
         #    p.check_returncode()
 
+# _async_iter_concurrently runs fn over items. The function must return a
+# coroutine, which will be scheduled as a task.
+def _async_iter_concurrently(items, fn, concurrency=os.cpu_count()):
+    assert asyncio.iscoroutinefunction(fn)
 
-def nodekey_to_id(keyfile):
-    argv = ["./devp2p", "key", "to-id", keyfile]
-    p = subprocess.run(argv, capture_output=True, text=True)
-    p.check_returncode()
-    return p.stdout.split('\n')[0]
+    tasks = set()
+    async def wait_and_check_exn(tasks, **kwargs):
+        done, tasks = await asyncio.wait(tasks, **kwargs)
+        for t in done:
+            if t.exception():
+                raise t.exception()
 
-# create_nodeid_index writes a node_id -> node index file in the logs directory.
-def create_nodeid_index(config_path):
+    async def iterate():
+        for item in items:
+            if len(tasks) >= concurrency:
+                await wait_and_check_exn(tasks, return_when=asyncio.FIRST_COMPLETED)
+            t = asyncio.create_task(fn(item))
+            tasks.add(t)
+        # wait for all remaining tasks to finish
+        await wait_and_check_exn(tasks)
+
+    asyncio.run(iterate())
+
+# _call_process runs the given command and returns its output.
+# The process must exit with code zero.
+async def _call_process(cmd: str, *args):
+    proc = await create_subprocess_exec(cmd, *args, stdout=asyncio.subprocess.PIPE)
+    output, _ = await proc.communicate()
+    if proc.returncode != 0:
+        raise Exception(cmd + ' exited with non-zero code ' + str(proc.returncode))
+    return output.decode('utf-8')
+
+
+# create_nodeid_index writes a node_id -> node index file in the keys directory.
+def create_nodeid_index(config_path: str):
     keys_dir = os.path.join(config_path, "keys")
     if not os.path.isdir(keys_dir):
         raise FileNotFoundError("keys/ directory does not exist: " + keys_dir)
 
-    print("Creating node ID index...")
-    index = {}
-    for key_file in glob.glob(os.path.join(keys_dir, "node-*.key")):
-        node = int(os.path.basename(key_file).split('-')[1].split('.')[0])
-        node_id = nodekey_to_id(key_file)
-        index[node_id] = node
+    # This generator returns all key files in keys_dir:
+    def key_files():
+        for file in glob.glob(os.path.join(keys_dir, "node-*.key")):
+            node = int(os.path.basename(file).split('-')[1].split('.')[0])
+            yield (node, file)
 
+    # Create the index by invoking the devp2p tool for each key file.
+    index = {}
+    async def key_to_id(tuple):
+        node, keyfile = tuple
+        output = await _call_process("./devp2p", "key", "to-id", keyfile)
+        node_id = output.split('\n')[0]
+        index[node] = node_id
+
+    _async_iter_concurrently(key_files(), key_to_id)
+
+    # Write the index.
     index_file = os.path.join(keys_dir, "node_id_index.json")
     with open(index_file, 'w') as f:
         json.dump(index, f)
         f.write("\n")
-
     return index
 
 def load_nodeid_index(config_path):
@@ -260,9 +296,31 @@ def load_nodeid_index(config_path):
     with open(index_file, 'r') as f:
         return json.load(f)
 
+# create_enrs turns node key files into ENRs.
+def create_enrs(network: Network, config_path: str, n: int):
+    result = []
 
-def create_enrs(network: Network, config_path, n: int):
-    return [ network.node_enr(config_path, node) for node in range(1, n+1) ]
+    async def key_to_enr(node: int):
+        keyfile = os.path.join(config_path, 'keys', 'node-{}.key'.format(node))
+        ip, port = network.node_udp_endpoint(node)
+        args = ['key', 'to-enr', '--ip', ip, '--udp', str(port), keyfile]
+        output = await _call_process('./devp2p', *args)
+        result.append(output.split('\n')[0])
+
+    _async_iter_concurrently(range(1, n+1), key_to_enr)
+    return result
+
+# make_keys creates n node keys.
+def make_keys(config_path: str, n: int):
+    keys_dir = os.path.join(config_path, "keys")
+    os.makedirs(keys_dir, exist_ok=True)
+
+    async def generate_key(node: int):
+        file = os.path.join(keys_dir, "node-" + str(node) + ".key")
+        await _call_process('./devp2p', 'key', 'generate', file)
+
+    _async_iter_concurrently(range(1, n+1), generate_key)
+
 
 def select_bootnodes(enrs):
     return [ enrs[0] ] + random.sample(enrs[1:], min(len(enrs)//3, 20))
@@ -270,8 +328,13 @@ def select_bootnodes(enrs):
 def start_nodes(network: Network, config_path: str, params: dict):
     n = params['nodes']
 
+    print("Building keys...")
+    make_keys(config_path, params['nodes'])
+
     print("Creating ENRs...")
     enrs = create_enrs(network, config_path, n)
+
+    print("Creating node ID index...")
     create_nodeid_index(config_path)
 
     print("Starting", n, "nodes...")
@@ -280,7 +343,7 @@ def start_nodes(network: Network, config_path: str, params: dict):
         network.create_docker_networks(n)
         os.system("sudo iptables --flush DOCKER-ISOLATION-STAGE-1")
 
-    for i in range(1,n+1):
+    for i in range(1, n+1):
         keyfile = os.path.join(config_path, "keys", "node-"+str(i)+".key")
         with open(keyfile, "r") as f:
             nodekey = f.read()
@@ -289,18 +352,8 @@ def start_nodes(network: Network, config_path: str, params: dict):
 
         if isinstance(network, NetworkDocker):
             network.config_network(i)
+
     print("Nodes started")
-
-# make_keys creates all node keys.
-def make_keys(config_path, n):
-    print("Building keys...")
-    result = os.makedirs(config_path+"keys/",exist_ok=True)
-
-    for i in range(1,n+1):
-        file=config_path+"keys/node-"+str(i)+".key"
-        if not os.path.exists(file):
-            result = os.system("./devp2p key generate "+file)
-            assert(result == 0)
 
 def filter_params(params):
     result={}
@@ -328,6 +381,5 @@ def write_experiment(config_path, params):
 
 def run_testbed(network: Network, config_path, params):
     network.build()
-    make_keys(config_path, params['nodes'])
     write_experiment(config_path, params)
     start_nodes(network, config_path, params)
