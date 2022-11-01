@@ -840,7 +840,6 @@ def create_dfs(out_dir):
 
     print('Computing msg_df')
     msg_df = get_msg_df(out_dir, op_df)
-    msg_df = msg_df.dropna(subset=['opid'])
     msg_df.to_csv(os.path.join(df_dir, 'msg_df.json'))
     print('Written to msg_df.json')
 
