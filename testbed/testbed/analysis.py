@@ -1,7 +1,6 @@
 import json
 import os
 import os.path
-import sys
 from dateutil.parser import parse
 import pandas as pd
 import hashlib
@@ -11,6 +10,8 @@ import seaborn as sns
 import heapq # to sort register removal events
 import time
 import concurrent.futures
+
+from testbed.network import load_nodeid_index
 
 import matplotlib
 matplotlib.use('Agg')
@@ -26,13 +27,7 @@ matplotlib.rc('font', **font)
 matplotlib.rcParams['pdf.fonttype'] = 42
 matplotlib.rcParams['ps.fonttype'] = 42
 
-from python.network import load_nodeid_index
-
 form = 'pdf'
-
-#config_path = "./discv5-test"
-#config_path = "./discv5_test_logs/benign/_nodes-100_topic-1_regBucketSize-10_searchBucketSize-3_adLifetimeSeconds-60_adCacheSize-500_rpcBasePort-20200_udpBasePort-30200_returnedNodes-5"
-config_path = "../discv5-test"
 
 def get_search_dist_df(config_path):
     log_path = os.path.join(config_path, 'logs')
@@ -60,7 +55,7 @@ def get_search_dist_df(config_path):
                 #not a json line
                 continue
             jsons = json.loads(line)
-            
+
             if not jsons['msg'].startswith('<< TOPICNODES/v5') and not jsons['msg'].startswith('<< NODES/v5'):
                 continue
             searcher = node_id_index[jsons['id']]
@@ -68,7 +63,7 @@ def get_search_dist_df(config_path):
                 msg_count[registrar][searcher] = 1
             else:
                 msg_count[registrar][searcher] = msg_count[registrar][searcher] + 1
-                
+
             total = int(jsons['tot'])
 
             if(registrar == searcher):
@@ -480,13 +475,13 @@ def assign_missing_op_info(rows: list, op_info: dict):
 
 def parse_msg_logs(fname: str, topic_mapping: dict, op_info: dict, node_id_index: dict):
     rows = []
-    def process_message(node_id: int, jsons: dict):
+    def process_message(node: int, jsons: dict):
          msg = jsons['msg']
          if not msg.startswith('>> '):
              return # it's not a message sent between peers
 
          row = {
-             'node_id': node_id,
+             'node_id': node,
              'peer_id': node_id_index[jsons['id']],
              'timestamp': parse(jsons['t']),
              'msg_type': msg.split(' ')[1].split(':')[0],
@@ -517,7 +512,7 @@ def parse_msg_logs(fname: str, topic_mapping: dict, op_info: dict, node_id_index
          rows.append(row)
 
     fname_base = os.path.basename(fname) # node-10.log
-    node_id = fname_base.split('-')[1].split('.')[0]
+    node_id = int(fname_base.split('-')[1].split('.')[0])
     print("Reading", fname_base)
     with open(fname, 'r') as f:
         for line in f:
@@ -742,7 +737,7 @@ def plot_storage_per_node_over_time(fig_dir, storage_df):
     fig.savefig(fig_dir + 'storage_time.'+form,format=form, bbox_extra_artists=(lgd,), bbox_inches='tight')
 
 def plot_heatmap(figname, fig_dir, df):
-    df = df.set_index('timestamp') 
+    df = df.set_index('timestamp')
     # convert the df into one that computes frequencies of values
     df_frequency = df.apply(pd.Series.value_counts, axis=1).fillna(0)
     plt.figure(figsize=(15,10)) # large figure to display all the nodes in the y axis
@@ -898,28 +893,19 @@ def plot_dfs(out_dir):
     print("Reading storage heatmap df")
     storage_df_heatmap = pd.read_json(os.path.join(df_dir, 'storage_heatmap_df.json'))
     plot_heatmap('storage_heatmap', fig_dir, storage_df_heatmap)
-    
+
     print("Reading advert heatmap df")
     advert_df_heatmap = pd.read_json(os.path.join(df_dir, 'advert_heatmap_df.json'))
     plot_heatmap('advertisement_heatmap', fig_dir, storage_df_heatmap)
-    
+
     print("Reading search heatmap df")
     search_df = pd.read_json(os.path.join(df_dir, 'search_df.json'))
     plot_heatmap('search_heatmap', fig_dir, search_df)
-    
+
     print('Done plotting...')
     plt.close()
 
 
-def analyse(out_dir):
+def analyse(out_dir: str):
     create_dfs(out_dir)
     plot_dfs(out_dir)
-
-def main():
-    directory = "../discv5-test"
-    if len(sys.argv) > 1:
-        directory = sys.argv[1]
-    analyse(directory)
-
-if __name__ == "__main__":
-    main()

@@ -4,15 +4,15 @@ import time
 import hashlib
 import traceback
 import os.path
-import io
 import functools
 
+import numpy as np
 import asyncio
 import aiohttp
 
-import numpy as np
+from typing import IO
 
-from python.network import Network, NetworkLocal
+from testbed.network import Network
 
 ZIPF_EXPONENT = 1.0
 REQUEST_CONCURRENCY = 128
@@ -124,7 +124,7 @@ class TruncatedZipfDist(DiscreteDist):
 
 
 OP_ID = 100
-def gen_op_id():
+def gen_op_id() -> int:
     global OP_ID
     OP_ID += 1
     return OP_ID
@@ -133,16 +133,16 @@ def gen_op_id():
 def get_current_time_msec():
     return round(time.time() * 1000)
 
-def get_topic_digest(topicStr):
-    topic_digest = hashlib.sha256(topicStr.encode('utf-8')).hexdigest()
-    # json cannot unmarshal hex string without 0x so adding below
+def get_topic_digest(topic: str) -> str:
+    topic_digest = hashlib.sha256(topic.encode('utf-8')).hexdigest()
+    # json cannot unmarshal hex string without 0x so adding below
     topic_digest = '0x' + topic_digest
     return topic_digest
 
-def open_logs(out_dir):
+def open_logs(out_dir: str) -> IO[str]:
     return open(os.path.join(out_dir, "logs", "logs.json"), 'a')
 
-def rpc(method, *args):
+def rpc(method: str, *args) -> dict:
     return {"method": method, "params": args, "jsonrpc": "2.0", "id": 1}
 
 
@@ -153,9 +153,9 @@ class Workload:
     out_dir: str
     zipf: TruncatedZipfDist
     client: aiohttp.ClientSession
-    logs_file: io.IOBase
+    logs_file: IO[str]
 
-    def __init__(self, network, config, out_dir):
+    def __init__(self, network: Network, config: dict, out_dir: str):
         self.config = config
         self.network = network
         self.out_dir = out_dir
@@ -201,7 +201,7 @@ class Workload:
         return None
 
     # _write_event appends an event to logs.json.
-    def _write_event(self, obj):
+    def _write_event(self, obj: dict):
         json.dump(obj, self.logs_file)
         self.logs_file.write('\n')
         self.logs_file.flush()
@@ -347,7 +347,7 @@ class Workload:
             self._write_event(resp)
 
 
-async def _run_workload(network: Network, params: dict, out_dir):
+async def _run_workload(network: Network, params: dict, out_dir: str):
     async with Workload(network, params, out_dir) as w:
         await w.wait_for_nodes_ready()
 
@@ -363,5 +363,5 @@ async def _run_workload(network: Network, params: dict, out_dir):
         await w.search_topics(node_to_topic)
 
 
-def run_workload(network: Network, params, out_dir):
+def run(network: Network, params: dict, out_dir: str):
     asyncio.run(_run_workload(network, params, out_dir))

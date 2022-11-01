@@ -4,13 +4,11 @@ import sys
 from pprint import pformat
 import os
 import atexit
-
-from python.header import *
-from python.network import *
-import python.workload_gen as workload_gen
-import python.analyse_logs as analyse_logs
-
 import argparse
+
+from testbed.header import *
+from testbed.network import *
+from testbed import workload, analysis
 
 def parseArguments():
     parser = argparse.ArgumentParser()
@@ -44,7 +42,7 @@ def load_config_file(file):
 
     return config
 
-def create_result_directory(cliargs: argparse.Namespace, params: dict,attack):
+def create_result_directory(cliargs: argparse.Namespace, params: dict, attack):
     if cliargs.name:
         dir_base = cliargs.name
     elif attack:
@@ -62,14 +60,16 @@ def run_it(network: Network, cliargs: argparse.Namespace, params: dict, attack=F
 
     run_testbed(network, out_dir, params)
 
-    workload_gen.run_workload(network, params, out_dir)
+    workload.run(network, params, out_dir)
     print("Workload done.")
     network.stop()
 
     if cliargs.analysis:
-        analyse_logs.analyse(out_dir)
+        analysis.analyse(out_dir)
 
-def main(args) -> int:
+def main():
+    args = parseArguments()
+
     network = NetworkLocal()
     if args.docker:
         network = NetworkDocker()
@@ -109,7 +109,5 @@ def main(args) -> int:
                 already_run.add(pformat(params))
                 run_it(network, args, params, attack=is_attack)
 
-
 if __name__ == '__main__':
-    args = parseArguments()
-    sys.exit(main(args))
+    main()
