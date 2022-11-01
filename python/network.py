@@ -30,7 +30,7 @@ MIN_LATENCY=2
 MAX_LATENCY=40
 
 class Network:
-    config = {}
+    config: dict = {}
 
     def __init__(self, config=network_config_defaults):
         assert isinstance(config, dict)
@@ -47,11 +47,23 @@ class Network:
         pass
 
     def node_udp_endpoint(self, node: int):
+        """Returns the UDP endpoint of a node."""
+        raise NotImplementedError
+
+    def node_api_url(self, node: int):
+        """Returns the URL of the RPC server of a node."""
+        raise NotImplementedError
+
+    def start_node(self, node: int, bootnodes=[], nodekey=None, config_path=None):
+        """Spawns a node.
+
+        The 'nodekey' and 'config_path' keyword arguments are required.
+        """
         raise NotImplementedError
 
 
 class NetworkLocal(Network):
-    proc = []
+    proc: list[subprocess.Popen] = []
 
     node_env = os.environ.copy()
     node_env['GOMAXPROCS'] = '1'
@@ -67,12 +79,12 @@ class NetworkLocal(Network):
         url = 'http://127.0.0.1:' + str(port)
         return url
 
-    def start_node(self, n: int, bootnodes=[], nodekey=None, config_path=None):
+    def start_node(self, node: int, bootnodes=[], nodekey=None, config_path=None):
         assert nodekey is not None
         assert config_path is not None
 
-        port = self.config['udpBasePort'] + n
-        rpc = self.config['rpcBasePort'] + n
+        port = self.config['udpBasePort'] + node
+        rpc = self.config['rpcBasePort'] + node
         nodeflags = [
             "--bootnodes", ','.join(bootnodes),
             "--nodekey", nodekey,
@@ -80,15 +92,17 @@ class NetworkLocal(Network):
             "--rpc", "127.0.0.1:"+str(rpc),
             "--config", os.path.join(config_path, "config.json"),
         ]
-        logfile = os.path.join(config_path, "logs", "node-"+str(n)+".log")
+        logfile = os.path.join(config_path, "logs", "node-"+str(node)+".log")
         logflags = ["--verbosity", "5", "--log.json", "--log.file", logfile]
         argv = ["./devp2p", *logflags, "discv5", "listen", *nodeflags]
 
-        print("Starting node", str(n))
+        print("Starting node", str(node))
         p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=None, env=self.node_env)
         self.proc.append(p)
 
     def stop(self):
+        super().stop()
+
         if self.proc: print('Stopping network')
         for p in self.proc:
             p.terminate()
@@ -98,8 +112,8 @@ class NetworkLocal(Network):
 
 
 class NetworkDocker(Network):
-    containers = []
-    networks = []
+    containers: list[str] = []
+    networks: list[str] = []
 
     def build(self):
         super().build()
@@ -126,7 +140,7 @@ class NetworkDocker(Network):
         self.networks = []
 
     def node_udp_endpoint(self, node: int):
-        ip = self._node_ip(n)
+        ip = self._node_ip(node)
         port = self.config['udpBasePort']
         return (ip, port)
 
@@ -136,29 +150,30 @@ class NetworkDocker(Network):
         ip = self._node_ip(n)
         return "http://" + ip + ":" + str(port)
 
-    def start_node(self, n: int, bootnodes=[], nodekey=None, config_path=None):
+    def start_node(self, node: int, bootnodes=[], nodekey=None, config_path=None):
         assert nodekey is not None
         assert config_path is not None
 
         # create node command line
         port = self.config['udpBasePort']
         rpc = self.config['rpcBasePort']
+        ip = self._node_ip(node)
         nodeflags = [
             "--bootnodes", ','.join(bootnodes),
             "--nodekey", nodekey,
-            "--addr", self._node_ip(n)+':'+str(port),
-            "--rpc", self._node_ip(n)+':'+str(rpc),
+            "--addr", ip+':'+str(port),
+            "--rpc", ip+':'+str(rpc),
             "--config", "/go-ethereum/discv5-test/config.json",
         ]
-        logfile = "/go-ethereum/discv5-test/logs/node-"+str(n)+".log"
+        logfile = "/go-ethereum/discv5-test/logs/node-"+str(node)+".log"
         logflags = ["--verbosity", "5", "--log.json", "--log.file", logfile]
         node_args = [*logflags, "discv5", "listen", *nodeflags]
 
         # start the docker container
         argv = [
             "docker", "run", "-d",
-            "--name", "node"+str(n),
-            "--network", self._node_network_name(n),
+            "--name", "node"+str(node),
+            "--network", self._node_network_name(node),
             "--cap-add", "NET_ADMIN",
             "--mount", "type=bind,source="+config_path+",target=/go-ethereum/discv5-test",
             "devp2p", *node_args,
@@ -169,12 +184,12 @@ class NetworkDocker(Network):
             p.check_returncode()
 
         container_id = p.stdout.split('\n')[0]
-        print('started node', n, 'container:', container_id)
+        print('Started node', node, 'container:', container_id)
         self.containers.append(container_id)
         #self._config_network(n)
 
-    def create_docker_networks(self, nodes):
-        for node in range(1,nodes+1):
+    def create_docker_networks(self, n: int):
+        for node in range(1, n+1):
             network = self._node_network_name(node)
             prefix = self._node_ip_prefix(node)
             subnet = prefix + '.0/24'
@@ -192,13 +207,13 @@ class NetworkDocker(Network):
             else:
                 self.networks.append(p.stdout.split('\n')[0])
 
-    def _node_network_name(self, node):
+    def _node_network_name(self, node: int):
         return 'node' + str(node) + '-network'
 
-    def _node_ip(self, node):
+    def _node_ip(self, node: int):
         return self._node_ip_prefix(node) + '.2'
 
-    def _node_ip_prefix(self, node):
+    def _node_ip_prefix(self, node: int):
         IP1=172
         IP2=20
         IP3=0
@@ -213,7 +228,7 @@ class NetworkDocker(Network):
         ip=str(IP1)+"."+str(IP2)+"."+str(IP3)
         return ip
 
-    def config_network(self, node):
+    def config_network(self, node: int):
         latency = random.randint(MIN_LATENCY,MAX_LATENCY)
         subprocess.Popen("docker exec node"+str(node)+" sh -c 'tc qdisc add dev eth0 root netem delay "+str(latency)+"ms'", stdout=subprocess.DEVNULL, stderr=None,shell=True)
 
@@ -258,7 +273,7 @@ async def _call_process(cmd: str, *args):
 
 
 # create_nodeid_index writes a node_id -> node index file in the keys directory.
-def create_nodeid_index(config_path: str):
+def create_nodeid_index(config_path: str) -> dict[str, int]:
     keys_dir = os.path.join(config_path, "keys")
     if not os.path.isdir(keys_dir):
         raise FileNotFoundError("keys/ directory does not exist: " + keys_dir)
@@ -275,7 +290,7 @@ def create_nodeid_index(config_path: str):
         node, keyfile = tuple
         output = await _call_process("./devp2p", "key", "to-id", keyfile)
         node_id = output.split('\n')[0]
-        index[node] = node_id
+        index[node_id] = node
 
     _async_iter_concurrently(key_files(), key_to_id)
 
@@ -286,11 +301,14 @@ def create_nodeid_index(config_path: str):
         f.write("\n")
     return index
 
-def load_nodeid_index(config_path):
+# load_nodeid_index reads the node_id->node index file or creates
+# it when it is not present.
+def load_nodeid_index(config_path) -> dict[str, int]:
     keys_dir = os.path.join(config_path, "keys")
     index_file = os.path.join(keys_dir, "node_id_index.json")
 
     if not os.path.isfile(index_file):
+        print('Missing node ID index, creating it now...')
         return create_nodeid_index(config_path)
 
     with open(index_file, 'r') as f:
