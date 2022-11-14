@@ -479,9 +479,11 @@ def parse_msg_logs(fname: str, topic_mapping: dict, op_info: dict, node_id_index
          msg = jsons['msg']
          if not msg.startswith('>> '):
              return # it's not a message sent between peers
-
+         id_node_index = {val: key for (key, val) in node_id_index.items()}
          row = {
+             'real_node_id': id_node_index[node],
              'node_id': node,
+             'real_peer_id': jsons['id'],
              'peer_id': node_id_index[jsons['id']],
              'timestamp': parse(jsons['t']),
              'msg_type': msg.split(' ')[1].split(':')[0],
@@ -716,7 +718,9 @@ def plot_waiting_time(fig_dir,msg_df):
 def plot_times_registered(fig_dir, msg_df):
     # consider only final REGTOPIC message
     df = msg_df.dropna(subset=['ok', 'topic', 'total_wtime'], inplace=False)
+    print(df)
     df = df.groupby('peer_id')
+    
 
     fig, axes = plt.subplots(figsize=(10, 4))
     df['ok'].value_counts().plot(ax=axes, kind='bar')
@@ -852,6 +856,8 @@ def create_dfs(out_dir):
     print('Getting search df')
     search_df = get_search_dist_df(out_dir)
     search_df.to_json(os.path.join(df_dir, 'search_df.json'))
+    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    print(msg_df)
 
 # plot_dfs loads and creates plots out of the analysis data frames.
 def plot_dfs(out_dir):
@@ -862,26 +868,28 @@ def plot_dfs(out_dir):
     if not os.path.exists(fig_dir):
         os.mkdir(fig_dir)
 
-    plot_operation_returned(fig_dir,op_df)
+    #plot_operation_returned(fig_dir,op_df)
 
-    plot_search_times(fig_dir,op_df)
+    #plot_search_times(fig_dir,op_df)
 
     print("Reading msg df")
     msg_df = pd.read_csv(os.path.join(df_dir, 'msg_df.json'))
 
-    plot_msg_operation(fig_dir, msg_df)
 
-    plot_msg_topic(fig_dir,msg_df)
+    #plot_msg_operation(fig_dir, msg_df)
 
-    plot_times_discovered(fig_dir,op_df)
+    #plot_msg_topic(fig_dir,msg_df)
+
+    #plot_times_discovered(fig_dir,op_df)
 
     plot_times_registered(fig_dir, msg_df)
 
-    plot_search_results(fig_dir,op_df)
+    #plot_search_results(fig_dir,op_df)
 
-    plot_waiting_time(fig_dir,msg_df)
+    #plot_waiting_time(fig_dir,msg_df)
 
-    plot_mean_waiting_time(fig_dir,msg_df)
+    #plot_mean_waiting_time(fig_dir,msg_df)
+    quit()
 
     print("Reading advert dfs")
     advert_dist_df = pd.read_json(os.path.join(df_dir, 'advert_dist_df.json'))
@@ -908,4 +916,4 @@ def plot_dfs(out_dir):
 
 def analyse(out_dir: str):
     create_dfs(out_dir)
-    plot_dfs(out_dir)
+    #plot_dfs(out_dir)
