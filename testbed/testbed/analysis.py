@@ -4,7 +4,7 @@ import os.path
 from dateutil.parser import parse
 import pandas as pd
 import hashlib
-import numpy
+import math
 
 import seaborn as sns
 import heapq # to sort register removal events
@@ -29,13 +29,17 @@ matplotlib.rcParams['ps.fonttype'] = 42
 
 form = 'pdf'
 
+topic_mapping = {} #reverse engineer the topic hash
+for i in range(1, 10):
+    topic_mapping[hashlib.sha256(('t'+str(i)).encode('utf-8')).hexdigest()] = i
+reversed_topic_mapping = {val: key for (key, val) in topic_mapping.items()}
+
+
+
 def get_search_dist_df(config_path):
+    global topic_mapping
     log_path = os.path.join(config_path, 'logs')
     node_id_index = load_nodeid_index(config_path)
-
-    topic_mapping = {} #reverse engineer the topic hash
-    for i in range(1, 1000):
-        topic_mapping[hashlib.sha256(('t'+str(i)).encode('utf-8')).hexdigest()] = i
 
     search_events_heap = []
     nodes = set()
@@ -125,12 +129,10 @@ def get_search_dist_df(config_path):
     return search_df
 
 def get_storage_and_advertisement_dist_for_heatmap(config_path):
+    global topic_mapping
     log_path = os.path.join(config_path, 'logs')
     node_id_index = load_nodeid_index(config_path)
 
-    topic_mapping = {} #reverse engineer the topic hash
-    for i in range(1, 1000):
-        topic_mapping[hashlib.sha256(('t'+str(i)).encode('utf-8')).hexdigest()] = i
     ad_expiry_heap = []
     reg_events_heap = []
     nodes = set()
@@ -272,12 +274,10 @@ def get_storage_and_advertisement_dist_for_heatmap(config_path):
 
 
 def get_storage_and_advertisement_dist_df(config_path):
+    global topic_mapping
     log_path = os.path.join(config_path, 'logs')
     node_id_index = load_nodeid_index(config_path)
 
-    topic_mapping = {} #reverse engineer the topic hash
-    for i in range(1, 1000):
-        topic_mapping[hashlib.sha256(('t'+str(i)).encode('utf-8')).hexdigest()] = i
     ad_expiry_heap = []
     reg_events_heap = []
     nodes = set()
@@ -420,12 +420,9 @@ def get_storage_and_advertisement_dist_df(config_path):
 
 
 def get_msg_df(config_path, op_df):
+    global topic_mapping
     log_path = os.path.join(config_path, "logs")
     node_id_index = load_nodeid_index(config_path)
-
-    topic_mapping = {} #reverse engineer the topic hash
-    for i in range(1, 100):
-        topic_mapping[hashlib.sha256(('t'+str(i)).encode('utf-8')).hexdigest()] = i
 
     op_info = {}
     for opid in set([i for i in op_df['opid']]):
@@ -468,20 +465,22 @@ def assign_missing_op_info(rows: list, op_info: dict):
             if req in mapping:
                 op = mapping[req]
                 row['opid'] = op
-                row['topic'] = op_info[op]['topic']
+                row['topic'] = int(op_info[op]['topic'])
+                row['real_topic'] = reversed_topic_mapping[int(op_info[op]['topic'])]
                 row['op_type'] = op_info[op]['op_type']
     return rows
 
 
 def parse_msg_logs(fname: str, topic_mapping: dict, op_info: dict, node_id_index: dict):
     rows = []
+    reversed_node_id_index = {val: key for (key, val) in node_id_index.items()}
+
     def process_message(node: int, jsons: dict):
          msg = jsons['msg']
          if not msg.startswith('>> '):
              return # it's not a message sent between peers
-         id_node_index = {val: key for (key, val) in node_id_index.items()}
          row = {
-             'real_node_id': id_node_index[node],
+             'real_node_id': reversed_node_id_index[node],
              'node_id': node,
              'real_peer_id': jsons['id'],
              'peer_id': node_id_index[jsons['id']],
@@ -501,7 +500,8 @@ def parse_msg_logs(fname: str, topic_mapping: dict, op_info: dict, node_id_index
              op = jsons['opid']
              row['opid'] = op
              # add other attributes known about this operation
-             row['topic'] = op_info[op]['topic']
+             row['topic'] = int(op_info[op]['topic'])
+             row['real_topic'] = reversed_topic_mapping[row['topic']]
              row['op_type'] = op_info[op]['op_type']
 
          # we have a key to the message specified
@@ -509,7 +509,11 @@ def parse_msg_logs(fname: str, topic_mapping: dict, op_info: dict, node_id_index
          if('topic' in jsons):
              # replace topic digest by topic name
              topic = jsons['topic']
+             #print(reversed_topic_mapping)
+             print("topic:", topic)
+             #row['real_topic'] = reversed_topic_mapping[topic]
              row['key'] = topic_mapping[topic]
+             row['real_key'] = topic
 
          rows.append(row)
 
@@ -528,10 +532,6 @@ def parse_msg_logs(fname: str, topic_mapping: dict, op_info: dict, node_id_index
 
 def get_op_df(config_path):
     log_path = os.path.join(config_path, "logs")
-
-    topic_mapping = {} #reverse engineer the topic hash
-    for i in range(1, 100):
-        topic_mapping[hashlib.sha256(('t'+str(i)).encode('utf-8')).hexdigest()] = i
 
     operations = {} #indexed by opid
     for line in open(os.path.join(log_path, 'logs.json'), 'r').readlines():
@@ -715,13 +715,26 @@ def plot_waiting_time(fig_dir,msg_df):
     fig.savefig(fig_dir + 'waiting_time.'+form,format=form)
 
 
-def plot_times_registered(fig_dir, msg_df):
+def plot_times_registered(fig_dir, msg_df, op_df):
     # consider only final REGTOPIC message
     df = msg_df.dropna(subset=['ok', 'topic', 'total_wtime'], inplace=False)
-    print(df)
-    df = df.groupby('peer_id')
+    d = df.to_dict()#it's faster to process a dict than a df
+    print(d)
+    d['topic_bucket'] = {}
+    for item in d['real_node_id'].items():
+        index = item[0]
+        real_node_id = item[1]
+        real_topic_id = d['real_topic'][index]
+        bucket = 255 - int(math.log2(int(real_node_id, 16) ^ int(real_topic_id, 16)))
+        d['topic_bucket'][index] =  bucket
+        print(index, real_node_id, real_topic_id, bucket)
+    df = pd.DataFrame.from_dict(d)
     
-
+    splot = sns.catplot(data=df, x="node_id", y="topic_bucket", hue="topic", height=5, aspect=1.5)
+    splot.savefig(fig_dir + 'times_registered_dist.'+form, format=form)
+    
+    
+    df = df.groupby('peer_id')
     fig, axes = plt.subplots(figsize=(10, 4))
     df['ok'].value_counts().plot(ax=axes, kind='bar')
     axes.set_xticklabels([])
@@ -868,27 +881,27 @@ def plot_dfs(out_dir):
     if not os.path.exists(fig_dir):
         os.mkdir(fig_dir)
 
-    #plot_operation_returned(fig_dir,op_df)
+    plot_operation_returned(fig_dir,op_df)
 
-    #plot_search_times(fig_dir,op_df)
+    plot_search_times(fig_dir,op_df)
 
     print("Reading msg df")
     msg_df = pd.read_csv(os.path.join(df_dir, 'msg_df.json'))
 
 
-    #plot_msg_operation(fig_dir, msg_df)
+    plot_msg_operation(fig_dir, msg_df)
 
-    #plot_msg_topic(fig_dir,msg_df)
+    plot_msg_topic(fig_dir,msg_df)
 
-    #plot_times_discovered(fig_dir,op_df)
+    plot_times_discovered(fig_dir,op_df)
 
-    plot_times_registered(fig_dir, msg_df)
+    plot_times_registered(fig_dir, msg_df, op_df)
 
-    #plot_search_results(fig_dir,op_df)
+    plot_search_results(fig_dir,op_df)
 
-    #plot_waiting_time(fig_dir,msg_df)
+    plot_waiting_time(fig_dir,msg_df)
 
-    #plot_mean_waiting_time(fig_dir,msg_df)
+    plot_mean_waiting_time(fig_dir,msg_df)
     quit()
 
     print("Reading advert dfs")
@@ -916,4 +929,4 @@ def plot_dfs(out_dir):
 
 def analyse(out_dir: str):
     create_dfs(out_dir)
-    #plot_dfs(out_dir)
+    plot_dfs(out_dir)
