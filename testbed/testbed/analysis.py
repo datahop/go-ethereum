@@ -730,7 +730,7 @@ def plot_times_registered(fig_dir, msg_df, op_df):
         print(index, real_node_id, real_topic_id, bucket)
     df = pd.DataFrame.from_dict(d)
     
-    splot = sns.catplot(data=df, x="node_id", y="topic_bucket", hue="topic", height=5, aspect=1.5)
+    splot = sns.catplot(data=df, x="peer_id", y="topic_bucket", hue="topic", height=5, aspect=1.5)
     splot.savefig(fig_dir + 'times_registered_dist.'+form, format=form)
     
     
