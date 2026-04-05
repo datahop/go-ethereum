@@ -28,6 +28,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
@@ -58,6 +59,9 @@ type Config struct {
 	PingInterval            time.Duration // speed of node liveness check
 	RefreshInterval         time.Duration // used in bucket refresh
 	NoFindnodeLivenessCheck bool          // turns off validation of table nodes in FINDNODE handler
+
+	// Topic system configuration:
+	Topic topicindex.Config
 
 	// The options below are useful in very specific cases, like in unit tests.
 	V5ProtocolID *[6]byte

@@ -49,6 +49,10 @@ const (
 	TalkResponseMsg
 	RequestTicketMsg
 	TicketMsg
+	RegtopicMsg
+	RegconfirmationMsg
+	TopicQueryMsg
+	TopicNodesMsg
 
 	UnknownPacket   = byte(255) // any non-decryptable packet
 	WhoareyouPacket = byte(254) // the WHOAREYOU packet
@@ -122,6 +126,51 @@ type (
 		ReqID   []byte
 		Message []byte
 	}
+
+	// REGTOPIC registers the sender in a topic queue using a ticket.
+	Regtopic struct {
+		ReqID  []byte
+		Topic  [32]byte
+		Ticket []byte
+		ENR    *enr.Record
+
+		// Buckets contains the distances from the topic where the
+		// requesting node still has space in its search table.
+		Buckets []uint
+
+		// OpID is for debugging purposes and is not part of the packet encoding.
+		OpID uint64 `rlp:"-"`
+	}
+
+	// REGCONFIRMATION is one of the responses to REGTOPIC.
+	Regconfirmation struct {
+		ReqID     []byte
+		RespCount uint8  // total number of responses to the request
+		Ticket    []byte // registered successfully if length zero
+		WaitTime  uint   // how long to wait until sending next REGTOPIC (in ms)
+
+		CumulativeWaitTime *uint `rlp:"-"` // for logs
+	}
+
+	// TOPICQUERY asks for nodes with the given topic.
+	TopicQuery struct {
+		ReqID []byte
+		Topic [32]byte
+
+		// Buckets contains the distances from the topic where the
+		// requesting node still has space in its search table.
+		Buckets []uint
+
+		// OpID is for debugging purposes and is not part of the packet encoding.
+		OpID uint64 `rlp:"-"`
+	}
+
+	// TOPICNODES is one of the responses to TOPICQUERY.
+	TopicNodes struct {
+		ReqID     []byte
+		RespCount uint8         // total number of responses to the request
+		Nodes     []*enr.Record // nodes matching the requested topic
+	}
 )
 
 // DecodeMessage decodes the message body of a packet.
@@ -140,6 +189,14 @@ func DecodeMessage(ptype byte, body []byte) (Packet, error) {
 		dec = new(TalkRequest)
 	case TalkResponseMsg:
 		dec = new(TalkResponse)
+	case RegtopicMsg:
+		dec = new(Regtopic)
+	case RegconfirmationMsg:
+		dec = new(Regconfirmation)
+	case TopicQueryMsg:
+		dec = new(TopicQuery)
+	case TopicNodesMsg:
+		dec = new(TopicNodes)
 	default:
 		return nil, fmt.Errorf("unknown packet type %d", ptype)
 	}
@@ -230,4 +287,62 @@ func (p *TalkResponse) SetRequestID(id []byte) { p.ReqID = id }
 
 func (p *TalkResponse) AppendLogInfo(ctx []interface{}) []interface{} {
 	return append(ctx, "req", hexutil.Bytes(p.ReqID), "len", len(p.Message))
+}
+
+func (*Regtopic) Name() string             { return "REGTOPIC/v5" }
+func (*Regtopic) Kind() byte               { return RegtopicMsg }
+func (p *Regtopic) RequestID() []byte      { return p.ReqID }
+func (p *Regtopic) SetRequestID(id []byte) { p.ReqID = id }
+
+func (p *Regtopic) AppendLogInfo(ctx []interface{}) []interface{} {
+	ctx = append(ctx, "req", hexutil.Bytes(p.ReqID), "topic", (*enode.ID)(&p.Topic))
+	if p.OpID != 0 {
+		ctx = append(ctx, "opid", p.OpID)
+	}
+	return ctx
+}
+
+func (*Regconfirmation) Name() string             { return "REGCONFIRMATION/v5" }
+func (*Regconfirmation) Kind() byte               { return RegconfirmationMsg }
+func (p *Regconfirmation) RequestID() []byte      { return p.ReqID }
+func (p *Regconfirmation) SetRequestID(id []byte) { p.ReqID = id }
+
+func (p *Regconfirmation) AppendLogInfo(ctx []interface{}) []interface{} {
+	ok := len(p.Ticket) == 0
+	ctx = append(ctx, "req", hexutil.Bytes(p.ReqID), "ok", ok)
+	if ok {
+		ctx = append(ctx, "adlifetime", p.WaitTime)
+	} else {
+		ctx = append(ctx, "wtime", p.WaitTime)
+	}
+	if p.CumulativeWaitTime != nil {
+		ctx = append(ctx, "total-wtime", *p.CumulativeWaitTime)
+	}
+	return ctx
+}
+
+func (*TopicQuery) Name() string             { return "TOPICQUERY/v5" }
+func (*TopicQuery) Kind() byte               { return TopicQueryMsg }
+func (p *TopicQuery) RequestID() []byte      { return p.ReqID }
+func (p *TopicQuery) SetRequestID(id []byte) { p.ReqID = id }
+
+func (p *TopicQuery) AppendLogInfo(ctx []interface{}) []interface{} {
+	ctx = append(ctx, "req", hexutil.Bytes(p.ReqID), "topic", (*enode.ID)(&p.Topic))
+	if p.OpID != 0 {
+		ctx = append(ctx, "opid", p.OpID)
+	}
+	return ctx
+}
+
+func (*TopicNodes) Name() string             { return "TOPICNODES/v5" }
+func (*TopicNodes) Kind() byte               { return TopicNodesMsg }
+func (p *TopicNodes) RequestID() []byte      { return p.ReqID }
+func (p *TopicNodes) SetRequestID(id []byte) { p.ReqID = id }
+
+func (p *TopicNodes) AppendLogInfo(ctx []interface{}) []interface{} {
+	return append(ctx,
+		"req", hexutil.Bytes(p.ReqID),
+		"tot", p.RespCount,
+		"n", len(p.Nodes),
+	)
 }

@@ -30,8 +30,11 @@ import (
 	"sync"
 	"time"
 
+	"math"
+
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
@@ -42,6 +45,8 @@ const (
 	lookupRequestLimit      = 3  // max requests against a single node during lookup
 	findnodeResultLimit     = 16 // applies in FINDNODE handler
 	totalNodesResponseLimit = 5  // applies in waitForNodes
+	regtopicNodesLimit      = 8
+	topicNodesResultLimit   = 16 // applies in TOPICQUERY handler
 )
 
 // codecV5 is implemented by v5wire.Codec (and testCodec).
@@ -89,7 +94,13 @@ type UDPv5 struct {
 	// talkreq handler registry
 	talk *talkSystem
 
+	// topic stuff
+	topicTable   *topicindex.TopicTable
+	ticketSealer *topicindex.TicketSealer
+	topicSys     *topicSystem
+
 	// channels into dispatch
+	onDispatchCh chan func()
 	packetInCh    chan ReadPacket
 	readNextCh    chan struct{}
 	callCh        chan *callV5
@@ -159,6 +170,12 @@ func ListenV5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 	closeCtx, cancelCloseCtx := context.WithCancel(context.Background())
 	cfg = cfg.withDefaults()
+
+	topicConfig := cfg.Topic
+	topicConfig.Self = ln.ID()
+	topicConfig.Log = cfg.Log
+	topicConfig.Clock = cfg.Clock
+
 	t := &UDPv5{
 		// static fields
 		conn:         newMeteredConn(conn),
@@ -170,6 +187,9 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		validSchemes: cfg.ValidSchemes,
 		clock:        cfg.Clock,
 		respTimeout:  cfg.V5RespTimeout,
+		// topic stuff
+		topicTable:   topicindex.NewTopicTable(topicConfig),
+		ticketSealer: topicindex.NewTicketSealer(cfg.Clock),
 		// channels into dispatch
 		packetInCh:    make(chan ReadPacket, 1),
 		readNextCh:    make(chan struct{}, 1),
@@ -177,6 +197,7 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		callDoneCh:    make(chan *callV5),
 		sendCh:        make(chan sendRequest),
 		respTimeoutCh: make(chan *callTimeout),
+		onDispatchCh:  make(chan func()),
 		unhandled:     cfg.Unhandled,
 		// state of dispatch
 		codec:            v5wire.NewCodec(ln, cfg.PrivateKey, cfg.Clock, cfg.V5ProtocolID),
@@ -193,6 +214,7 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		return nil, err
 	}
 	t.tab = tab
+	t.topicSys = newTopicSystem(t, topicConfig)
 	return t, nil
 }
 
@@ -205,6 +227,7 @@ func (t *UDPv5) Self() *enode.Node {
 func (t *UDPv5) Close() {
 	t.closeOnce.Do(func() {
 		t.cancelCloseCtx()
+		t.topicSys.stop()
 		t.conn.Close()
 		t.talk.wait()
 		t.wg.Wait()
@@ -274,6 +297,33 @@ func (t *UDPv5) AllNodes() []*enode.Node {
 		}
 	}
 	return nodes
+}
+
+// RegisterTopic adds a topic for registration.
+func (t *UDPv5) RegisterTopic(topic topicindex.TopicID, opid uint64) {
+	t.topicSys.register(topic, opid)
+}
+
+// StopRegisterTopic removes a topic from registration.
+func (t *UDPv5) StopRegisterTopic(topic topicindex.TopicID) {
+	t.topicSys.stopRegister(topic)
+}
+
+// LocalTopicNodes returns all locally-registered nodes for a topic.
+func (t *UDPv5) LocalTopicNodes(topic topicindex.TopicID) []*enode.Node {
+	done := make(chan []*enode.Node, 1)
+	fn := func() { done <- t.topicTable.Nodes(topic) }
+	select {
+	case t.onDispatchCh <- fn:
+		return <-done
+	case <-t.closeCtx.Done():
+		return nil
+	}
+}
+
+// TopicSearch returns an iterator over random nodes found in a topic.
+func (t *UDPv5) TopicSearch(topic topicindex.TopicID, opid uint64) enode.Iterator {
+	return t.topicSys.newSearchIterator(topic, opid)
 }
 
 // AddKnownNode adds a node to the routing table.
@@ -501,6 +551,114 @@ func (t *UDPv5) verifyResponseNode(c *callV5, r *enr.Record, distances []uint, s
 	return node, nil
 }
 
+// regtopic sends REGTOPIC to node n and waits for responses.
+func (t *UDPv5) regtopic(n *enode.Node, topic topicindex.TopicID, ticket []byte, buckets []uint, opid uint64) topicRegResult {
+	req := &v5wire.Regtopic{
+		Topic:   topic,
+		Ticket:  ticket,
+		ENR:     t.Self().Record(),
+		Buckets: buckets,
+		OpID:    opid,
+	}
+	c := t.callToNode(n, 0, req) // responseType=0 accepts any response type
+	defer t.callDone(c)
+
+	var (
+		nodes     []*enode.Node
+		seen      = make(map[enode.ID]struct{})
+		confirmed bool
+		result    topicRegResult
+		received  int
+		total     = -1
+	)
+	for result.err == nil && (!confirmed || (total >= 0 && received < total)) {
+		select {
+		case responseMsg := <-c.ch:
+			switch resp := responseMsg.(type) {
+			case *v5wire.Regconfirmation:
+				if total == -1 {
+					total = int(resp.RespCount)
+				}
+				received++
+				result.msg = resp
+				confirmed = true
+			case *v5wire.Nodes:
+				if total == -1 {
+					total = int(resp.RespCount)
+				}
+				received++
+				for _, record := range resp.Nodes {
+					node, err := t.verifyResponseNode(c, record, nil, seen)
+					if err != nil {
+						t.log.Debug("Invalid record in "+resp.Name(), "id", c.node.ID(), "err", err)
+						continue
+					}
+					nodes = append(nodes, node)
+				}
+			}
+		case err := <-c.err:
+			result.err = err
+		}
+	}
+	result.nodes = nodes
+	return result
+}
+
+// topicQuery sends TOPICQUERY and waits for responses.
+func (t *UDPv5) topicQuery(n *enode.Node, topic topicindex.TopicID, buckets []uint, opid uint64) topicQueryResult {
+	req := &v5wire.TopicQuery{Topic: topic, Buckets: buckets, OpID: opid}
+	c := t.callToNode(n, 0, req) // responseType=0 accepts any response type
+	defer t.callDone(c)
+
+	var (
+		auxNodes   []*enode.Node
+		topicNodes []*enode.Node
+		auxSeen    = make(map[enode.ID]struct{})
+		topicSeen  = make(map[enode.ID]struct{})
+		result     topicQueryResult
+		received   int
+		total      = -1
+	)
+	for result.err == nil && (total < 0 || received < total) {
+		select {
+		case responseMsg := <-c.ch:
+			switch resp := responseMsg.(type) {
+			case *v5wire.Nodes:
+				if total == -1 {
+					total = int(resp.RespCount)
+				}
+				received++
+				for _, record := range resp.Nodes {
+					node, err := t.verifyResponseNode(c, record, nil, auxSeen)
+					if err != nil {
+						t.log.Debug("Invalid record in "+resp.Name(), "id", c.node.ID(), "err", err)
+						continue
+					}
+					auxNodes = append(auxNodes, node)
+				}
+			case *v5wire.TopicNodes:
+				if total == -1 {
+					total = int(resp.RespCount)
+				}
+				received++
+				for _, record := range resp.Nodes {
+					node, err := t.verifyResponseNode(c, record, nil, topicSeen)
+					if err != nil {
+						t.log.Debug("Invalid record in "+resp.Name(), "id", c.node.ID(), "err", err)
+						continue
+					}
+					topicNodes = append(topicNodes, node)
+				}
+			}
+		case err := <-c.err:
+			result.err = err
+		}
+	}
+	result.topicNodes = topicNodes
+	result.auxNodes = auxNodes
+	return result
+}
+
 // callToNode sends the given call and sets up a handler for response packets (of message
 // type responseType). Responses are dispatched to the call's response channel.
 func (t *UDPv5) callToNode(n *enode.Node, responseType byte, req v5wire.Packet) *callV5 {
@@ -567,11 +725,24 @@ func (t *UDPv5) callDone(c *callV5) {
 func (t *UDPv5) dispatch() {
 	defer t.wg.Done()
 
+	var topicExp = mclock.NewAlarm(t.clock)
+
 	// Arm first read.
 	t.readNextCh <- struct{}{}
 
 	for {
+		nextExp := t.topicTable.NextExpiryTime()
+		if nextExp != topicindex.Never {
+			topicExp.Schedule(nextExp)
+		}
+
 		select {
+		case <-topicExp.C():
+			t.topicTable.Expire()
+
+		case fn := <-t.onDispatchCh:
+			fn()
+
 		case c := <-t.callCh:
 			t.callQueue[c.id] = append(t.callQueue[c.id], c)
 			t.sendNextCall(c.id)
@@ -778,7 +949,7 @@ func (t *UDPv5) handleCallResponse(fromID enode.ID, fromAddr netip.AddrPort, p v
 		t.log.Debug(fmt.Sprintf("%s from wrong endpoint", p.Name()), "id", fromID, "addr", fromAddr)
 		return false
 	}
-	if p.Kind() != ac.responseType {
+	if ac.responseType != 0 && p.Kind() != ac.responseType {
 		t.log.Debug(fmt.Sprintf("Wrong discv5 response type %s", p.Name()), "id", fromID, "addr", fromAddr)
 		return false
 	}
@@ -824,6 +995,14 @@ func (t *UDPv5) handle(p v5wire.Packet, fromID enode.ID, fromAddr netip.AddrPort
 	case *v5wire.TalkRequest:
 		t.talk.handleRequest(fromID, fromAddr, p)
 	case *v5wire.TalkResponse:
+		t.handleCallResponse(fromID, fromAddr, p)
+	case *v5wire.Regtopic:
+		t.handleRegtopic(fromID, fromAddr, p)
+	case *v5wire.TopicQuery:
+		t.handleTopicQuery(fromID, fromAddr, p)
+	case *v5wire.Regconfirmation:
+		t.handleCallResponse(fromID, fromAddr, p)
+	case *v5wire.TopicNodes:
 		t.handleCallResponse(fromID, fromAddr, p)
 	}
 }
@@ -977,4 +1156,137 @@ func packNodes(reqid []byte, nodes []*enode.Node) []*v5wire.Nodes {
 		msg.RespCount = uint8(len(resp))
 	}
 	return resp
+}
+
+// packNodeRecords converts nodes to ENR records grouped into slices of at most
+// nodesResponseItemLimit each.
+func packNodeRecords(nodes []*enode.Node) [][]*enr.Record {
+	const nodesResponseItemLimit = 3
+	if len(nodes) == 0 {
+		return nil
+	}
+	var result [][]*enr.Record
+	for i := 0; i < len(nodes); i += nodesResponseItemLimit {
+		end := i + nodesResponseItemLimit
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+		group := make([]*enr.Record, 0, end-i)
+		for _, n := range nodes[i:end] {
+			group = append(group, n.Record())
+		}
+		result = append(result, group)
+	}
+	return result
+}
+
+// handleRegtopic serves REGTOPIC messages.
+func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.Regtopic) {
+	ticket, err := t.ticketSealer.Unpack(p.Topic, p.Ticket)
+	if err != nil {
+		t.log.Debug("Invalid ticket in REGTOPIC/v5", "id", fromID, "addr", fromAddr, "err", err)
+		return
+	}
+
+	n, err := enode.New(t.validSchemes, p.ENR)
+	if err != nil {
+		t.log.Debug("Node record in REGTOPIC/v5 is invalid", "id", fromID, "addr", fromAddr, "err", err)
+		return
+	}
+	if n.ID() != fromID {
+		t.log.Debug("Node record in REGTOPIC/v5 does not match id", "id", fromID, "addr", fromAddr)
+		return
+	}
+
+	// Compute total wait time.
+	now := t.clock.Now()
+	waitTime := time.Duration(0)
+	if len(p.Ticket) > 0 {
+		waitTime = now.Sub(ticket.FirstIssued)
+	}
+
+	// Collect closest nodes to topic hash.
+	auxNodes := t.collectTopicAuxNodes(ticket.Topic, p.Buckets, fromAddr.Addr())
+	nodesResponses := packNodeRecords(auxNodes)
+	responseCount := uint8(1 + len(nodesResponses))
+
+	// Attempt to register.
+	newTime := t.topicTable.Register(n, ticket.Topic, waitTime)
+
+	// Build confirmation.
+	confirmation := &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: responseCount}
+	if newTime > 0 {
+		firstIssued := ticket.FirstIssued
+		if len(p.Ticket) == 0 {
+			firstIssued = now
+		}
+		confirmation.WaitTime = waitTimeToMs(newTime)
+		confirmation.Ticket = t.ticketSealer.Pack(&topicindex.Ticket{
+			Topic:          p.Topic,
+			WaitTimeIssued: newTime,
+			LastUsed:       now,
+			FirstIssued:    firstIssued,
+		})
+	} else {
+		confirmation.WaitTime = waitTimeToMs(t.topicTable.AdLifetime())
+		totalWaitTimeMs := waitTimeToMs(waitTime)
+		confirmation.CumulativeWaitTime = &totalWaitTimeMs
+	}
+
+	// Send responses.
+	t.sendResponse(fromID, fromAddr, confirmation)
+	for _, records := range nodesResponses {
+		msg := &v5wire.Nodes{ReqID: p.ReqID, RespCount: responseCount, Nodes: records}
+		t.sendResponse(fromID, fromAddr, msg)
+	}
+}
+
+// handleTopicQuery serves TOPICQUERY messages.
+func (t *UDPv5) handleTopicQuery(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.TopicQuery) {
+	// Collect closest nodes to topic hash.
+	auxNodes := t.collectTopicAuxNodes(p.Topic, p.Buckets, fromAddr.Addr())
+	auxResponses := packNodeRecords(auxNodes)
+
+	// Get matching nodes from the topic table.
+	topicNodes := t.topicTable.RandomNodes(p.Topic, topicNodesResultLimit, func(n *enode.Node) bool {
+		return netutil.CheckRelayAddr(fromAddr.Addr(), n.IPAddr()) == nil
+	})
+	topicResponses := packNodeRecords(topicNodes)
+
+	responseCount := uint8(len(auxResponses) + len(topicResponses))
+
+	// Send NODES responses (aux nodes).
+	for _, records := range auxResponses {
+		t.sendResponse(fromID, fromAddr, &v5wire.Nodes{
+			ReqID:     p.ReqID,
+			RespCount: responseCount,
+			Nodes:     records,
+		})
+	}
+	// Send TOPICNODES responses (topic results).
+	for _, records := range topicResponses {
+		t.sendResponse(fromID, fromAddr, &v5wire.TopicNodes{
+			ReqID:     p.ReqID,
+			RespCount: responseCount,
+			Nodes:     records,
+		})
+	}
+	// Ensure at least one response is sent.
+	if len(auxResponses) == 0 && len(topicResponses) == 0 {
+		t.sendResponse(fromID, fromAddr, &v5wire.TopicNodes{
+			ReqID:     p.ReqID,
+			RespCount: 1,
+		})
+	}
+}
+
+func (t *UDPv5) collectTopicAuxNodes(topic topicindex.TopicID, reqDist []uint, remoteIP netip.Addr) []*enode.Node {
+	check := func(n *enode.Node) bool {
+		return netutil.CheckRelayAddr(remoteIP, n.IPAddr()) == nil
+	}
+	return t.tab.collectOnePerDist(enode.ID(topic), reqDist, regtopicNodesLimit, check)
+}
+
+func waitTimeToMs(d time.Duration) uint {
+	return uint(math.Ceil(d.Seconds() * 1000))
 }

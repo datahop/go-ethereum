@@ -743,6 +743,61 @@ func pushNode(list []*tableNode, n *tableNode, max int) ([]*tableNode, *tableNod
 	return list, removed
 }
 
+// subscribeNodes subscribes to node addition events.
+// New nodes are sent on the given channel.
+func (tab *Table) subscribeNodes(ch chan *enode.Node) event.Subscription {
+	return tab.nodeFeed.Subscribe(ch)
+}
+
+// allNodes returns all live nodes in the table.
+func (tab *Table) allNodes() []*enode.Node {
+	tab.mutex.Lock()
+	defer tab.mutex.Unlock()
+
+	var nodes []*enode.Node
+	for _, b := range &tab.buckets {
+		for _, n := range b.entries {
+			nodes = append(nodes, n.Node)
+		}
+	}
+	return nodes
+}
+
+// collectOnePerDist collects one node per requested distance from the table.
+func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, limit int, check func(*enode.Node) bool) []*enode.Node {
+	tab.mutex.Lock()
+	defer tab.mutex.Unlock()
+
+	var nodes []*enode.Node
+	processed := make(map[uint]struct{})
+	for _, dist := range distances {
+		if _, seen := processed[dist]; seen || dist > 256 {
+			continue
+		}
+		processed[dist] = struct{}{}
+
+		if dist == 0 {
+			self := tab.net.Self()
+			if check(self) {
+				nodes = append(nodes, self)
+			}
+			continue
+		}
+
+		b := tab.bucketAtDistance(int(dist))
+		for _, n := range b.entries {
+			if check(n.Node) {
+				nodes = append(nodes, n.Node)
+				break // one per distance
+			}
+		}
+		if len(nodes) >= limit {
+			break
+		}
+	}
+	return nodes
+}
+
 // deleteNode removes a node from the table.
 func (tab *Table) deleteNode(n *enode.Node) {
 	tab.mutex.Lock()
