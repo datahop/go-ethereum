@@ -302,6 +302,7 @@ func (api *discAPI) TopicSearch(topic common.Hash, numNodes int, opID *uint64) [
 	}()
 
 	// Read nodes from the iterator.
+	// Stops early when numNodes unique results are collected.
 	go func() {
 		var results []enode.ID
 		seen := make(map[enode.ID]struct{})
@@ -312,6 +313,9 @@ func (api *discAPI) TopicSearch(topic common.Hash, numNodes int, opID *uint64) [
 			}
 			results = append(results, id)
 			seen[id] = struct{}{}
+			if numNodes > 0 && len(results) >= numNodes {
+				break
+			}
 		}
 		nodesCh <- results
 		close(searchDone)
