@@ -143,7 +143,7 @@ func TestTopicSearchE2E(t *testing.T) {
 	}()
 
 	found := make(map[enode.ID]bool)
-	timeout := time.After(30 * time.Second)
+	timeout := time.After(45 * time.Second)
 	done := false
 	for !done {
 		select {

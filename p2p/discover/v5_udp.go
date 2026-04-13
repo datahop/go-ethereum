@@ -577,17 +577,20 @@ func (t *UDPv5) regtopic(n *enode.Node, topic topicindex.TopicID, ticket []byte,
 			switch resp := responseMsg.(type) {
 			case *v5wire.Regconfirmation:
 				if total == -1 {
-					total = int(resp.RespCount)
+					total = min(int(resp.RespCount), regtopicNodesLimit)
 				}
 				received++
 				result.msg = resp
 				confirmed = true
 			case *v5wire.Nodes:
 				if total == -1 {
-					total = int(resp.RespCount)
+					total = min(int(resp.RespCount), regtopicNodesLimit)
 				}
 				received++
 				for _, record := range resp.Nodes {
+					if len(nodes) >= regtopicNodesLimit {
+						break
+					}
 					node, err := t.verifyResponseNode(c, record, nil, seen)
 					if err != nil {
 						t.log.Debug("Invalid record in "+resp.Name(), "id", c.node.ID(), "err", err)
@@ -625,10 +628,13 @@ func (t *UDPv5) topicQuery(n *enode.Node, topic topicindex.TopicID, buckets []ui
 			switch resp := responseMsg.(type) {
 			case *v5wire.Nodes:
 				if total == -1 {
-					total = int(resp.RespCount)
+					total = min(int(resp.RespCount), topicNodesResultLimit)
 				}
 				received++
 				for _, record := range resp.Nodes {
+					if len(auxNodes) >= topicNodesResultLimit {
+						break
+					}
 					node, err := t.verifyResponseNode(c, record, nil, auxSeen)
 					if err != nil {
 						t.log.Debug("Invalid record in "+resp.Name(), "id", c.node.ID(), "err", err)
@@ -638,10 +644,13 @@ func (t *UDPv5) topicQuery(n *enode.Node, topic topicindex.TopicID, buckets []ui
 				}
 			case *v5wire.TopicNodes:
 				if total == -1 {
-					total = int(resp.RespCount)
+					total = min(int(resp.RespCount), topicNodesResultLimit)
 				}
 				received++
 				for _, record := range resp.Nodes {
+					if len(topicNodes) >= topicNodesResultLimit {
+						break
+					}
 					node, err := t.verifyResponseNode(c, record, nil, topicSeen)
 					if err != nil {
 						t.log.Debug("Invalid record in "+resp.Name(), "id", c.node.ID(), "err", err)
