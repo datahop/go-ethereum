@@ -321,9 +321,9 @@ class NetworkDockerRouter(Network):
         return (public_ip_for_node(node), self.DISCV5_PORT)
 
     def node_api_url(self, node: int):
-        """Returns the RPC URL using the private (Docker bridge) IP."""
-        priv_ip = private_ip_for_node(node)
-        return f"http://{priv_ip}:{self.RPC_PORT}"
+        """Returns the RPC URL via host port mapping."""
+        host_port = self.RPC_PORT + node
+        return f"http://127.0.0.1:{host_port}"
 
     def _create_network(self):
         """Create the Docker bridge network."""
@@ -386,11 +386,13 @@ class NetworkDockerRouter(Network):
         priv_ip = private_ip_for_node(node)
         pub_ip = public_ip_for_node(node)
 
+        host_rpc_port = self.RPC_PORT + node
+
         nodeflags = [
             "--bootnodes", ','.join(bootnodes),
             "--nodekey", nodekey,
             "--addr", f"{priv_ip}:{self.DISCV5_PORT}",
-            "--rpc", f"{priv_ip}:{self.RPC_PORT}",
+            "--rpc", f"0.0.0.0:{self.RPC_PORT}",
             "--config", "/config/config.json",
         ]
         logfile = f"/config/logs/node-{node}.log"
@@ -403,6 +405,7 @@ class NetworkDockerRouter(Network):
             '--ip', priv_ip,
             '--cap-add', 'NET_ADMIN',
             '-e', f'GATEWAY={self.ROUTER_IP}',
+            '-p', f'127.0.0.1:{host_rpc_port}:{self.RPC_PORT}/tcp',
             '--mount', f'type=bind,source={abs_config_path},target=/config',
             'discv5-node',
             'devp2p', *logflags, 'discv5', 'listen', *nodeflags,
