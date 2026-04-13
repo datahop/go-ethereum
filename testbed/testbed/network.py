@@ -41,8 +41,10 @@ def public_ip_for_node(node: int) -> str:
     return f"{first}.{second}.{third}.1"
 
 def private_ip_for_node(node: int) -> str:
-    """Private IP on the Docker bridge network."""
-    return f"10.100.{node // 256}.{node % 256}"
+    """Private IP on the Docker bridge network. Offset by 10 to avoid
+    gateway (.1) and router (.2) addresses."""
+    n = node + 9  # node 1 -> .10, node 2 -> .11, etc.
+    return f"10.100.{n // 256}.{n % 256}"
 
 class Network:
     config: dict = {}
@@ -259,7 +261,8 @@ class NetworkDockerRouter(Network):
 
     DOCKER_NETWORK = 'discv5-testnet'
     DOCKER_SUBNET = '10.100.0.0/16'
-    ROUTER_IP = '10.100.0.1'
+    DOCKER_GATEWAY = '10.100.0.1'
+    ROUTER_IP = '10.100.0.2'
     DISCV5_PORT = 30303
     RPC_PORT = 20200
     PROJECT = 'discv5'
@@ -329,7 +332,7 @@ class NetworkDockerRouter(Network):
         argv = [
             'docker', 'network', 'create',
             '--subnet', self.DOCKER_SUBNET,
-            '--gateway', self.ROUTER_IP,
+            '--gateway', self.DOCKER_GATEWAY,
             self.DOCKER_NETWORK,
         ]
         p = subprocess.run(argv, capture_output=True, text=True)
