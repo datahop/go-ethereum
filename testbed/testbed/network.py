@@ -277,6 +277,11 @@ class NetworkDockerRouter(Network):
         super().__init__(cfg)
 
     def build(self):
+        # Build the local devp2p binary (needed for key generation and ENR creation).
+        print('Compiling devp2p tool')
+        result = os.system("PATH=$PATH:/usr/local/go/bin go build ./cmd/devp2p")
+        assert result == 0, "Failed to build devp2p"
+
         print('Building Docker images...')
         result = os.system(
             "docker build -t discv5-node -f testbed/docker/node/Dockerfile ."
