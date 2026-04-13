@@ -361,7 +361,8 @@ class NetworkDockerRouter(Network):
             '--name', f'{self.PROJECT}-router',
             '--network', self.DOCKER_NETWORK,
             '--ip', self.ROUTER_IP,
-            '--cap-add', 'NET_ADMIN',
+            '--privileged',
+            '--sysctl', 'net.ipv4.ip_forward=1',
             '--mount', f'type=bind,source={abs_config_path},target=/config',
             'discv5-router',
         ]

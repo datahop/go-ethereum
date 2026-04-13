@@ -18,12 +18,17 @@ if [ ! -f "$MAPPINGS_FILE" ]; then
     exit 1
 fi
 
-# Enable IP forwarding.
-echo 1 > /proc/sys/net/ipv4/ip_forward
+# Note: IP forwarding is enabled via --sysctl net.ipv4.ip_forward=1 in docker run.
 
-# Create dummy interface for virtual public IPs.
-ip link add dummy0 type dummy
-ip link set dummy0 up
+# Create a loopback alias for virtual public IPs (dummy module may not be available).
+# We use 'lo' as a fallback.
+if ip link add dummy0 type dummy 2>/dev/null; then
+    ip link set dummy0 up
+    PUB_DEV=dummy0
+else
+    echo "WARNING: dummy interface not available, using lo for virtual IPs"
+    PUB_DEV=lo
+fi
 
 # Flush existing rules.
 iptables -F FORWARD
@@ -41,8 +46,8 @@ while read -r PRIV_IP PUB_IP TYPE; do
 
     echo "  $PRIV_IP -> $PUB_IP ($TYPE)"
 
-    # Add virtual public IP to dummy interface.
-    ip addr add "$PUB_IP/32" dev dummy0 2>/dev/null || true
+    # Add virtual public IP.
+    ip addr add "$PUB_IP/32" dev $PUB_DEV 2>/dev/null || true
 
     # SNAT: outbound from private IP appears as public IP.
     iptables -t nat -A POSTROUTING -s "$PRIV_IP" -j SNAT --to-source "$PUB_IP"
