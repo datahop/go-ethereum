@@ -12,7 +12,7 @@ from testbed import workload, analysis
 
 def parseArguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--docker", help="enable docker testbed", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--docker", help="enable docker testbed with router-based NAT simulation", action=argparse.BooleanOptionalAction)
     parser.add_argument("--analysis", help="run analysis after test", default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--config", help="run chosen configuration", type=str)
     parser.add_argument("--name", help="experiment name", type=str)
@@ -72,7 +72,7 @@ def main():
 
     network = NetworkLocal()
     if args.docker:
-        network = NetworkDocker()
+        network = NetworkDockerRouter()
     atexit.register(network.stop)
 
     params = {}

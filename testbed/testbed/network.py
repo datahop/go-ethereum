@@ -29,6 +29,21 @@ network_config_defaults = {
 MIN_LATENCY=2
 MAX_LATENCY=40
 
+# Safe first octets for virtual public IPs (non-private, non-reserved).
+SAFE_OCTETS = [45, 51, 64, 78, 85, 91, 104, 138, 155, 163, 185, 193, 203, 212]
+
+def public_ip_for_node(node: int) -> str:
+    """Generate a virtual public IP scattered across different /8, /16, /24 ranges."""
+    i = node - 1  # node is 1-based
+    first = SAFE_OCTETS[i % len(SAFE_OCTETS)]
+    second = (i // len(SAFE_OCTETS)) + 1
+    third = (i % 250) + 1
+    return f"{first}.{second}.{third}.1"
+
+def private_ip_for_node(node: int) -> str:
+    """Private IP on the Docker bridge network."""
+    return f"10.100.{node // 256}.{node % 256}"
+
 class Network:
     config: dict = {}
 
@@ -232,12 +247,176 @@ class NetworkDocker(Network):
         latency = random.randint(MIN_LATENCY,MAX_LATENCY)
         subprocess.Popen("docker exec node"+str(node)+" sh -c 'tc qdisc add dev eth0 root netem delay "+str(latency)+"ms'", stdout=subprocess.DEVNULL, stderr=None,shell=True)
 
-        #command = 'sh -c "tc qdisc add dev eth0 root netem delay '+str(latency)+'ms"'
-        #argv = ["docker","exec","node"+str(node),command]
-        #p = subprocess.run(argv, capture_output=True, text=True)
-        #if p.returncode != 0:
-        #    print(p.stderr)
-        #    p.check_returncode()
+
+class NetworkDockerRouter(Network):
+    """Docker-based network with a single router container that simulates
+    diverse public IPs and NAT behaviors using iptables.
+
+    All nodes are on a single Docker bridge (10.100.0.0/16). The router
+    assigns virtual public IPs from scattered ranges and applies per-node
+    NAT rules (public, natted, port-forwarded).
+    """
+
+    DOCKER_NETWORK = 'discv5-testnet'
+    DOCKER_SUBNET = '10.100.0.0/16'
+    ROUTER_IP = '10.100.0.1'
+    DISCV5_PORT = 30303
+    RPC_PORT = 20200
+    PROJECT = 'discv5'
+
+    containers: list[str] = []
+    node_types: dict[int, str] = {}  # node -> 'public'|'natted'|'port-forwarded'
+
+    def __init__(self, config=None):
+        cfg = {
+            'rpcBasePort': self.RPC_PORT,
+            'udpBasePort': self.DISCV5_PORT,
+        }
+        if config:
+            cfg.update(config)
+        super().__init__(cfg)
+
+    def build(self):
+        print('Building Docker images...')
+        result = os.system(
+            "docker build -t discv5-node -f testbed/docker/node/Dockerfile ."
+        )
+        assert result == 0, "Failed to build node image"
+        result = os.system(
+            "docker build -t discv5-router -f testbed/docker/router/Dockerfile ."
+        )
+        assert result == 0, "Failed to build router image"
+
+    def classify_nodes(self, params: dict):
+        """Assign node types based on config parameters."""
+        n = params['nodes']
+        natted = params.get('nattedNodes', 0)
+        forwarded = params.get('portForwardedNodes', 0)
+        public = n - natted - forwarded
+
+        assert public >= 0, "nattedNodes + portForwardedNodes > nodes"
+
+        self.node_types = {}
+        node = 1
+        for _ in range(public):
+            self.node_types[node] = 'public'
+            node += 1
+        for _ in range(forwarded):
+            self.node_types[node] = 'port-forwarded'
+            node += 1
+        for _ in range(natted):
+            self.node_types[node] = 'natted'
+            node += 1
+
+    def node_udp_endpoint(self, node: int):
+        """Returns the virtual public IP and port for a node."""
+        return (public_ip_for_node(node), self.DISCV5_PORT)
+
+    def node_api_url(self, node: int):
+        """Returns the RPC URL using the private (Docker bridge) IP."""
+        priv_ip = private_ip_for_node(node)
+        return f"http://{priv_ip}:{self.RPC_PORT}"
+
+    def _create_network(self):
+        """Create the Docker bridge network."""
+        # Remove existing network if present.
+        os.system(f"docker network rm {self.DOCKER_NETWORK} 2>/dev/null")
+        argv = [
+            'docker', 'network', 'create',
+            '--subnet', self.DOCKER_SUBNET,
+            '--gateway', self.ROUTER_IP,
+            self.DOCKER_NETWORK,
+        ]
+        p = subprocess.run(argv, capture_output=True, text=True)
+        if p.returncode != 0:
+            print('docker network create failed:', p.stderr)
+            p.check_returncode()
+
+    def _write_mappings(self, config_path: str, n: int):
+        """Write the node_mappings.txt file for the router."""
+        mappings_file = os.path.join(config_path, "node_mappings.txt")
+        with open(mappings_file, 'w') as f:
+            f.write("# private_ip public_ip type\n")
+            for node in range(1, n + 1):
+                priv_ip = private_ip_for_node(node)
+                pub_ip = public_ip_for_node(node)
+                ntype = self.node_types.get(node, 'public')
+                f.write(f"{priv_ip} {pub_ip} {ntype}\n")
+        return mappings_file
+
+    def _start_router(self, config_path: str):
+        """Start the router container."""
+        abs_config_path = os.path.abspath(config_path)
+        argv = [
+            'docker', 'run', '-d',
+            '--name', f'{self.PROJECT}-router',
+            '--network', self.DOCKER_NETWORK,
+            '--ip', self.ROUTER_IP,
+            '--cap-add', 'NET_ADMIN',
+            '--mount', f'type=bind,source={abs_config_path},target=/config',
+            'discv5-router',
+        ]
+        p = subprocess.run(argv, capture_output=True, text=True)
+        if p.returncode != 0:
+            print('Router start failed:', p.stderr)
+            p.check_returncode()
+
+        container_id = p.stdout.strip()
+        print(f'Started router: {container_id[:12]}')
+        self.containers.append(container_id)
+
+        # Wait for router to be ready.
+        import time
+        time.sleep(2)
+
+    def start_node(self, node: int, bootnodes=[], nodekey=None, config_path=None):
+        assert nodekey is not None
+        assert config_path is not None
+
+        abs_config_path = os.path.abspath(config_path)
+        priv_ip = private_ip_for_node(node)
+        pub_ip = public_ip_for_node(node)
+
+        nodeflags = [
+            "--bootnodes", ','.join(bootnodes),
+            "--nodekey", nodekey,
+            "--addr", f"{priv_ip}:{self.DISCV5_PORT}",
+            "--rpc", f"{priv_ip}:{self.RPC_PORT}",
+            "--config", "/config/config.json",
+        ]
+        logfile = f"/config/logs/node-{node}.log"
+        logflags = ["--verbosity", "5", "--log.json", "--log.file", logfile]
+
+        argv = [
+            'docker', 'run', '-d',
+            '--name', f'{self.PROJECT}-node-{node}',
+            '--network', self.DOCKER_NETWORK,
+            '--ip', priv_ip,
+            '--cap-add', 'NET_ADMIN',
+            '-e', f'GATEWAY={self.ROUTER_IP}',
+            '--mount', f'type=bind,source={abs_config_path},target=/config',
+            'discv5-node',
+            'devp2p', *logflags, 'discv5', 'listen', *nodeflags,
+        ]
+        p = subprocess.run(argv, capture_output=True, text=True)
+        if p.returncode != 0:
+            print(f'Node {node} start failed:', p.stderr)
+            p.check_returncode()
+
+        container_id = p.stdout.strip()
+        ntype = self.node_types.get(node, 'public')
+        print(f'Started node {node} ({ntype}): {priv_ip} -> {pub_ip}')
+        self.containers.append(container_id)
+
+    def stop(self):
+        super().stop()
+        if self.containers:
+            print('Stopping containers...')
+        for cid in self.containers:
+            os.system(f'docker rm -f {cid} 2>/dev/null')
+        self.containers = []
+        os.system(f'docker network rm {self.DOCKER_NETWORK} 2>/dev/null')
+
 
 # _async_iter_concurrently runs fn over items. The function must return a
 # coroutine, which will be scheduled as a task.
@@ -343,8 +522,60 @@ def make_keys(config_path: str, n: int):
 def select_bootnodes(enrs):
     return [ enrs[0] ] + random.sample(enrs[1:], min(len(enrs)//3, 20))
 
+def load_ip_list(filepath: str) -> list[str]:
+    """Load public IPs from a file (one IP per line)."""
+    ips = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                ips.append(line)
+    return ips
+
+
+def load_latency_list(filepath: str) -> list[int]:
+    """Load per-node latencies from a file (one value in ms per line)."""
+    latencies = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                latencies.append(int(line))
+    return latencies
+
+
+def generate_latencies(n: int, params: dict) -> list[int]:
+    """Generate latencies per node from config (random uniform or from file)."""
+    latency_file = params.get('latencyFile')
+    if latency_file and os.path.isfile(latency_file):
+        latencies = load_latency_list(latency_file)
+        if len(latencies) < n:
+            # Cycle if file has fewer entries than nodes.
+            latencies = (latencies * ((n // len(latencies)) + 1))[:n]
+        return latencies[:n]
+
+    min_lat = params.get('minLatencyMs', MIN_LATENCY)
+    max_lat = params.get('maxLatencyMs', MAX_LATENCY)
+    return [random.randint(min_lat, max_lat) for _ in range(n)]
+
+
 def start_nodes(network: Network, config_path: str, params: dict):
     n = params['nodes']
+
+    # For NetworkDockerRouter, classify nodes and set up IP mappings.
+    if isinstance(network, NetworkDockerRouter):
+        network.classify_nodes(params)
+
+        # Load or generate public IPs.
+        ip_file = params.get('publicIpFile')
+        if ip_file and os.path.isfile(ip_file):
+            custom_ips = load_ip_list(ip_file)
+            if len(custom_ips) < n:
+                raise ValueError(f"IP file has {len(custom_ips)} IPs but need {n}")
+            # Override the IP function with custom IPs.
+            ip_map = {i+1: custom_ips[i] for i in range(n)}
+            original_endpoint = network.node_udp_endpoint
+            network.node_udp_endpoint = lambda node: (ip_map[node], network.DISCV5_PORT)
 
     print("Building keys...")
     make_keys(config_path, params['nodes'])
@@ -357,7 +588,11 @@ def start_nodes(network: Network, config_path: str, params: dict):
 
     print("Starting", n, "nodes...")
 
-    if isinstance(network, NetworkDocker):
+    if isinstance(network, NetworkDockerRouter):
+        network._create_network()
+        network._write_mappings(config_path, n)
+        network._start_router(config_path)
+    elif isinstance(network, NetworkDocker):
         network.create_docker_networks(n)
         os.system("sudo iptables --flush DOCKER-ISOLATION-STAGE-1")
 
@@ -370,6 +605,19 @@ def start_nodes(network: Network, config_path: str, params: dict):
 
         if isinstance(network, NetworkDocker):
             network.config_network(i)
+
+    # Apply latencies.
+    if isinstance(network, NetworkDockerRouter):
+        latencies = generate_latencies(n, params)
+        for i in range(1, n+1):
+            lat = latencies[i-1]
+            if lat > 0:
+                container = f'{network.PROJECT}-node-{i}'
+                os.system(
+                    f"docker exec {container} sh -c "
+                    f"'tc qdisc add dev eth0 root netem delay {lat}ms' 2>/dev/null"
+                )
+        print(f"Applied latencies: min={min(latencies)}ms max={max(latencies)}ms")
 
     print("Nodes started")
 
