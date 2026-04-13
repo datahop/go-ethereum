@@ -57,3 +57,6 @@ cmd/geth/geth
 cmd/rlpdump/rlpdump
 cmd/workload/workload
 cmd/keeper/keeper
+/devp2p
+discv5_test_logs/
+testbed/.venv/
