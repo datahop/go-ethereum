@@ -327,7 +327,8 @@ class NetworkDockerRouter(Network):
 
     def _create_network(self):
         """Create the Docker bridge network."""
-        # Remove existing network if present.
+        # Force-remove any leftover containers and network from previous runs.
+        os.system(f"docker ps -a --filter network={self.DOCKER_NETWORK} -q | xargs -r docker rm -f 2>/dev/null")
         os.system(f"docker network rm {self.DOCKER_NETWORK} 2>/dev/null")
         argv = [
             'docker', 'network', 'create',
