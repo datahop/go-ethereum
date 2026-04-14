@@ -215,6 +215,8 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 	}
 	t.tab = tab
 	t.topicSys = newTopicSystem(t, topicConfig)
+	// Advertise DISC-NG capability in the local node's ENR.
+	ln.Set(topicindex.DiscNG{})
 	return t, nil
 }
 
@@ -1291,7 +1293,7 @@ func (t *UDPv5) handleTopicQuery(fromID enode.ID, fromAddr netip.AddrPort, p *v5
 
 func (t *UDPv5) collectTopicAuxNodes(topic topicindex.TopicID, reqDist []uint, remoteIP netip.Addr) []*enode.Node {
 	check := func(n *enode.Node) bool {
-		return netutil.CheckRelayAddr(remoteIP, n.IPAddr()) == nil
+		return topicindex.SupportsDiscNG(n) && netutil.CheckRelayAddr(remoteIP, n.IPAddr()) == nil
 	}
 	return t.tab.collectOnePerDist(enode.ID(topic), reqDist, regtopicNodesLimit, check)
 }
