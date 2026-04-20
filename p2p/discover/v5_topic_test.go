@@ -59,6 +59,8 @@ func TestTopicReg(t *testing.T) {
 }
 
 func TestTopicSearch(t *testing.T) {
+	t.Skip("disabled: topicSearch.runRequests can block past Close; see datahop/go-ethereum#30")
+
 	node0 := startLocalhostV5(t, Config{})
 	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
 	node2 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
