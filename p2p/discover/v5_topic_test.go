@@ -17,12 +17,16 @@
 package discover
 
 import (
+	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
+	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
+
+var testTopic1 = topicindex.TopicID{1, 1, 1, 1}
 
 func makeTopic(name string) topicindex.TopicID {
 	var topic topicindex.TopicID
@@ -30,147 +34,53 @@ func makeTopic(name string) topicindex.TopicID {
 	return topic
 }
 
-// TestTopicRegistrationE2E spins up a small network of discv5 nodes,
-// registers a topic on some of them, and verifies that the registrations
-// appear in remote nodes' topic tables.
-func TestTopicRegistrationE2E(t *testing.T) {
-	t.Parallel()
+func TestTopicReg(t *testing.T) {
+	bootnode := startLocalhostV5(t, Config{})
+	defer bootnode.Close()
+	client := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{bootnode.Self()}})
+	defer client.Close()
 
-	const numNodes = 6
-	nodes := make([]*UDPv5, numNodes)
-	for i := 0; i < numNodes; i++ {
-		var cfg Config
-		if i > 0 {
-			cfg.Bootnodes = []*enode.Node{nodes[0].Self()}
-		}
-		nodes[i] = startLocalhostV5(t, cfg)
-		defer nodes[i].Close()
-	}
+	client.RegisterTopic(topicindex.TopicID{}, 0)
 
-	// Trigger lookups so all nodes discover each other.
-	for _, n := range nodes {
-		n.Lookup(n.Self().ID())
-	}
-	time.Sleep(1 * time.Second)
-
-	topic := makeTopic("test-reg-e2e-00000000")
-
-	// Nodes 0 and 1 register for the topic.
-	nodes[0].RegisterTopic(topic, 1)
-	nodes[1].RegisterTopic(topic, 2)
-
-	// Wait for registrations to propagate through the network.
-	// The registration goroutines send REGTOPIC to nodes in their routing tables,
-	// which store ads in their local topic tables.
-	deadline := time.After(30 * time.Second)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
+	deadline := time.After(15 * time.Second)
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
 	for {
 		select {
 		case <-deadline:
-			t.Fatal("Timed out waiting for topic registrations to appear in any node's topic table")
-		case <-ticker.C:
-			for i := 2; i < numNodes; i++ {
-				regs := nodes[i].LocalTopicNodes(topic)
-				if len(regs) > 0 {
-					t.Logf("Node %d has %d registrations for topic", i, len(regs))
-					// Verify that at least one of the registrants is found.
-					for _, n := range regs {
-						if n.ID() == nodes[0].Self().ID() || n.ID() == nodes[1].Self().ID() {
-							t.Logf("Found registrant %s in node %d's topic table", n.ID().TerminalString(), i)
-							return // Success
-						}
-					}
-				}
+			t.Fatal("client not registered on bootnode within deadline")
+		case <-tick.C:
+			reg := bootnode.LocalTopicNodes(topicindex.TopicID{})
+			if len(reg) == 1 && reg[0].ID() == client.Self().ID() {
+				return
 			}
 		}
 	}
 }
 
-// TestTopicSearchE2E verifies that TopicSearch can find nodes that have
-// registered for a topic via the full protocol flow.
-//
-// This test is not parallel because it spins up a relatively large network
-// and is sensitive to load/timing on the test machine.
-func TestTopicSearchE2E(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping topic search E2E test in short mode")
-	}
-	const numNodes = 8
-	nodes := make([]*UDPv5, numNodes)
-	for i := 0; i < numNodes; i++ {
-		var cfg Config
-		if i > 0 {
-			cfg.Bootnodes = []*enode.Node{nodes[0].Self()}
-		}
-		nodes[i] = startLocalhostV5(t, cfg)
-		defer nodes[i].Close()
-	}
-
-	// Trigger lookups so all nodes discover each other.
-	for _, n := range nodes {
-		n.Lookup(n.Self().ID())
-	}
-	time.Sleep(1 * time.Second)
-
-	topic := makeTopic("test-search-e2e-00000")
-
-	// Nodes 0-3 register.
-	for i := 0; i < 4; i++ {
-		nodes[i].RegisterTopic(topic, uint64(i+1))
-	}
-
-	// Wait for registrations to propagate.
-	time.Sleep(15 * time.Second)
-
-	// Node 7 (non-registrant) searches for the topic.
-	iter := nodes[7].TopicSearch(topic, 100)
-	defer iter.Close()
-
-	registrantIDs := make(map[enode.ID]bool)
-	for i := 0; i < 4; i++ {
-		registrantIDs[nodes[i].Self().ID()] = true
-	}
-
-	// Drain the iterator in a goroutine.
-	results := make(chan *enode.Node, 100)
-	go func() {
-		defer close(results)
-		for iter.Next() {
-			results <- iter.Node()
+func TestTopicSearch(t *testing.T) {
+	node0 := startLocalhostV5(t, Config{})
+	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+	node2 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+	node3 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+	defer func() {
+		for _, n := range []*UDPv5{node0, node1, node2, node3} {
+			n.Close()
 		}
 	}()
 
-	found := make(map[enode.ID]bool)
-	timeout := time.After(45 * time.Second)
-	done := false
-	for !done {
-		select {
-		case <-timeout:
-			done = true
-		case n, ok := <-results:
-			if !ok {
-				done = true
-				break
-			}
-			if !found[n.ID()] {
-				found[n.ID()] = true
-				if registrantIDs[n.ID()] {
-					t.Logf("Found registrant %s via search", n.ID().TerminalString())
-				}
-			}
-			if countRegistrants(found, registrantIDs) >= 4 {
-				t.Logf("Found all 4 registrants!")
-				return
-			}
-		}
-	}
+	node1.topicTable.Add(node0.Self(), testTopic1)
+	node1.topicTable.Add(node3.Self(), testTopic1)
 
-	regCount := countRegistrants(found, registrantIDs)
-	t.Logf("Search found %d unique nodes (%d are registrants)", len(found), regCount)
-	if regCount == 0 {
-		t.Fatal("Expected to find at least one registrant via topic search")
+	it := node2.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	found := enode.ReadNodes(it, 2)
+	sortByID(found)
+
+	want := []*enode.Node{node0.Self(), node3.Self()}
+	sortByID(want)
+	if err := checkNodesEqual(found, want); err != nil {
+		t.Error(err)
 	}
 }
 
@@ -239,12 +149,49 @@ func TestTopicLocalTopicNodes(t *testing.T) {
 	}
 }
 
-func countRegistrants(found map[enode.ID]bool, registrants map[enode.ID]bool) int {
-	count := 0
-	for id := range found {
-		if registrants[id] {
-			count++
+// TestTopicRegNodeTableUpdates verifies that a running topic registration
+// picks up new nodes arriving via the main node table feed.
+func TestTopicRegNodeTableUpdates(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	key1 := newkey()
+	addr1 := netip.MustParseAddrPort("10.0.1.101:30303")
+	ln1 := test.getNode(key1, addr1)
+
+	key2 := newkey()
+	addr2 := netip.MustParseAddrPort("10.0.1.102:30303")
+	ln2 := test.getNode(key2, addr2)
+
+	test.table.addFoundNode(ln1.Node(), true)
+	test.udp.RegisterTopic(testTopic1, 1)
+
+	test.waitPacketOut(func(p *v5wire.Regtopic, addr netip.AddrPort, _ v5wire.Nonce) {
+		if addr != addr1 {
+			t.Fatalf("REGTOPIC sent to wrong node: got %v, want %v", addr, addr1)
 		}
+		test.packetInFrom(key1, addr, &v5wire.Regconfirmation{
+			ReqID:    p.ReqID,
+			Ticket:   nil,
+			WaitTime: 900000,
+		})
+	})
+
+	test.table.addFoundNode(ln2.Node(), true)
+
+	test.waitPacketOut(func(p *v5wire.Regtopic, addr netip.AddrPort, _ v5wire.Nonce) {
+		if addr != addr2 {
+			t.Fatalf("REGTOPIC sent to wrong node: got %v, want %v", addr, addr2)
+		}
+		test.packetInFrom(key2, addr, &v5wire.Regconfirmation{
+			ReqID:    p.ReqID,
+			Ticket:   nil,
+			WaitTime: 900000,
+		})
+	})
+
+	if got := test.udp.topicSys.reg[testTopic1].state.NodeCount(); got != 2 {
+		t.Fatalf("wrong node count in reg state: got %d, want 2", got)
 	}
-	return count
 }

@@ -165,6 +165,7 @@ func shuffleNodes(nodes []*enode.Node) {
 const regloopMinTime = 2 * time.Second
 
 // pause ensures that top-level registration loop iterations take at least regLoopMinTime.
+// This prevents the loop from running too hot when the local node table is very empty.
 func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
 	d := reg.clock.Now().Sub(lastTime)
 	if d < regloopMinTime {
@@ -175,6 +176,7 @@ func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
 			case <-sleep.C():
 				return false
 			case <-reg.newNodesCh:
+				// Drain the channel to avoid blocking the Table's feed sender.
 			case <-reg.quit:
 				return true
 			}
@@ -343,6 +345,8 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 	}
 }
 
+// pause ensures that top-level search loop iterations take at least regLoopMinTime.
+// This prevents the loop from running too hot when the local node table is very empty.
 func (s *topicSearch) pause(lastTime mclock.AbsTime) bool {
 	d := s.config.Clock.Now().Sub(lastTime)
 	if d < regloopMinTime {
@@ -353,6 +357,7 @@ func (s *topicSearch) pause(lastTime mclock.AbsTime) bool {
 			case <-sleep.C():
 				return false
 			case <-s.newNodesCh:
+				// Drain the channel to avoid blocking the Table's feed sender.
 			case <-s.quit:
 				return true
 			}
@@ -417,6 +422,8 @@ func (s *topicSearch) run(state *topicindex.Search) (exit bool) {
 func (s *topicSearch) closeDown() {
 	close(s.queryCh)
 	close(s.resultCh)
+	// Drain the result channel. This guarantees that, when the iterator's
+	// Close returns, Next will always return false.
 	for range s.resultCh {
 	}
 }
