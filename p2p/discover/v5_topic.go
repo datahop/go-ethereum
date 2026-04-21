@@ -214,15 +214,19 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			reg.state.AddNodes(nil, []*enode.Node{n})
 
 		case <-updateCh:
-			att := reg.state.Update()
-			if att != nil {
+			attempt := reg.state.Update()
+			if attempt != nil {
 				sendAttemptCh = reg.regRequest
-				nextAttempt = topicRegJob{att: att}
+				nextAttempt = topicRegJob{
+					attempt: attempt,
+					node:    attempt.Node,
+					ticket:  attempt.Ticket,
+				}
 				nextAttempt.buckets = reg.state.BucketsWithFreeSpace(nextAttempt.buckets[:0])
 			}
 
 		case sendAttemptCh <- nextAttempt:
-			reg.state.StartRequest(nextAttempt.att)
+			reg.state.StartRequest(nextAttempt.attempt)
 			sendAttemptCh = nil
 
 		case resp := <-reg.regResponse:
@@ -243,8 +247,14 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 	}
 }
 
+// topicRegJob is a dispatch job handed from the event loop to the request
+// worker. It carries a value snapshot of the attempt's node and ticket, so
+// the worker does not share *RegAttempt state with the event loop goroutine.
+// The attempt field is only used for response correlation on the way back.
 type topicRegJob struct {
-	att     *topicindex.RegAttempt
+	attempt *topicindex.RegAttempt
+	node    *enode.Node
+	ticket  []byte
 	buckets []uint
 }
 
@@ -261,10 +271,9 @@ func (reg *topicReg) runRequests(sys *topicSystem) {
 	defer reg.wg.Done()
 
 	for job := range reg.regRequest {
-		n := job.att.Node
 		topic := reg.state.Topic()
-		resp := sys.transport.regtopic(n, topic, job.att.Ticket, job.buckets, reg.opid)
-		resp.att = job.att
+		resp := sys.transport.regtopic(job.node, topic, job.ticket, job.buckets, reg.opid)
+		resp.att = job.attempt
 
 		select {
 		case reg.regResponse <- resp:
