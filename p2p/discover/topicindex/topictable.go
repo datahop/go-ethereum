@@ -137,13 +137,17 @@ func (tab *TopicTable) NextExpiryTime() mclock.AbsTime {
 // Expire removes inactive registrations.
 func (tab *TopicTable) Expire() {
 	now := tab.config.Clock.Now()
-	for e := tab.all.Front(); e != nil; e = e.Next() {
+	// Capture Next() before remove; list.Remove nils the element's next/prev
+	// pointers, so e.Next() after remove would return nil.
+	for e := tab.all.Front(); e != nil; {
+		next := e.Next()
 		reg := e.Value.(*topicTableEntry)
 		if reg.exp > now {
 			break
 		}
 		tab.remove(reg)
 		tab.wt.removeReg(reg)
+		e = next
 	}
 }
 
