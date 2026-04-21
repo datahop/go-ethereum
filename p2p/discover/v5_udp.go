@@ -1206,6 +1206,19 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 		t.log.Debug("Node record in REGTOPIC/v5 does not match id", "id", fromID, "addr", fromAddr)
 		return
 	}
+	// Reject ads whose advertised endpoint does not match the packet source.
+	// Without this check, any peer could register an ad pointing at an
+	// arbitrary IP, turning the topic table into a redirection vector.
+	advertised, ok := n.UDPEndpoint()
+	if !ok {
+		t.log.Debug("Node record in REGTOPIC/v5 has no UDP endpoint", "id", fromID, "addr", fromAddr)
+		return
+	}
+	if advertised != fromAddr {
+		t.log.Debug("Node record in REGTOPIC/v5 endpoint does not match packet source",
+			"id", fromID, "advertised", advertised, "from", fromAddr)
+		return
+	}
 
 	// Compute total wait time.
 	now := t.clock.Now()

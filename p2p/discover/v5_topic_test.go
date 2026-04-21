@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/p2p/enr"
 )
 
 var testTopic1 = topicindex.TopicID{1, 1, 1, 1}
@@ -195,5 +196,56 @@ func TestTopicRegNodeTableUpdates(t *testing.T) {
 
 	if got := test.udp.topicSys.reg[testTopic1].state.NodeCount(); got != 2 {
 		t.Fatalf("wrong node count in reg state: got %d, want 2", got)
+	}
+}
+
+// TestHandleRegtopicEndpointCheck verifies that handleRegtopic rejects
+// REGTOPIC requests whose advertised ENR endpoint does not match the packet
+// source address — otherwise any peer could register an ad pointing at an
+// arbitrary IP.
+func TestHandleRegtopicEndpointCheck(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	key := newkey()
+	addrReal := netip.MustParseAddrPort("10.0.1.101:30303")
+	addrLie := netip.MustParseAddrPort("10.0.99.99:30303")
+
+	// Matching ENR: advertises the real source endpoint.
+	matchNode := test.getNode(key, addrReal)
+	matchRecord := matchNode.Node().Record()
+
+	// Mismatched ENR: same key (ID matches), but advertises a different endpoint.
+	db, _ := enode.OpenDB("")
+	defer db.Close()
+	lying := enode.NewLocalNode(db, key)
+	lying.SetStaticIP(addrLie.Addr().AsSlice())
+	lying.Set(enr.UDP(addrLie.Port()))
+	lyingRecord := lying.Node().Record()
+
+	// Case A: REGTOPIC with mismatched ENR — should be silently dropped.
+	test.packetInFrom(key, addrReal, &v5wire.Regtopic{
+		ReqID: []byte{1},
+		Topic: testTopic1,
+		ENR:   lyingRecord,
+	})
+	if nodes := test.udp.LocalTopicNodes(testTopic1); len(nodes) != 0 {
+		t.Fatalf("mismatched-endpoint REGTOPIC was accepted: %d nodes in topic", len(nodes))
+	}
+
+	// Case B: REGTOPIC with matching ENR — should be accepted and confirmed.
+	test.packetInFrom(key, addrReal, &v5wire.Regtopic{
+		ReqID: []byte{2},
+		Topic: testTopic1,
+		ENR:   matchRecord,
+	})
+	test.waitPacketOut(func(p *v5wire.Regconfirmation, addr netip.AddrPort, _ v5wire.Nonce) {
+		if addr != addrReal {
+			t.Fatalf("REGCONFIRMATION sent to wrong addr: got %v, want %v", addr, addrReal)
+		}
+	})
+	if nodes := test.udp.LocalTopicNodes(testTopic1); len(nodes) != 1 {
+		t.Fatalf("matching REGTOPIC was not stored: %d nodes in topic", len(nodes))
 	}
 }
