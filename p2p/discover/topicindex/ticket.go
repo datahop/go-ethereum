@@ -170,10 +170,14 @@ func (ts *TicketSealer) gcKeys() {
 // getValidKey ensures there is at least one valid key and returns it.
 func (ts *TicketSealer) getValidKey() *ticketKey {
 	if len(ts.keys) > 0 && ts.keys[len(ts.keys)-1].uses < ticketRekeyInterval {
-		// Current latest key is still valid.
+		// Current latest key is still valid — bump usage counters and
+		// reuse it. Without this return, every REGTOPIC allocated a
+		// fresh HMAC key and 32 bytes of CSPRNG, growing ts.keys
+		// unboundedly up to the 6h GC window.
 		key := ts.keys[len(ts.keys)-1]
 		key.uses++
 		key.lastUsed = ts.clock.Now()
+		return key
 	}
 
 	// Generate key ID.
