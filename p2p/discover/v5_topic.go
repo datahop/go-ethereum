@@ -111,7 +111,7 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 		quit:        make(chan struct{}),
 		regRequest:  make(chan topicRegJob),
 		regResponse: make(chan topicRegResult),
-		newNodesCh:  make(chan *enode.Node, 100),
+		newNodesCh:  make(chan *enode.Node),
 		iter:        sys.transport.RandomNodes(),
 	}
 
