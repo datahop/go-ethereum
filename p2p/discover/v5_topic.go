@@ -97,9 +97,10 @@ type topicReg struct {
 	regRequest  chan topicRegJob
 	regResponse chan topicRegResult
 
-	// nodes subscription
-	newNodesCh  chan *enode.Node
-	newNodesSub event.Subscription
+	// Continuous DHT-walking iterator that feeds candidate registrars.
+	// readNodes pumps it into newNodesCh.
+	newNodesCh chan *enode.Node
+	iter       enode.Iterator
 }
 
 func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topicReg {
@@ -110,47 +111,32 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 		quit:        make(chan struct{}),
 		regRequest:  make(chan topicRegJob),
 		regResponse: make(chan topicRegResult),
+		newNodesCh:  make(chan *enode.Node, 100),
+		iter:        sys.transport.RandomNodes(),
 	}
 
-	// Set up the subscription for new main table nodes.
-	reg.newNodesCh = make(chan *enode.Node, 100)
-	reg.newNodesSub = sys.transport.tab.subscribeNodes(reg.newNodesCh)
-
-	reg.wg.Add(2)
+	reg.wg.Add(3)
 	go reg.run(sys)
 	go reg.runRequests(sys)
+	go reg.readNodes()
 	return reg
 }
 
 func (reg *topicReg) stop() {
 	close(reg.quit)
+	reg.iter.Close()
 	reg.wg.Wait()
 }
 
-func (reg *topicReg) run(sys *topicSystem) {
+// readNodes pumps nodes from the DHT-walking iterator into the event-loop
+// channel. The iterator naturally blocks when no candidates are available,
+// providing back-pressure if the event loop is slow.
+func (reg *topicReg) readNodes() {
 	defer reg.wg.Done()
-	defer reg.newNodesSub.Unsubscribe()
-	defer close(reg.regRequest)
-
-	time := mclock.AbsTime(-1)
-	for {
-		if time >= 0 {
-			if exit := reg.pause(time); exit {
-				return
-			}
-		}
-		time = reg.clock.Now()
-
-		// Initialize the registration state.
-		nodes := sys.transport.tab.allNodes()
-		if len(nodes) == 0 {
-			continue // Local table is empty, retry later.
-		}
-		shuffleNodes(nodes)
-		reg.state.AddNodes(nil, nodes)
-
-		// Perform registration.
-		if exit := reg.runRegistration(sys); exit {
+	for reg.iter.Next() {
+		select {
+		case reg.newNodesCh <- reg.iter.Node():
+		case <-reg.quit:
 			return
 		}
 	}
@@ -164,28 +150,10 @@ func shuffleNodes(nodes []*enode.Node) {
 
 const regloopMinTime = 2 * time.Second
 
-// pause ensures that top-level registration loop iterations take at least regLoopMinTime.
-// This prevents the loop from running too hot when the local node table is very empty.
-func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
-	d := reg.clock.Now().Sub(lastTime)
-	if d < regloopMinTime {
-		sleep := reg.clock.NewTimer(regloopMinTime - d)
-		defer sleep.Stop()
-		for {
-			select {
-			case <-sleep.C():
-				return false
-			case <-reg.newNodesCh:
-				// Drain the channel to avoid blocking the Table's feed sender.
-			case <-reg.quit:
-				return true
-			}
-		}
-	}
-	return false
-}
+func (reg *topicReg) run(sys *topicSystem) {
+	defer reg.wg.Done()
+	defer close(reg.regRequest)
 
-func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 	var (
 		updateEv      = mclock.NewAlarm(reg.clock)
 		nextAttempt   topicRegJob
@@ -193,10 +161,6 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 	)
 
 	for {
-		if reg.state.NodeCount() == 0 {
-			return false
-		}
-
 		var updateCh <-chan struct{}
 		if sendAttemptCh == nil {
 			next := reg.state.NextUpdateTime()
@@ -208,7 +172,7 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 
 		select {
 		case <-reg.quit:
-			return true
+			return
 
 		case n := <-reg.newNodesCh:
 			reg.state.AddNodes(nil, []*enode.Node{n})

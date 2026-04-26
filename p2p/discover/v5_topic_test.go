@@ -17,12 +17,10 @@
 package discover
 
 import (
-	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
-	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
@@ -151,49 +149,3 @@ func TestTopicLocalTopicNodes(t *testing.T) {
 	}
 }
 
-// TestTopicRegNodeTableUpdates verifies that a running topic registration
-// picks up new nodes arriving via the main node table feed.
-func TestTopicRegNodeTableUpdates(t *testing.T) {
-	t.Parallel()
-	test := newUDPV5Test(t)
-	defer test.close()
-
-	key1 := newkey()
-	addr1 := netip.MustParseAddrPort("10.0.1.101:30303")
-	ln1 := test.getNode(key1, addr1)
-
-	key2 := newkey()
-	addr2 := netip.MustParseAddrPort("10.0.1.102:30303")
-	ln2 := test.getNode(key2, addr2)
-
-	test.table.addFoundNode(ln1.Node(), true)
-	test.udp.RegisterTopic(testTopic1, 1)
-
-	test.waitPacketOut(func(p *v5wire.Regtopic, addr netip.AddrPort, _ v5wire.Nonce) {
-		if addr != addr1 {
-			t.Fatalf("REGTOPIC sent to wrong node: got %v, want %v", addr, addr1)
-		}
-		test.packetInFrom(key1, addr, &v5wire.Regconfirmation{
-			ReqID:    p.ReqID,
-			Ticket:   nil,
-			WaitTime: 900000,
-		})
-	})
-
-	test.table.addFoundNode(ln2.Node(), true)
-
-	test.waitPacketOut(func(p *v5wire.Regtopic, addr netip.AddrPort, _ v5wire.Nonce) {
-		if addr != addr2 {
-			t.Fatalf("REGTOPIC sent to wrong node: got %v, want %v", addr, addr2)
-		}
-		test.packetInFrom(key2, addr, &v5wire.Regconfirmation{
-			ReqID:    p.ReqID,
-			Ticket:   nil,
-			WaitTime: 900000,
-		})
-	})
-
-	if got := test.udp.topicSys.reg[testTopic1].state.NodeCount(); got != 2 {
-		t.Fatalf("wrong node count in reg state: got %d, want 2", got)
-	}
-}
