@@ -17,6 +17,8 @@
 package discover
 
 import (
+	"context"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -59,7 +61,7 @@ func TestTopicReg(t *testing.T) {
 }
 
 func TestTopicSearch(t *testing.T) {
-	t.Skip("disabled: topicSearch.runRequests can block past Close; see datahop/go-ethereum#30")
+	t.Skip("disabled: depends on Search.IsDone fix; see datahop/go-ethereum#27")
 
 	node0 := startLocalhostV5(t, Config{})
 	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
@@ -105,6 +107,43 @@ func TestTopicStopRegister(t *testing.T) {
 	node.RegisterTopic(topic, 2)
 	time.Sleep(100 * time.Millisecond)
 	node.StopRegisterTopic(topic)
+}
+
+// TestTopicQueryContextCancel verifies that an in-flight topicQuery returns
+// promptly when its context is cancelled, instead of blocking until the RPC
+// times out. This is the invariant that lets topicSearch.runRequests unblock
+// when the search is closed (datahop/go-ethereum#30) and lets UDPv5.Close
+// stop active searches without waiting (datahop/go-ethereum#28).
+func TestTopicQueryContextCancel(t *testing.T) {
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.1.101:30303")
+	peer := test.getNode(key, addr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan topicQueryResult, 1)
+	go func() {
+		done <- test.udp.topicQuery(ctx, peer.Node(), testTopic1, []uint{0}, 1)
+	}()
+
+	// Wait for the outbound TOPICQUERY so we know the call is in flight.
+	test.waitPacketOut(func(_ *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {
+		// Don't respond — leave topicQuery blocked.
+	})
+
+	cancel()
+
+	select {
+	case result := <-done:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("topicQuery did not return within 2s after ctx cancel")
+	}
 }
 
 // TestTopicSearchIteratorClose verifies that closing the search iterator

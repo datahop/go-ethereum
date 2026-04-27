@@ -607,8 +607,10 @@ func (t *UDPv5) regtopic(n *enode.Node, topic topicindex.TopicID, ticket []byte,
 	return result
 }
 
-// topicQuery sends TOPICQUERY and waits for responses.
-func (t *UDPv5) topicQuery(n *enode.Node, topic topicindex.TopicID, buckets []uint, opid uint64) topicQueryResult {
+// topicQuery sends TOPICQUERY and waits for responses. It returns early when
+// ctx is cancelled, so callers can abort an in-flight query without waiting
+// for the RPC to time out on its own.
+func (t *UDPv5) topicQuery(ctx context.Context, n *enode.Node, topic topicindex.TopicID, buckets []uint, opid uint64) topicQueryResult {
 	req := &v5wire.TopicQuery{Topic: topic, Buckets: buckets, OpID: opid}
 	c := t.callToNode(n, 0, req) // responseType=0 accepts any response type
 	defer t.callDone(c)
@@ -661,6 +663,8 @@ func (t *UDPv5) topicQuery(n *enode.Node, topic topicindex.TopicID, buckets []ui
 			}
 		case err := <-c.err:
 			result.err = err
+		case <-ctx.Done():
+			result.err = ctx.Err()
 		}
 	}
 	result.topicNodes = topicNodes
