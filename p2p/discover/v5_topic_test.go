@@ -146,6 +146,66 @@ func TestTopicQueryContextCancel(t *testing.T) {
 	}
 }
 
+// TestTopicQueryContextCancelQueued verifies that cancelling the context of a
+// topicQuery whose call has not yet become active (i.e. it's queued behind
+// another active call to the same peer) does not panic dispatch with
+// "BUG: callDone for inactive call". The panic was hit by a 200-node testbed
+// run on 2026-04-27, where every search ran for the full
+// rpcSearchTimeoutSeconds window (returnedNodes=0) and multiple topicQueries
+// could pile up against the same peer.
+func TestTopicQueryContextCancelQueued(t *testing.T) {
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.1.101:30303")
+	peer := test.getNode(key, addr)
+
+	// First call — becomes active and stays in flight (no response).
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	done1 := make(chan topicQueryResult, 1)
+	go func() {
+		done1 <- test.udp.topicQuery(ctx1, peer.Node(), testTopic1, []uint{0}, 1)
+	}()
+	test.waitPacketOut(func(_ *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {
+		// Don't respond — keep call 1 active.
+	})
+
+	// Second call to the same peer — queued behind call 1.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan topicQueryResult, 1)
+	go func() {
+		done2 <- test.udp.topicQuery(ctx2, peer.Node(), testTopic1, []uint{0}, 2)
+	}()
+
+	// Give dispatch time to enqueue call 2. No packet should go out for it
+	// while call 1 is still active.
+	time.Sleep(100 * time.Millisecond)
+
+	// Cancel the queued call. Without the dispatch fix this panics inside
+	// the dispatch goroutine, killing the test process.
+	cancel2()
+
+	select {
+	case result := <-done2:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("queued call: expected context.Canceled, got %v", result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued topicQuery did not return within 2s after ctx cancel")
+	}
+
+	// Confirm dispatch is still alive by also cancelling call 1 and
+	// observing it return promptly.
+	cancel1()
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active topicQuery did not return — dispatch may have panicked")
+	}
+}
+
 // TestTopicSearchIteratorClose verifies that closing the search iterator
 // doesn't leak goroutines.
 func TestTopicSearchIteratorClose(t *testing.T) {
