@@ -174,6 +174,7 @@ func (ts *TicketSealer) getValidKey() *ticketKey {
 		key := ts.keys[len(ts.keys)-1]
 		key.uses++
 		key.lastUsed = ts.clock.Now()
+		return key
 	}
 
 	// Generate key ID.
