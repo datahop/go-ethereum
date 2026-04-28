@@ -117,8 +117,8 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 	reg.newNodesSub = sys.transport.tab.subscribeNodes(reg.newNodesCh)
 
 	reg.wg.Add(2)
-	go reg.run(sys)
-	go reg.runRequests(sys)
+	go reg.registrationLoop(sys)
+	go reg.sendRequestsLoop(sys)
 	return reg
 }
 
@@ -127,7 +127,7 @@ func (reg *topicReg) stop() {
 	reg.wg.Wait()
 }
 
-func (reg *topicReg) run(sys *topicSystem) {
+func (reg *topicReg) registrationLoop(sys *topicSystem) {
 	defer reg.wg.Done()
 	defer reg.newNodesSub.Unsubscribe()
 	defer close(reg.regRequest)
@@ -256,8 +256,8 @@ type topicRegResult struct {
 	att *topicindex.RegAttempt
 }
 
-// runRequests performs topic registration requests.
-func (reg *topicReg) runRequests(sys *topicSystem) {
+// sendRequestsLoop performs topic registration requests.
+func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 	defer reg.wg.Done()
 
 	for job := range reg.regRequest {
