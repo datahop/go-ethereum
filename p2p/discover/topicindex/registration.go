@@ -48,8 +48,6 @@ type Registration struct {
 	// Note: registration buckets are ordered far -> close.
 	buckets [regTableDepth]regBucket
 	heap    regHeap
-
-	bucketCheck map[int]struct{}
 }
 
 //go:generate go run golang.org/x/tools/cmd/stringer@latest -type RegAttemptState
@@ -63,6 +61,10 @@ type regBucket struct {
 	count [nRegStates]int
 
 	ips netutil.DistinctNetSet
+	// seenSources records which sources have ever contributed a node to this
+	// bucket during the lifetime of the Registration. It is never cleared, so
+	// a single source cannot fill a bucket across multiple AddNodes calls.
+	seenSources map[enode.ID]struct{}
 }
 
 const (
@@ -104,17 +106,17 @@ type RegAttempt struct {
 func NewRegistration(topic TopicID, cfg Config) *Registration {
 	cfg = cfg.withDefaults()
 	r := &Registration{
-		topic:       topic,
-		cfg:         cfg,
-		log:         cfg.Log.New("topic", topic),
-		bucketCheck: make(map[int]struct{}, regTableDepth),
+		topic: topic,
+		cfg:   cfg,
+		log:   cfg.Log.New("topic", topic),
 	}
 	dist := 256
 	for i := range r.buckets {
 		r.buckets[i] = regBucket{
-			att:  make(map[enode.ID]*RegAttempt),
-			dist: dist - (len(r.buckets) - 1) + i,
-			ips:  netutil.DistinctNetSet{Subnet: regBucketSubnet, Limit: regBucketIPLimit},
+			att:         make(map[enode.ID]*RegAttempt),
+			dist:        dist - (len(r.buckets) - 1) + i,
+			ips:         netutil.DistinctNetSet{Subnet: regBucketSubnet, Limit: regBucketIPLimit},
+			seenSources: make(map[enode.ID]struct{}),
 		}
 	}
 	return r
@@ -151,12 +153,6 @@ func (r *Registration) BucketsWithFreeSpace(dists []uint) []uint {
 //
 // 'src' is the source of the nodes.
 func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
-	// Clear the one-per-bucket checker.
-	for i := range r.bucketCheck {
-		delete(r.bucketCheck, i)
-	}
-
-	// Add the nodes.
 	for _, n := range nodes {
 		id := n.ID()
 		if id == r.cfg.Self {
@@ -180,15 +176,18 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 
 		if src != nil {
-			// The node is supplied by a remote registrar. Enforce 'one-per-bucket' rule:
-			// in the list given by the registrar, there should be at most one node for
-			// every registration bucket. This avoids attacks where a single registrar can
-			// dominate a bucket.
-			if _, ok := r.bucketCheck[bi]; ok {
-				r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "one-per-bucket-rule")
+			// The node is supplied by a remote registrar. Enforce a
+			// 'one-per-source-per-bucket' rule across the entire Registration
+			// lifetime: any given registrar may contribute at most one entry to
+			// a given bucket. This prevents a single registrar from dominating
+			// a bucket either within one response or across multiple responses
+			// to the same client.
+			srcID := src.ID()
+			if _, ok := b.seenSources[srcID]; ok {
+				r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "source-already-in-bucket")
 				continue
 			}
-			r.bucketCheck[bi] = struct{}{}
+			b.seenSources[srcID] = struct{}{}
 		}
 
 		if b.count[Standby] >= r.cfg.RegBucketStandbyLimit {
