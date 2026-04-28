@@ -71,6 +71,32 @@ func TestTicketSealerInvalid(t *testing.T) {
 
 // This test checks that tickets sealed with an older key
 // are accepted after a key rotation happened.
+// TestTicketSealerKeyReuse verifies that consecutive Pack calls reuse the
+// same signing key until ticketRekeyInterval is reached.
+func TestTicketSealerKeyReuse(t *testing.T) {
+	prevRekeyInterval := ticketRekeyInterval
+	defer func() { ticketRekeyInterval = prevRekeyInterval }()
+	ticketRekeyInterval = 10
+
+	clock := new(mclock.Simulated)
+	ts := NewTicketSealer(clock)
+
+	// Pack 25 tickets. With rekey interval 10, this should allocate
+	// exactly 3 keys: one for tickets 1..10, one for 11..20, one for 21..25.
+	for i := 0; i < 25; i++ {
+		ts.Pack(&Ticket{
+			Topic:          topic1,
+			FirstIssued:    clock.Now(),
+			WaitTimeIssued: ticketKeyLifetime - 3,
+			LastUsed:       clock.Now(),
+		})
+	}
+
+	if got, want := len(ts.keys), 3; got != want {
+		t.Fatalf("wrong number of signing keys allocated: got %d, want %d", got, want)
+	}
+}
+
 func TestTicketSealerKeyRotation(t *testing.T) {
 	prevRekeyInterval := ticketRekeyInterval
 	defer func() { ticketRekeyInterval = prevRekeyInterval }()
