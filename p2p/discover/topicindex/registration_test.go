@@ -102,6 +102,47 @@ func TestRegistrationOnePerBucketCheck(t *testing.T) {
 	}
 }
 
+// TestRegistrationSourcePersistentCap verifies that a single source cannot
+// contribute more than one node to a given bucket across multiple AddNodes
+// calls. This is the persistent variant of the per-RPC one-per-bucket rule:
+// once src has contributed an entry to bucket K, subsequent calls from src
+// to that bucket are rejected, while different sources and bootstrap
+// (src == nil) calls remain admissible.
+func TestRegistrationSourcePersistentCap(t *testing.T) {
+	cfg := testConfig(t)
+	r := NewRegistration(topic1, cfg)
+	src1 := nodeAtDistance(enode.ID(topic1), 255, intIP(1))
+	src2 := nodeAtDistance(enode.ID(topic1), 254, intIP(2))
+
+	// First call from src1 admits one node into a bucket.
+	node1 := nodeAtDistance(enode.ID(topic1), 200, intIP(3))
+	r.AddNodes(src1, []*enode.Node{node1})
+	if r.NodeCount() != 1 {
+		t.Fatalf("after 1st call: expected 1 node, got %d", r.NodeCount())
+	}
+
+	// Second call from the same src1 to the same bucket is rejected.
+	node2 := nodeAtDistance(enode.ID(topic1), 200, intIP(4))
+	r.AddNodes(src1, []*enode.Node{node2})
+	if r.NodeCount() != 1 {
+		t.Fatalf("after 2nd call from src1 (cross-RPC cap): expected 1 node, got %d", r.NodeCount())
+	}
+
+	// A different src2 is allowed to contribute to the same bucket.
+	node3 := nodeAtDistance(enode.ID(topic1), 200, intIP(5))
+	r.AddNodes(src2, []*enode.Node{node3})
+	if r.NodeCount() != 2 {
+		t.Fatalf("after 3rd call from src2: expected 2 nodes, got %d", r.NodeCount())
+	}
+
+	// Bootstrap path (src == nil) is not subject to the cap.
+	node4 := nodeAtDistance(enode.ID(topic1), 200, intIP(6))
+	r.AddNodes(nil, []*enode.Node{node4})
+	if r.NodeCount() != 3 {
+		t.Fatalf("after bootstrap (src=nil): expected 3 nodes, got %d", r.NodeCount())
+	}
+}
+
 // This checks that the per-bucket IP limit is applied in AddNodes.
 func TestRegistrationIPCheck(t *testing.T) {
 	cfg := testConfig(t)
