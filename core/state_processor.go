@@ -22,6 +22,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -30,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/telemetry"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 // StateProcessor is a basic Processor, which takes care of transitioning
@@ -62,7 +64,7 @@ func (p *StateProcessor) chainConfig() *params.ChainConfig {
 func (p *StateProcessor) Process(ctx context.Context, block *types.Block, statedb *state.StateDB, cfg vm.Config) (*ProcessResult, error) {
 	var (
 		config      = p.chainConfig()
-		receipts    types.Receipts
+		receipts    = make(types.Receipts, 0, len(block.Transactions()))
 		header      = block.Header()
 		blockHash   = block.Hash()
 		blockNumber = block.Number()
@@ -371,4 +373,12 @@ func onSystemCallStart(tracer *tracing.Hooks, ctx *tracing.VMContext) {
 	} else if tracer.OnSystemCallStart != nil {
 		tracer.OnSystemCallStart()
 	}
+}
+
+// AssembleBlock finalizes the state and assembles the block with provided
+// body and receipts.
+func AssembleBlock(engine consensus.Engine, chain consensus.ChainHeaderReader, header *types.Header, state *state.StateDB, body *types.Body, receipts []*types.Receipt) *types.Block {
+	engine.Finalize(chain, header, state, body)
+	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil))
 }
