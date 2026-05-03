@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net"
 	"os"
 	"time"
@@ -15,6 +16,13 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
+
+// maxBootnodes caps how many of the previously-spawned nodes a fresh node
+// uses as its bootstrap set. Without a cap, node N tries to PING all N-1
+// predecessors at startup, producing O(N^2) bootstrap traffic that stalls
+// at scale (n=2000 stalls indefinitely). Mirrors the Python testbed's
+// select_bootnodes helper which uses ~20.
+const maxBootnodes = 20
 
 func main() {
 	nodes := flag.Int("nodes", 5, "number of discv5 nodes to spawn")
@@ -68,9 +76,19 @@ func main() {
 		ln.SetFallbackUDP(addr.Port)
 
 		cfg := discover.Config{PrivateKey: key}
-		// Boot from the previously-spawned nodes so the DHT can form.
-		for _, prev := range all {
-			cfg.Bootnodes = append(cfg.Bootnodes, prev.ln.Node())
+		// Sample a bounded set of predecessors as bootnodes. The first node
+		// to admit (index 0) is always included so every later node has a
+		// guaranteed reachable peer; the rest are uniformly random.
+		if len(all) > 0 {
+			cfg.Bootnodes = append(cfg.Bootnodes, all[0].ln.Node())
+			pool := all[1:]
+			n := maxBootnodes - 1
+			if n > len(pool) {
+				n = len(pool)
+			}
+			for _, idx := range rand.Perm(len(pool))[:n] {
+				cfg.Bootnodes = append(cfg.Bootnodes, pool[idx].ln.Node())
+			}
 		}
 
 		disc, err := discover.ListenV5(conn, ln, cfg)
