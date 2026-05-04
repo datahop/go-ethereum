@@ -17,6 +17,7 @@
 package discover
 
 import (
+	"context"
 	"math/rand"
 	"sync"
 	"time"
@@ -34,8 +35,9 @@ type topicSystem struct {
 	transport *UDPv5
 	config    topicindex.Config
 
-	mu  sync.Mutex
-	reg map[topicindex.TopicID]*topicReg
+	mu     sync.Mutex
+	reg    map[topicindex.TopicID]*topicReg
+	search map[*topicSearch]struct{}
 }
 
 func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
@@ -43,6 +45,7 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 		transport: transport,
 		config:    config,
 		reg:       make(map[topicindex.TopicID]*topicReg),
+		search:    make(map[*topicSearch]struct{}),
 	}
 }
 
@@ -74,6 +77,10 @@ func (sys *topicSystem) stop() {
 		reg.stop()
 		delete(sys.reg, topic)
 	}
+	for s := range sys.search {
+		s.stop()
+		delete(sys.search, s)
+	}
 }
 
 func (sys *topicSystem) newSearchIterator(topic topicindex.TopicID, opid uint64) enode.Iterator {
@@ -82,7 +89,21 @@ func (sys *topicSystem) newSearchIterator(topic topicindex.TopicID, opid uint64)
 
 	resultCh := make(chan *enode.Node, 200)
 	s := newTopicSearch(sys, topic, resultCh, opid)
+	sys.search[s] = struct{}{}
 	return newTopicSearchIterator(sys, s, resultCh)
+}
+
+// stopSearch stops a search and removes it from the active set. Safe to call
+// repeatedly; calls after the first are no-ops.
+func (sys *topicSystem) stopSearch(s *topicSearch) {
+	sys.mu.Lock()
+	defer sys.mu.Unlock()
+
+	if _, ok := sys.search[s]; !ok {
+		return
+	}
+	delete(sys.search, s)
+	s.stop()
 }
 
 // topicReg handles registering for a single topic.
@@ -280,8 +301,9 @@ type topicSearch struct {
 	opid   uint64
 	config topicindex.Config
 
-	wg   sync.WaitGroup
-	quit chan struct{}
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	queryCh     chan topicQueryJob
 	queryRespCh chan topicQueryResult
@@ -292,11 +314,16 @@ type topicSearch struct {
 }
 
 func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.Node, opid uint64) *topicSearch {
+	// Derive ctx from UDPv5.closeCtx so that an in-flight topicQuery is
+	// unblocked by either an explicit Close on the iterator (s.cancel) or by
+	// UDPv5.Close cancelling closeCtx.
+	ctx, cancel := context.WithCancel(sys.transport.closeCtx)
 	s := &topicSearch{
 		topic:    topic,
 		config:   sys.config,
 		opid:     opid,
-		quit:     make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
 		resultCh: out,
 
 		queryCh:     make(chan topicQueryJob),
@@ -313,7 +340,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 }
 
 func (s *topicSearch) stop() {
-	close(s.quit)
+	s.cancel()
 	s.wg.Wait()
 }
 
@@ -358,7 +385,7 @@ func (s *topicSearch) pause(lastTime mclock.AbsTime) bool {
 				return false
 			case <-s.newNodesCh:
 				// Drain the channel to avoid blocking the Table's feed sender.
-			case <-s.quit:
+			case <-s.ctx.Done():
 				return true
 			}
 		}
@@ -399,7 +426,7 @@ func (s *topicSearch) run(state *topicindex.Search) (exit bool) {
 		}
 
 		select {
-		case <-s.quit:
+		case <-s.ctx.Done():
 			return true
 
 		case queryCh <- nextQuery:
@@ -440,12 +467,12 @@ func (s *topicSearch) runRequests(sys *topicSystem) {
 	defer s.wg.Done()
 
 	for job := range s.queryCh {
-		result := sys.transport.topicQuery(job.dst, s.topic, job.buckets, s.opid)
+		result := sys.transport.topicQuery(s.ctx, job.dst, s.topic, job.buckets, s.opid)
 		result.src = job.dst
 
 		select {
 		case s.queryRespCh <- result:
-		case <-s.quit:
+		case <-s.ctx.Done():
 			return
 		}
 	}
@@ -475,5 +502,7 @@ func (tsi *topicSearchIterator) Node() *enode.Node {
 }
 
 func (tsi *topicSearchIterator) Close() {
-	tsi.closing.Do(tsi.search.stop)
+	tsi.closing.Do(func() {
+		tsi.sys.stopSearch(tsi.search)
+	})
 }

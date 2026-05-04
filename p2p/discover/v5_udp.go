@@ -607,8 +607,10 @@ func (t *UDPv5) regtopic(n *enode.Node, topic topicindex.TopicID, ticket []byte,
 	return result
 }
 
-// topicQuery sends TOPICQUERY and waits for responses.
-func (t *UDPv5) topicQuery(n *enode.Node, topic topicindex.TopicID, buckets []uint, opid uint64) topicQueryResult {
+// topicQuery sends TOPICQUERY and waits for responses. It returns early when
+// ctx is cancelled, so callers can abort an in-flight query without waiting
+// for the RPC to time out on its own.
+func (t *UDPv5) topicQuery(ctx context.Context, n *enode.Node, topic topicindex.TopicID, buckets []uint, opid uint64) topicQueryResult {
 	req := &v5wire.TopicQuery{Topic: topic, Buckets: buckets, OpID: opid}
 	c := t.callToNode(n, 0, req) // responseType=0 accepts any response type
 	defer t.callDone(c)
@@ -661,6 +663,8 @@ func (t *UDPv5) topicQuery(n *enode.Node, topic topicindex.TopicID, buckets []ui
 			}
 		case err := <-c.err:
 			result.err = err
+		case <-ctx.Done():
+			result.err = ctx.Err()
 		}
 	}
 	result.topicNodes = topicNodes
@@ -763,14 +767,27 @@ func (t *UDPv5) dispatch() {
 			}
 
 		case c := <-t.callDoneCh:
-			active := t.activeCallByNode[c.id]
-			if active != c {
-				panic("BUG: callDone for inactive call")
+			if active := t.activeCallByNode[c.id]; active == c {
+				c.timeout.Stop()
+				delete(t.activeCallByAuth, c.nonce)
+				delete(t.activeCallByNode, c.id)
+				t.sendNextCall(c.id)
+			} else {
+				// The call finished before becoming active — i.e. its
+				// context was cancelled while it was still queued behind
+				// another active call to the same peer. Drop it from the
+				// queue so sendNextCall doesn't try to launch it later.
+				queue := t.callQueue[c.id]
+				for i, qc := range queue {
+					if qc == c {
+						t.callQueue[c.id] = append(queue[:i], queue[i+1:]...)
+						break
+					}
+				}
+				if len(t.callQueue[c.id]) == 0 {
+					delete(t.callQueue, c.id)
+				}
 			}
-			c.timeout.Stop()
-			delete(t.activeCallByAuth, c.nonce)
-			delete(t.activeCallByNode, c.id)
-			t.sendNextCall(c.id)
 
 		case r := <-t.sendCh:
 			t.send(r.destID, r.destAddr, r.msg, nil)
