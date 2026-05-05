@@ -162,10 +162,10 @@ func (reg *topicReg) registrationLoop(sys *topicSystem) {
 		}
 		time = reg.clock.Now()
 
-		// Initialize the registration state.
-		nodes := sys.transport.tab.allNodes()
+		// Initialize the registration state with DISC-NG capable nodes only.
+		nodes := filterDiscNG(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
-			continue // Local table is empty, retry later.
+			continue // No DISC-NG capable nodes, retry later.
 		}
 		shuffleNodes(nodes)
 		reg.state.AddNodes(nil, nodes)
@@ -232,23 +232,29 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			return true
 
 		case n := <-reg.newNodesCh:
-			reg.state.AddNodes(nil, []*enode.Node{n})
+			if topicindex.SupportsDiscNG(n) {
+				reg.state.AddNodes(nil, []*enode.Node{n})
+			}
 
 		case <-updateCh:
-			att := reg.state.Update()
-			if att != nil {
+			attempt := reg.state.Update()
+			if attempt != nil {
 				sendAttemptCh = reg.regRequest
-				nextAttempt = topicRegJob{att: att}
+				nextAttempt = topicRegJob{
+					attempt: attempt,
+					node:    attempt.Node,
+					ticket:  attempt.Ticket,
+				}
 				nextAttempt.buckets = reg.state.BucketsWithFreeSpace(nextAttempt.buckets[:0])
 			}
 
 		case sendAttemptCh <- nextAttempt:
-			reg.state.StartRequest(nextAttempt.att)
+			reg.state.StartRequest(nextAttempt.attempt)
 			sendAttemptCh = nil
 
 		case resp := <-reg.regResponse:
 			if len(resp.nodes) > 0 {
-				reg.state.AddNodes(resp.att.Node, resp.nodes)
+				reg.state.AddNodes(resp.att.Node, filterDiscNG(resp.nodes))
 			}
 			if resp.err != nil {
 				reg.state.HandleErrorResponse(resp.att, resp.err)
@@ -264,8 +270,14 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 	}
 }
 
+// topicRegJob is a dispatch job handed from the event loop to the request
+// worker. It carries a value snapshot of the attempt's node and ticket, so
+// the worker does not share *RegAttempt state with the event loop goroutine.
+// The attempt field is only used for response correlation on the way back.
 type topicRegJob struct {
-	att     *topicindex.RegAttempt
+	attempt *topicindex.RegAttempt
+	node    *enode.Node
+	ticket  []byte
 	buckets []uint
 }
 
@@ -282,10 +294,9 @@ func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 	defer reg.wg.Done()
 
 	for job := range reg.regRequest {
-		n := job.att.Node
 		topic := reg.state.Topic()
-		resp := sys.transport.regtopic(n, topic, job.att.Ticket, job.buckets, reg.opid)
-		resp.att = job.att
+		resp := sys.transport.regtopic(job.node, topic, job.ticket, job.buckets, reg.opid)
+		resp.att = job.attempt
 
 		select {
 		case reg.regResponse <- resp:
@@ -359,7 +370,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		time = s.config.Clock.Now()
 
 		state := topicindex.NewSearch(s.topic, s.config)
-		nodes := sys.transport.tab.allNodes()
+		nodes := filterDiscNG(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
 		}
@@ -431,8 +442,8 @@ func (s *topicSearch) run(state *topicindex.Search) (exit bool) {
 
 		case queryCh <- nextQuery:
 		case resp := <-s.queryRespCh:
-			state.AddNodes(resp.src, resp.auxNodes)
-			state.AddQueryResults(resp.src, resp.topicNodes)
+			state.AddNodes(resp.src, filterDiscNG(resp.auxNodes))
+			state.AddQueryResults(resp.src, filterDiscNG(resp.topicNodes))
 			if resp.err != nil {
 				s.config.Log.Debug("TOPICQUERY/v5 failed", "topic", s.topic, "id", resp.src.ID(), "err", resp.err)
 			}
@@ -505,4 +516,15 @@ func (tsi *topicSearchIterator) Close() {
 	tsi.closing.Do(func() {
 		tsi.sys.stopSearch(tsi.search)
 	})
+}
+
+// filterDiscNG returns only the nodes that advertise DISC-NG support in their ENR.
+func filterDiscNG(nodes []*enode.Node) []*enode.Node {
+	filtered := make([]*enode.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if topicindex.SupportsDiscNG(n) {
+			filtered = append(filtered, n)
+		}
+	}
+	return filtered
 }
