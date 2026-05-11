@@ -94,3 +94,14 @@ func (t TopicID) String() string {
 // Never is a special time value returned by certain event-scheduling functions.
 // It indicates that the event should not be scheduled.
 const Never = ^mclock.AbsTime(0)
+
+// DiscNG is an ENR entry indicating that a node supports the DISC-NG
+// topic discovery protocol. Its presence in a node's ENR signals capability.
+type DiscNG struct{}
+
+func (DiscNG) ENRKey() string { return "discng" }
+
+// SupportsDiscNG reports whether a node's ENR contains the discng capability flag.
+func SupportsDiscNG(n *enode.Node) bool {
+	return n.Record().Load(new(DiscNG)) == nil
+}
