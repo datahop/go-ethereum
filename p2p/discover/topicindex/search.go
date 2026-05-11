@@ -48,8 +48,6 @@ type Search struct {
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
 	resultSeen   map[enode.ID]struct{}
-
-	queriesWithoutNewNodes int
 }
 
 type searchBucket struct {
@@ -91,28 +89,22 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 // this search state should be abandoned and a new search started using a
 // fresh Search instance.
 func (s *Search) IsDone() bool {
-	// TODO: what's the condition here?
-	//
-	// Ideas:
-	//
-	//   - n total results reached
-	//   - results from n sources received
-	//   - closest nodes reached (requires improved lookup tracking)
-	//   - buckets fuller than X
-
-	// The search cannot be done while there are unused results in the buffer,
-	// or while there are still nodes that could be asked.
+	// The search cannot be done while there are unused results in the buffer.
 	if len(s.resultBuffer) > 0 {
 		return false
 	}
+	// The search cannot be done while there are still nodes that could be asked.
 	for _, b := range s.buckets {
 		if len(b.new) > 0 {
 			return false
 		}
 	}
-	// No unasked nodes remain. Consider it done when the last
-	// two lookups didn't yield any new nodes.
-	return s.queriesWithoutNewNodes >= 4
+	// No unasked nodes remain and no results are buffered: the search is
+	// saturated. There is no deeper "stalled but not yet done" state to wait
+	// for, because once every bucket's `new` set is empty, QueryTarget
+	// returns nil and no further queries (and thus no further AddNodes calls
+	// that could change this state) can occur.
+	return true
 }
 
 // BucketsWithFreeSpace gives n distances from the topic at which
@@ -134,7 +126,6 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		delete(s.bucketCheck, k)
 	}
 
-	var anyNewNode bool
 	for _, n := range nodes {
 		id := n.ID()
 		if id == s.cfg.Self {
@@ -162,14 +153,7 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 
 		// All checks passed, add the node.
-		anyNewNode = true
 		b.new[id] = n
-	}
-
-	if !anyNewNode {
-		s.queriesWithoutNewNodes++
-	} else {
-		s.queriesWithoutNewNodes = 0
 	}
 }
 

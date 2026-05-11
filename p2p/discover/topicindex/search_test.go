@@ -71,6 +71,67 @@ func sbContainsAll(b searchBucket, nodes []*enode.Node) bool {
 	return true
 }
 
+// TestSearchIsDoneNoUnaskedNodes verifies that IsDone returns true once every
+// bucket's `new` set is empty and no results are buffered. Without this, the
+// search state would deadlock: once `new` is empty across all buckets,
+// QueryTarget returns nil, no further query is sent, no AddNodes call can
+// occur, and any counter-based termination heuristic can never advance.
+// See datahop/go-ethereum#27.
+func TestSearchIsDoneNoUnaskedNodes(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	// A freshly created Search with no candidates is immediately done — the
+	// caller should roll over to a new search rather than spin.
+	if !s.IsDone() {
+		t.Fatal("IsDone should return true on an empty Search (no unasked nodes, no buffered results)")
+	}
+
+	// Seed one bucket with unasked nodes. IsDone should now be false.
+	nodes := nodesAtDistanceFrom(enode.ID(topic1), 255, 3, 1)
+	s.AddNodes(nil, nodes)
+	if s.IsDone() {
+		t.Fatal("IsDone should return false while unasked nodes remain")
+	}
+
+	// Mark every unasked node as asked. With no buffered results and no
+	// remaining `new` entries, IsDone must return true even though no query
+	// produced any new nodes (queriesWithoutNewNodes-style counters can't
+	// progress in this state).
+	for i := range s.buckets {
+		b := &s.buckets[i]
+		for id, n := range b.new {
+			b.setAsked(n)
+			delete(b.new, id)
+		}
+	}
+	if !s.IsDone() {
+		t.Fatal("IsDone should return true once all buckets are exhausted")
+	}
+}
+
+// TestSearchIsDoneBufferedResults verifies that IsDone keeps returning false
+// while buffered results have not yet been consumed by the caller, even when
+// no unasked nodes remain.
+func TestSearchIsDoneBufferedResults(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	src := nodeAtDistance(enode.ID(topic1), 255, intIP(1))
+	results := nodesAtDistanceFrom(enode.ID(topic1), 200, 2, 100)
+	s.AddQueryResults(src, results)
+
+	if s.IsDone() {
+		t.Fatal("IsDone should return false while results are buffered")
+	}
+	for range results {
+		s.PopResult()
+	}
+	if !s.IsDone() {
+		t.Fatal("IsDone should return true after all results have been popped")
+	}
+}
+
 // This checks (de)queueing of topic search results.
 func TestSearchResultsTracking(t *testing.T) {
 	config := testConfig(t)
