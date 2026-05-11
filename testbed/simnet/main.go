@@ -207,10 +207,9 @@ func runSearches(searchers []nodeRec, registrants map[enode.ID]struct{}, target 
 				} else {
 					extra++
 				}
-				if registered >= target {
-					iter.Close()
-					break
-				}
+				// Early-break removed on purpose: we want to observe whether
+				// iter.Next() returns false on its own with the IsDone fix
+				// (#27) and the search-tracking fix (#28) in place.
 			}
 			elapsed := time.Since(start)
 
