@@ -552,7 +552,9 @@ func (t *UDPv5) verifyResponseNode(c *callV5, r *enr.Record, distances []uint, s
 }
 
 // regtopic sends REGTOPIC to node n and waits for responses.
-func (t *UDPv5) regtopic(n *enode.Node, topic topicindex.TopicID, ticket []byte, buckets []uint, opid uint64) topicRegResult {
+// regtopic sends REGTOPIC and waits for responses. The call returns early
+// with errClosed if quit is closed before all responses arrive.
+func (t *UDPv5) regtopic(quit <-chan struct{}, n *enode.Node, topic topicindex.TopicID, ticket []byte, buckets []uint, opid uint64) topicRegResult {
 	req := &v5wire.Regtopic{
 		Topic:   topic,
 		Ticket:  ticket,
@@ -573,6 +575,9 @@ func (t *UDPv5) regtopic(n *enode.Node, topic topicindex.TopicID, ticket []byte,
 	)
 	for result.err == nil && (!confirmed || (total >= 0 && received < total)) {
 		select {
+		case <-quit:
+			result.err = errClosed
+			return result
 		case responseMsg := <-c.ch:
 			switch resp := responseMsg.(type) {
 			case *v5wire.Regconfirmation:
@@ -607,8 +612,9 @@ func (t *UDPv5) regtopic(n *enode.Node, topic topicindex.TopicID, ticket []byte,
 	return result
 }
 
-// topicQuery sends TOPICQUERY and waits for responses.
-func (t *UDPv5) topicQuery(n *enode.Node, topic topicindex.TopicID, buckets []uint, opid uint64) topicQueryResult {
+// topicQuery sends TOPICQUERY and waits for responses. The call returns early
+// with errClosed if quit is closed before all responses arrive.
+func (t *UDPv5) topicQuery(quit <-chan struct{}, n *enode.Node, topic topicindex.TopicID, buckets []uint, opid uint64) topicQueryResult {
 	req := &v5wire.TopicQuery{Topic: topic, Buckets: buckets, OpID: opid}
 	c := t.callToNode(n, 0, req) // responseType=0 accepts any response type
 	defer t.callDone(c)
@@ -624,6 +630,9 @@ func (t *UDPv5) topicQuery(n *enode.Node, topic topicindex.TopicID, buckets []ui
 	)
 	for result.err == nil && (total < 0 || received < total) {
 		select {
+		case <-quit:
+			result.err = errClosed
+			return result
 		case responseMsg := <-c.ch:
 			switch resp := responseMsg.(type) {
 			case *v5wire.Nodes:
