@@ -101,11 +101,84 @@ func main() {
 	fmt.Printf("registrations started; register-wait=%s\n", *registerWait)
 	time.Sleep(*registerWait)
 
+	// Snapshot the registration state just before searches start.
+	regCoverage := snapshotRegistrationCoverage(all, registrantIDs)
+	printRegistrationCoverage(regCoverage, len(registrants), len(all))
+
 	// Phase 2: searches.
 	results := runSearches(searchers, registrantIDs, len(registrants), *searchTimeout)
 
-	report(results, len(registrants), *metricsOut)
+	report(results, len(registrants), *metricsOut, regCoverage)
 	fmt.Println("teardown complete")
+}
+
+// registrationCoverage holds the post-register-wait snapshot:
+//
+//	byRegistrant[reg_id]   = how many distinct nodes have reg_id in their topic table
+//	byHost[host_id]        = how many distinct registrants this host knows
+type registrationCoverage struct {
+	ByRegistrant map[string]int `json:"byRegistrant"`
+	ByHost       map[string]int `json:"byHost"`
+}
+
+func snapshotRegistrationCoverage(all []nodeRec, registrantIDs map[enode.ID]struct{}) registrationCoverage {
+	cov := registrationCoverage{
+		ByRegistrant: make(map[string]int),
+		ByHost:       make(map[string]int),
+	}
+	for _, host := range all {
+		visible := host.disc.LocalTopicNodes(testTopic)
+		hostID := host.ln.ID()
+		seen := make(map[enode.ID]struct{})
+		for _, n := range visible {
+			id := n.ID()
+			if id == hostID {
+				continue // ignore self
+			}
+			if _, ok := registrantIDs[id]; !ok {
+				continue // non-registrant noise
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			cov.ByRegistrant[id.String()]++
+		}
+		cov.ByHost[hostID.String()] = len(seen)
+	}
+	return cov
+}
+
+func printRegistrationCoverage(cov registrationCoverage, numRegistrants, numHosts int) {
+	// Per-registrant: how many hosts know each registrant.
+	regCounts := make([]int, 0, numRegistrants)
+	for _, c := range cov.ByRegistrant {
+		regCounts = append(regCounts, c)
+	}
+	sort.Ints(regCounts)
+
+	// Per-host: how many registrants each host sees.
+	hostCounts := make([]int, 0, numHosts)
+	for _, c := range cov.ByHost {
+		hostCounts = append(hostCounts, c)
+	}
+	sort.Ints(hostCounts)
+
+	fmt.Println()
+	fmt.Println("=== post-register-wait coverage ===")
+	if len(regCounts) == 0 {
+		fmt.Println("no registrants visible on any remote node")
+	} else {
+		fmt.Printf("per-registrant fan-out (hosts that know each registrant):\n")
+		fmt.Printf("  registrants visible somewhere: %d / %d\n", len(regCounts), numRegistrants)
+		fmt.Printf("  fan-out                        min=%d  med=%d  max=%d  (cap = %d hosts)\n",
+			regCounts[0], regCounts[len(regCounts)/2], regCounts[len(regCounts)-1], numHosts)
+	}
+	if len(hostCounts) > 0 {
+		fmt.Printf("per-host registrant view (registrants known by each host):\n")
+		fmt.Printf("  view size                      min=%d  med=%d  max=%d  (cap = %d registrants)\n",
+			hostCounts[0], hostCounts[len(hostCounts)/2], hostCounts[len(hostCounts)-1], numRegistrants)
+	}
 }
 
 func spawnNodes(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, count int) []nodeRec {
@@ -250,7 +323,7 @@ func runSearches(searchers []nodeRec, registrants map[enode.ID]struct{}, target 
 	return results
 }
 
-func report(results []searchResult, target int, metricsOut string) {
+func report(results []searchResult, target int, metricsOut string, regCoverage registrationCoverage) {
 	if len(results) == 0 {
 		fmt.Println("no searchers")
 		return
@@ -293,16 +366,17 @@ func report(results []searchResult, target int, metricsOut string) {
 		percentile(latenciesComplete, 50), percentile(latenciesComplete, 95))
 
 	if metricsOut != "" {
-		writeMetrics(metricsOut, results, target)
+		writeMetrics(metricsOut, results, target, regCoverage)
 		fmt.Printf("metrics written to: %s\n", metricsOut)
 	}
 }
 
-func writeMetrics(path string, results []searchResult, target int) {
+func writeMetrics(path string, results []searchResult, target int, regCoverage registrationCoverage) {
 	out := map[string]any{
-		"target":     target,
-		"numSearchers": len(results),
-		"results":    results,
+		"target":               target,
+		"numSearchers":         len(results),
+		"results":              results,
+		"registrationCoverage": regCoverage,
 	}
 	f, err := os.Create(path)
 	if err != nil {
