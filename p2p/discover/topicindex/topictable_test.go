@@ -22,6 +22,7 @@ import (
 	mrand "math/rand"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/internal/testlog"
 	"github.com/ethereum/go-ethereum/log"
@@ -46,6 +47,29 @@ func TestTopicTableWait(t *testing.T) {
 	wt2 := tab.Register(n, topic1, wt)
 	if wt2 != 0 {
 		t.Fatal("node not registered after waiting")
+	}
+}
+
+// TestTopicTableRegisterMinWaitAdmissionFloor verifies that the registrar
+// admits immediately when the formula's required wait is below MinWaitTime,
+// instead of issuing a ticket with a clamped-up wait. This avoids a wasted
+// round-trip plus mandatory MinWaitTime sleep on honest near-empty-cache
+// registrations.
+func TestTopicTableRegisterMinWaitAdmissionFloor(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MinWaitTime = 30 * time.Second
+	tab := NewTopicTable(cfg)
+
+	// First call with waitTime=0: the cache is empty, so the formula's
+	// required wait is small (<< 30s). The admission floor should kick in
+	// and admit immediately, returning 0.
+	n := newNode()
+	wt := tab.Register(n, topic1, 0)
+	if wt != 0 {
+		t.Fatalf("expected immediate admission (returned 0), got wait=%v", wt)
+	}
+	if !tab.isRegistered(n, topic1) {
+		t.Fatal("node should be registered after admission floor admit")
 	}
 }
 

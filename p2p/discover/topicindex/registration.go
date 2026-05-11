@@ -288,6 +288,27 @@ func (r *Registration) validate(att *RegAttempt) {
 // request with a ticket and waiting time.
 func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, waitTime time.Duration) {
 	r.validate(att)
+
+	// Clamp incoming wait time to a sane range.
+	//
+	// Floor (MinWaitTime): without it, a misbehaving registrar can quote
+	// arbitrarily small wait times (0 to ~milliseconds) and force the
+	// registrant into a tight resend loop, burning bandwidth and bucket
+	// slots. With the floor, each retry costs at least MinWaitTime of real
+	// time, so the existing RegAttemptTimeout cumulative cap bounds the
+	// total number of retries to RegAttemptTimeout / MinWaitTime.
+	//
+	// Ceiling (AdLifetime): mirrors the paper's Algorithm 1 SLEEP step,
+	// SLEEP(min(E, response.ticket.wait_for)). A single huge first quote
+	// would otherwise park a slot until that wait elapsed, since the
+	// cumulative cap only fires after reqCount > 1.
+	if waitTime < r.cfg.MinWaitTime {
+		waitTime = r.cfg.MinWaitTime
+	}
+	if waitTime > r.cfg.AdLifetime {
+		waitTime = r.cfg.AdLifetime
+	}
+
 	att.totalWaitTime += waitTime
 
 	// Drop the attempt when the registrar makes us wait for longer than AdLifetime. This
@@ -297,8 +318,6 @@ func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, wait
 		r.removeAttempt(att, "wtime-too-high")
 		return
 	}
-
-	// TODO: should a maximum number of retries be enforced here?
 
 	att.Ticket = ticket
 	att.NextTime = r.cfg.Clock.Now().Add(waitTime)
