@@ -34,8 +34,9 @@ type topicSystem struct {
 	transport *UDPv5
 	config    topicindex.Config
 
-	mu  sync.Mutex
-	reg map[topicindex.TopicID]*topicReg
+	mu     sync.Mutex
+	reg    map[topicindex.TopicID]*topicReg
+	search map[*topicSearch]struct{}
 }
 
 func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
@@ -43,6 +44,7 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 		transport: transport,
 		config:    config,
 		reg:       make(map[topicindex.TopicID]*topicReg),
+		search:    make(map[*topicSearch]struct{}),
 	}
 }
 
@@ -70,6 +72,10 @@ func (sys *topicSystem) stop() {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
+	for s := range sys.search {
+		s.stop()
+		delete(sys.search, s)
+	}
 	for topic, reg := range sys.reg {
 		reg.stop()
 		delete(sys.reg, topic)
@@ -82,7 +88,17 @@ func (sys *topicSystem) newSearchIterator(topic topicindex.TopicID, opid uint64)
 
 	resultCh := make(chan *enode.Node, 200)
 	s := newTopicSearch(sys, topic, resultCh, opid)
+	sys.search[s] = struct{}{}
 	return newTopicSearchIterator(sys, s, resultCh)
+}
+
+// removeSearch removes a search from the tracked set after it has been
+// stopped by the application via iter.Close(). It is a no-op if the search
+// was already removed (e.g. by sys.stop()).
+func (sys *topicSystem) removeSearch(s *topicSearch) {
+	sys.mu.Lock()
+	defer sys.mu.Unlock()
+	delete(sys.search, s)
 }
 
 // topicReg handles registering for a single topic.
@@ -289,8 +305,9 @@ type topicSearch struct {
 	opid   uint64
 	config topicindex.Config
 
-	wg   sync.WaitGroup
-	quit chan struct{}
+	wg       sync.WaitGroup
+	quitOnce sync.Once
+	quit     chan struct{}
 
 	queryCh     chan topicQueryJob
 	queryRespCh chan topicQueryResult
@@ -322,7 +339,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 }
 
 func (s *topicSearch) stop() {
-	close(s.quit)
+	s.quitOnce.Do(func() { close(s.quit) })
 	s.wg.Wait()
 }
 
@@ -484,5 +501,8 @@ func (tsi *topicSearchIterator) Node() *enode.Node {
 }
 
 func (tsi *topicSearchIterator) Close() {
-	tsi.closing.Do(tsi.search.stop)
+	tsi.closing.Do(func() {
+		tsi.search.stop()
+		tsi.sys.removeSearch(tsi.search)
+	})
 }
