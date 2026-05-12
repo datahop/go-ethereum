@@ -274,7 +274,7 @@ func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 
 	for job := range reg.regRequest {
 		topic := reg.state.Topic()
-		resp := sys.transport.regtopic(job.node, topic, job.ticket, job.buckets, reg.opid)
+		resp := sys.transport.regtopic(reg.quit, job.node, topic, job.ticket, job.buckets, reg.opid)
 		resp.att = job.attempt
 
 		select {
@@ -451,7 +451,7 @@ func (s *topicSearch) runRequests(sys *topicSystem) {
 	defer s.wg.Done()
 
 	for job := range s.queryCh {
-		result := sys.transport.topicQuery(job.dst, s.topic, job.buckets, s.opid)
+		result := sys.transport.topicQuery(s.quit, job.dst, s.topic, job.buckets, s.opid)
 		result.src = job.dst
 
 		select {
