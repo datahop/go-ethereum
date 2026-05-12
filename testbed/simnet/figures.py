@@ -372,6 +372,12 @@ def write_report(out_dir, label, params, per_topic, results, cov_by_topic, reg_t
         lines.append(f"| {k} | {v} |")
     lines.append("")
 
+    # Figure 1 lives in the setup section — it's a visual of the topic
+    # distribution drawn by the Zipf process, i.e. another input parameter.
+    if os.path.exists(os.path.join(out_dir, "01_topic_distribution.png")):
+        lines.append("![01_topic_distribution](01_topic_distribution.png)\n")
+        lines.append("*Nodes per topic (Zipf draw).*\n")
+
     # Aggregate
     n_searchers = sum(r["numSearchers"] for r in per_topic)
     full = sum(r["fullRecall"] for r in per_topic)
@@ -445,8 +451,9 @@ def write_report(out_dir, label, params, per_topic, results, cov_by_topic, reg_t
         lines.append("> *Wall-clock time from the start of the registration phase to the first time each registrant appeared in any other host's topic table (i.e. time-to-first-remote-admission). Sampling resolution = `-reg-probe-period`.*\n")
 
     lines.append("## Figures\n")
+    # Figure 01 (topic distribution) is embedded above in the Simulation
+    # parameters section and intentionally omitted from this list.
     figs = [
-        ("01_topic_distribution", "Nodes per topic (Zipf draw)."),
         ("02_time_to_first_cdf", "CDF of time-to-first result across all searchers."),
         ("03_unique_found_over_time", "Per-topic mean ± 1σ of unique registrants discovered over time."),
         ("04_id_space_registrants", "ID-space distribution of registrants admitted to ≥1 registrar (one row per topic)."),
@@ -510,12 +517,16 @@ def main():
     fig.savefig(os.path.join(out, "02_time_to_first_cdf.pdf"))
     plt.close(fig)
 
-    # 03 unique-found over time
-    fig, ax = plt.subplots(figsize=(8, 5))
-    plot_unique_found_over_time(per_topic, results, ax, label)
-    fig.savefig(os.path.join(out, "03_unique_found_over_time.png"))
-    fig.savefig(os.path.join(out, "03_unique_found_over_time.pdf"))
-    plt.close(fig)
+    # 03 unique-found over time (only if per-find timestamps were captured)
+    has_unique_timestamps = any(r.get("uniqueFoundAtMs") for r in results)
+    if has_unique_timestamps:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        plot_unique_found_over_time(per_topic, results, ax, label)
+        fig.savefig(os.path.join(out, "03_unique_found_over_time.png"))
+        fig.savefig(os.path.join(out, "03_unique_found_over_time.pdf"))
+        plt.close(fig)
+    else:
+        print(f"[{label}] skipping figure 03 (no uniqueFoundAtMs in metrics — predates instrumentation)")
 
     # 04 ID-space registrants
     fig, ax = plt.subplots(figsize=(10, 0.5 * len(per_topic) + 1.5))
@@ -540,12 +551,16 @@ def main():
     fig.savefig(os.path.join(out, "06_fanout_both_views.pdf"))
     plt.close(fig)
 
-    # 07 registration latency bar
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    plot_registration_latency_bar(per_topic, reg_timing, ax, label)
-    fig.savefig(os.path.join(out, "07_registration_latency_bar.png"))
-    fig.savefig(os.path.join(out, "07_registration_latency_bar.pdf"))
-    plt.close(fig)
+    # 07 registration latency bar (only if probe data is present)
+    has_reg_timing = bool(reg_timing) and any(v for v in reg_timing.values())
+    if has_reg_timing:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        plot_registration_latency_bar(per_topic, reg_timing, ax, label)
+        fig.savefig(os.path.join(out, "07_registration_latency_bar.png"))
+        fig.savefig(os.path.join(out, "07_registration_latency_bar.pdf"))
+        plt.close(fig)
+    else:
+        print(f"[{label}] skipping figure 07 (no registrationTimingNs in metrics — predates instrumentation)")
 
     # Markdown report
     write_report(out, label, params, per_topic, results, cov_by_topic, reg_timing, num_hosts)
