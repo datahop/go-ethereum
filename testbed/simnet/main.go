@@ -47,10 +47,11 @@ func makeTopic(i int) topicindex.TopicID {
 }
 
 type nodeRec struct {
-	idx  int
-	key  *ecdsa.PrivateKey
-	ln   *enode.LocalNode
-	disc *discover.UDPv5
+	idx    int
+	key    *ecdsa.PrivateKey
+	ln     *enode.LocalNode
+	disc   *discover.UDPv5
+	legacy bool // true if the DiscNG ENR flag was stripped — used by the validation workload
 }
 
 func main() {
@@ -64,6 +65,7 @@ func main() {
 	numTopics := flag.Int("topics", 1, "number of distinct topics; if > 1 each node draws one via Zipf and both registers and searches it")
 	zipfS := flag.Float64("zipf-s", 1.07, "Zipf skew parameter for topic assignment when -topics > 1")
 	seed := flag.Int64("seed", 0, "RNG seed for Zipf draws (0 = use current time)")
+	legacyFrac := flag.Float64("legacy-frac", 0.0, "fraction of nodes that are 'legacy' (no DISC-NG ENR flag); enables incremental-deployment validation workload — see issue #6")
 	metricsOut := flag.String("metrics-out", "", "if set, write workload metrics to this JSON file")
 	flag.Parse()
 
@@ -79,7 +81,8 @@ func main() {
 		Uplink:   simnet.LinkSettings{BitsPerSecond: *bandwidthMibps * simnet.Mibps},
 	}
 
-	all := spawnNodes(sim, settings, *nodes)
+	legacySet := pickLegacySet(*nodes, *legacyFrac, *seed)
+	all := spawnNodes(sim, settings, *nodes, legacySet)
 
 	sim.Start()
 	defer sim.Close()
@@ -92,12 +95,35 @@ func main() {
 	fmt.Printf("simnet up; bootstrap-wait=%s\n", *bootstrapWait)
 	time.Sleep(*bootstrapWait)
 
-	if *numTopics <= 1 {
+	switch {
+	case *legacyFrac > 0:
+		runDiscNGValidationWorkload(all, *registerWait, *searchTimeout, *metricsOut)
+	case *numTopics <= 1:
 		runSingleTopicWorkload(all, *registerWait, *searchTimeout, *registerFrac, *metricsOut)
-	} else {
+	default:
 		runMultiTopicWorkload(all, *numTopics, *zipfS, *seed, *registerWait, *searchTimeout, *metricsOut)
 	}
 	fmt.Println("teardown complete")
+}
+
+// pickLegacySet deterministically chooses which node indices will have the
+// DISC-NG ENR flag stripped, simulating legacy Discv5 peers in a mixed
+// population.
+func pickLegacySet(total int, frac float64, seed int64) map[int]bool {
+	count := int(float64(total) * frac)
+	if count <= 0 {
+		return nil
+	}
+	s := seed
+	if s == 0 {
+		s = time.Now().UnixNano()
+	}
+	rng := rand.New(rand.NewSource(s))
+	set := make(map[int]bool, count)
+	for _, i := range rng.Perm(total)[:count] {
+		set[i] = true
+	}
+	return set
 }
 
 func runSingleTopicWorkload(all []nodeRec, registerWait, searchTimeout time.Duration, registerFrac float64, metricsOut string) {
@@ -247,7 +273,7 @@ func printRegistrationCoverage(cov registrationCoverage, numRegistrants, numHost
 	}
 }
 
-func spawnNodes(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, count int) []nodeRec {
+func spawnNodes(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, count int, legacySet map[int]bool) []nodeRec {
 	all := make([]nodeRec, 0, count)
 	for i := 0; i < count; i++ {
 		key, err := crypto.GenerateKey()
@@ -298,9 +324,70 @@ func spawnNodes(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, count 
 			fatalf("listen v5 on node %d: %v", i, err)
 		}
 
-		all = append(all, nodeRec{idx: i, key: key, ln: ln, disc: disc})
+		// Strip the DISC-NG capability flag from the LocalNode's record
+		// before sim.Start() so this node looks like a stock-Discv5 peer
+		// on the wire. ListenV5 sets the flag inside newUDPv5; we delete
+		// here, before any packet is sent, so peers only ever see the
+		// legacy version of this node's ENR.
+		legacy := legacySet[i]
+		if legacy {
+			ln.Delete(new(topicindex.DiscNG))
+		}
+
+		all = append(all, nodeRec{idx: i, key: key, ln: ln, disc: disc, legacy: legacy})
 	}
 	return all
+}
+
+// runDiscNGValidationWorkload exercises the incremental-deployment design
+// from issue #6: in a mixed population, flagged nodes register and search a
+// topic while legacy nodes (no DISC-NG ENR flag) stay passive. The expected
+// outcome is that filterDiscNG keeps REGTOPIC/TOPICQUERY off the legacy
+// peers — so legacy hosts must end up with zero entries in their topic
+// tables for the test topic, and flagged hosts should see the full
+// flagged-registrant set.
+func runDiscNGValidationWorkload(all []nodeRec, registerWait, searchTimeout time.Duration, metricsOut string) {
+	var flagged, legacy []nodeRec
+	flaggedIDs := make(map[enode.ID]struct{})
+	for _, n := range all {
+		if n.legacy {
+			legacy = append(legacy, n)
+		} else {
+			flagged = append(flagged, n)
+			flaggedIDs[n.ln.ID()] = struct{}{}
+		}
+	}
+	fmt.Printf("DISC-NG validation: %d flagged (register+search), %d legacy (passive), topic=%x\n",
+		len(flagged), len(legacy), testTopic[:])
+
+	for _, n := range flagged {
+		n.disc.RegisterTopic(testTopic, uint64(n.idx))
+	}
+	fmt.Printf("registrations started; register-wait=%s\n", registerWait)
+	time.Sleep(registerWait)
+
+	cov := snapshotRegistrationCoverage(all, flaggedIDs)
+	printRegistrationCoverage(cov, len(flagged), len(all))
+
+	var flaggedSum, legacySum int
+	for _, n := range flagged {
+		flaggedSum += cov.ByHost[n.ln.ID().String()]
+	}
+	for _, n := range legacy {
+		legacySum += cov.ByHost[n.ln.ID().String()]
+	}
+	fmt.Println()
+	fmt.Println("=== DISC-NG filter validation (issue #6) ===")
+	fmt.Printf("  flagged hosts (%d): %d flagged-registrant entries summed across hosts\n", len(flagged), flaggedSum)
+	fmt.Printf("  legacy hosts  (%d): %d flagged-registrant entries summed across hosts (expected 0)\n", len(legacy), legacySum)
+	if legacySum == 0 && flaggedSum > 0 {
+		fmt.Println("  RESULT: PASS — no REGTOPIC leaked to legacy peers")
+	} else {
+		fmt.Println("  RESULT: FAIL — filterDiscNG did not isolate the populations")
+	}
+
+	results := runSearches(flagged, flaggedIDs, len(flagged)-1, searchTimeout)
+	report(results, len(flagged)-1, metricsOut, cov)
 }
 
 // searchResult captures the metrics for one searcher's call to TopicSearch.
