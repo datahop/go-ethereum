@@ -1,0 +1,6 @@
+# Local artifacts — not part of the testbed source.
+simnet
+*.json
+*.log
+results/
+figures-*/
