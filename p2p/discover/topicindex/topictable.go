@@ -34,8 +34,8 @@ const (
 	occupancyExp = 10
 )
 
-// (note: the legacy 50ms admission slack is now superseded by Config.MinWaitTime,
-// see TopicTable.Register.)
+// If a node has less than this time to wait, they will be accepted anyway.
+const topicTableWaitTimeFloor = 50 * time.Millisecond
 
 // TopicTable holds node registrations.
 type TopicTable struct {
@@ -235,26 +235,7 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 }
 
 // Register adds node n for topic t if it has waited long enough.
-//
-// Returns 0 if the node is admitted, otherwise the new wait time the
-// registrant should observe before retrying.
-//
-// MinWaitTime acts as an admission floor: if the registrar's §6 eq. 1
-// formula would yield a wait below MinWaitTime, the registrant is admitted
-// immediately rather than being issued a ticket. This collapses the wasted
-// round-trip plus mandatory MinWaitTime sleep that an explicit clamp would
-// otherwise impose on honest near-empty-cache registrations.
-//
-// Non-zero return values (e.g. cache-full path) are still clamped to at
-// least MinWaitTime so the wire-level promise "quote is either 0 or >=
-// MinWaitTime" holds.
-func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration) (newWait time.Duration) {
-	defer func() {
-		if newWait > 0 && newWait < tab.config.MinWaitTime {
-			newWait = tab.config.MinWaitTime
-		}
-	}()
-
+func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration) time.Duration {
 	// Reject attempt if node is already registered.
 	if tab.isRegistered(n, t) {
 		return 0
@@ -264,10 +245,7 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 	requiredTime := tab.WaitTime(n, t)
 	if waitTime < requiredTime {
 		remaining := requiredTime - waitTime
-		// Admission floor: if remaining time is below MinWaitTime, treat the
-		// registrant as having waited enough and admit. The 50ms legacy
-		// jitter buffer is subsumed.
-		if remaining > tab.config.MinWaitTime {
+		if remaining > topicTableWaitTimeFloor {
 			return remaining
 		}
 	}

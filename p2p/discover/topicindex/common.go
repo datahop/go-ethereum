@@ -37,7 +37,6 @@ type Config struct {
 	RegBucketSize         int           // max/ number of active nodes in registration bucket
 	RegBucketStandbyLimit int           // max. number of 'standby' state nodes in bucket
 	RegAttemptTimeout     time.Duration // maximum amount of time to wait on one attempt
-	MinWaitTime           time.Duration // floor applied to ticket WaitTime quoted by a registrar
 
 	// Search settings.
 	SearchBucketSize int // number of nodes in search buckets
@@ -67,20 +66,6 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.RegBucketStandbyLimit == 0 {
 		cfg.RegBucketStandbyLimit = 20
-	}
-	if cfg.MinWaitTime == 0 {
-		// Floor on incoming ticket WaitTime. Without it, a misbehaving
-		// registrar can quote arbitrarily small wait times and force the
-		// registrant into a tight resend loop. Combined with
-		// RegAttemptTimeout, this also bounds the per-attempt retry count
-		// to RegAttemptTimeout / MinWaitTime.
-		//
-		// 10s is a compromise: aggressive enough to cap millisecond-spam
-		// attacks (~135 retries before RegAttemptTimeout fires, vs >10^4
-		// unbounded), without unduly slowing honest registration in
-		// near-empty caches where the §6 formula would naturally quote
-		// sub-second waits.
-		cfg.MinWaitTime = 10 * time.Second
 	}
 	if cfg.SearchBucketSize == 0 {
 		cfg.SearchBucketSize = 8
