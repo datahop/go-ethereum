@@ -379,14 +379,12 @@ def write_report(out_dir, label, params, per_topic, results, cov_by_topic, reg_t
     # Aggregate
     n_searchers = sum(r["numSearchers"] for r in per_topic)
     full = sum(r["fullRecall"] for r in per_topic)
-    timeouts = sum(r["hitTimeout"] for r in per_topic)
     lines.append("## Aggregate results\n")
     lines.append("| metric | value |")
     lines.append("|---|---|")
     lines.append(f"| total nodes (every node both registers and searches its topic) | {n_searchers} |")
     lines.append(f"| topics | {len(per_topic)} |")
     lines.append(f"| full-recall searches | {full} / {n_searchers} |")
-    lines.append(f"| searches that hit the wall-clock timeout | {timeouts} / {n_searchers} |")
     lines.append("")
 
     by_topic_results = collections.defaultdict(list)
