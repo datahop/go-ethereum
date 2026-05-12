@@ -71,6 +71,27 @@ func sbContainsAll(b searchBucket, nodes []*enode.Node) bool {
 	return true
 }
 
+// TestSearchAddNodesOnePerBucketRule verifies that within a single AddNodes
+// call from a non-nil src, at most one node is admitted to any given search
+// bucket. Regression test for an earlier bug where bucketCheck was read but
+// never written, so the rule never triggered.
+func TestSearchAddNodesOnePerBucketRule(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	src := enode.SignNull(new(enr.Record), enode.ID{})
+	// Two nodes from the same source at the same distance from the topic
+	// hash to the same search bucket. With the rule enforced, only one is
+	// kept.
+	sameBucket := nodesAtDistanceFrom(enode.ID(topic1), 250, 2, 1)
+	s.AddNodes(src, sameBucket)
+
+	bi := s.bucketIndex(sameBucket[0].ID())
+	if got := s.buckets[bi].count(); got != 1 {
+		t.Fatalf("expected 1 node in bucket[%d] under one-per-bucket-rule, got %d", bi, got)
+	}
+}
+
 // This checks (de)queueing of topic search results.
 func TestSearchResultsTracking(t *testing.T) {
 	config := testConfig(t)
