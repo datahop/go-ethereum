@@ -153,6 +153,93 @@ func TestSearchIsDoneBufferedResults(t *testing.T) {
 	}
 }
 
+// TestSearchQueryTargetSkipsEmptyFarBucket verifies that QueryTarget makes
+// progress when the farthest bucket is empty: it must skip empty buckets and
+// return a node from the next non-empty one. See datahop/go-ethereum#65.
+func TestSearchQueryTargetSkipsEmptyFarBucket(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	// Populate bucket 5 (logdist 251) only. Buckets 0..4 remain empty.
+	mid := nodesAtDistanceFrom(enode.ID(topic1), 251, 3, 1)
+	s.AddNodes(nil, mid)
+
+	target := s.QueryTarget()
+	if target == nil {
+		t.Fatal("QueryTarget returned nil while bucket[5] has unasked nodes")
+	}
+	if !s.buckets[5].contains(target.ID()) {
+		t.Fatalf("QueryTarget returned node not in bucket[5]: %v", target.ID())
+	}
+}
+
+// TestSearchQueryTargetPrefersFarthest verifies that QueryTarget drains the
+// farthest non-empty bucket before advancing to closer ones. Nodes close to
+// the topic are queried last, limiting load on the small set responsible
+// for the topic.
+func TestSearchQueryTargetPrefersFarthest(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	far := nodesAtDistanceFrom(enode.ID(topic1), 256, 3, 1)
+	mid := nodesAtDistanceFrom(enode.ID(topic1), 251, 3, 10)
+	s.AddNodes(nil, far)
+	s.AddNodes(nil, mid)
+
+	// Drain bucket 0 entirely; every pick must come from bucket 0 first.
+	for i := 0; i < len(far); i++ {
+		target := s.QueryTarget()
+		if target == nil {
+			t.Fatalf("QueryTarget returned nil with bucket[0] still populated (iteration %d)", i)
+		}
+		if !s.buckets[0].contains(target.ID()) {
+			t.Fatalf("iteration %d: QueryTarget returned %v from a non-farthest bucket while bucket[0] has unasked nodes", i, target.ID())
+		}
+		s.buckets[0].setAsked(target)
+	}
+	// With bucket 0 drained, next pick must come from bucket 5.
+	target := s.QueryTarget()
+	if target == nil {
+		t.Fatal("QueryTarget returned nil after draining bucket[0] while bucket[5] is populated")
+	}
+	if !s.buckets[5].contains(target.ID()) {
+		t.Fatalf("QueryTarget returned %v after bucket[0] drained; expected a bucket[5] node", target.ID())
+	}
+}
+
+// TestSearchQueryTargetRestartsAfterRefill verifies that newly-added far
+// nodes are picked up before further queries continue draining closer
+// buckets. Each QueryTarget call re-scans from the farthest bucket, so an
+// AddNodes that lands in bucket 0 takes priority over remaining bucket-5
+// candidates.
+func TestSearchQueryTargetRestartsAfterRefill(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	// Start with bucket 5 only.
+	mid := nodesAtDistanceFrom(enode.ID(topic1), 251, 2, 1)
+	s.AddNodes(nil, mid)
+
+	first := s.QueryTarget()
+	if first == nil || !s.buckets[5].contains(first.ID()) {
+		t.Fatalf("expected first pick from bucket[5], got %v", first)
+	}
+	s.buckets[5].setAsked(first)
+
+	// Now bucket 0 receives a node. QueryTarget must prefer it over the
+	// remaining bucket-5 candidate.
+	far := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 10)
+	s.AddNodes(nil, far)
+
+	target := s.QueryTarget()
+	if target == nil {
+		t.Fatal("QueryTarget returned nil with refilled bucket[0]")
+	}
+	if !s.buckets[0].contains(target.ID()) {
+		t.Fatalf("expected pick from refilled bucket[0], got %v", target.ID())
+	}
+}
+
 // This checks (de)queueing of topic search results.
 func TestSearchResultsTracking(t *testing.T) {
 	config := testConfig(t)
