@@ -9,24 +9,12 @@ import (
 	"github.com/marcopolo/simnet"
 )
 
-// simUDPConn adapts a *simnet.SimConn (which implements net.PacketConn using
-// net.Addr / *net.UDPAddr) to discv5's UDPConn interface, which uses
-// netip.AddrPort. The two interfaces are equivalent in semantics; only the
-// address representation differs.
-//
-// Geth's discv5 UDPConn (p2p/discover/common.go):
-//
-//	type UDPConn interface {
-//		ReadFromUDPAddrPort(b []byte) (n int, addr netip.AddrPort, err error)
-//		WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (n int, err error)
-//		Close() error
-//		LocalAddr() net.Addr
-//	}
+// simUDPConn adapts simnet.SimConn (net.PacketConn over net.UDPAddr) to
+// discv5's UDPConn interface (netip.AddrPort).
 type simUDPConn struct {
 	*simnet.SimConn
 }
 
-// ReadFromUDPAddrPort implements UDPConn.
 func (c *simUDPConn) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error) {
 	n, addr, err := c.SimConn.ReadFrom(b)
 	if err != nil {
@@ -35,7 +23,6 @@ func (c *simUDPConn) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error) 
 	return n, addr.(*net.UDPAddr).AddrPort(), nil
 }
 
-// WriteToUDPAddrPort implements UDPConn.
 func (c *simUDPConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
 	return c.SimConn.WriteTo(b, net.UDPAddrFromAddrPort(addr))
 }
