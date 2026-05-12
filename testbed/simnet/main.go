@@ -66,6 +66,7 @@ func main() {
 	zipfS := flag.Float64("zipf-s", 1.07, "Zipf skew parameter for topic assignment when -topics > 1")
 	seed := flag.Int64("seed", 0, "RNG seed for Zipf draws (0 = use current time)")
 	legacyFrac := flag.Float64("legacy-frac", 0.0, "fraction of nodes that are 'legacy' (no DISC-NG ENR flag); enables incremental-deployment validation workload — see issue #6")
+	regProbePeriod := flag.Duration("reg-probe-period", 500*time.Millisecond, "polling period for the registration probe; smaller = finer-grained timing, more CPU")
 	metricsOut := flag.String("metrics-out", "", "if set, write workload metrics to this JSON file")
 	flag.Parse()
 
@@ -101,7 +102,7 @@ func main() {
 	case *numTopics <= 1:
 		runSingleTopicWorkload(all, *registerWait, *searchTimeout, *registerFrac, *metricsOut)
 	default:
-		runMultiTopicWorkload(all, *numTopics, *zipfS, *seed, *registerWait, *searchTimeout, *metricsOut)
+		runMultiTopicWorkload(all, *numTopics, *zipfS, *seed, *registerWait, *searchTimeout, *regProbePeriod, *metricsOut)
 	}
 	fmt.Println("teardown complete")
 }
@@ -152,7 +153,7 @@ func runSingleTopicWorkload(all []nodeRec, registerWait, searchTimeout time.Dura
 	report(results, len(registrants), metricsOut, regCoverage)
 }
 
-func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, registerWait, searchTimeout time.Duration, metricsOut string) {
+func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, registerWait, searchTimeout, regProbePeriod time.Duration, metricsOut string) {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
@@ -189,11 +190,23 @@ func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int
 	}
 
 	// Phase 1: register.
+	regStart := time.Now()
 	for i, n := range all {
 		n.disc.RegisterTopic(topics[nodeTopic[i]], uint64(n.idx))
 	}
-	fmt.Printf("registrations started; register-wait=%s\n", registerWait)
+	fmt.Printf("registrations started; register-wait=%s probe-period=%s\n", registerWait, regProbePeriod)
+
+	// Run the registration probe in parallel with register-wait so we can
+	// timestamp the first time each registrant shows up in any registrar's
+	// topic table.
+	probeStop := make(chan struct{})
+	probeDone := make(chan map[string]map[string]int64, 1)
+	go func() {
+		probeDone <- runRegistrationProbe(all, topics, nodeTopic, regStart, probeStop, regProbePeriod)
+	}()
 	time.Sleep(registerWait)
+	close(probeStop)
+	regTimingNs := <-probeDone
 
 	// Per-topic coverage snapshot.
 	allCov := snapshotMultiTopicCoverage(all, registrantsByTopic, topics)
@@ -201,7 +214,64 @@ func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int
 
 	// Phase 2: searches.
 	results := runMultiTopicSearches(all, nodeTopic, topics, registrantsByTopic, searchTimeout)
-	reportMultiTopic(results, registrantsByTopic, metricsOut, allCov)
+	reportMultiTopic(results, registrantsByTopic, topics, regTimingNs, metricsOut, allCov)
+}
+
+// runRegistrationProbe polls each node's LocalTopicNodes(topic) every
+// probePeriod and records, per registrant, the first wall-clock time
+// (relative to regStart, in nanoseconds) that the registrant appears in any
+// other host's topic table. Self-registrations are excluded (we want
+// time-to-first-remote-admission, not local pre-population).
+//
+// Returned map: topicHex -> registrantIdHex -> ns since regStart.
+func runRegistrationProbe(all []nodeRec, topics []topicindex.TopicID, nodeTopic []int, regStart time.Time, stop <-chan struct{}, period time.Duration) map[string]map[string]int64 {
+	regTopic := make(map[enode.ID]topicindex.TopicID, len(all))
+	for i, n := range all {
+		regTopic[n.ln.ID()] = topics[nodeTopic[i]]
+	}
+
+	out := make(map[string]map[string]int64, len(topics))
+	for _, t := range topics {
+		out[t.String()] = make(map[string]int64)
+	}
+
+	probe := func() {
+		nowNs := time.Since(regStart).Nanoseconds()
+		for _, host := range all {
+			hostID := host.ln.ID()
+			for _, topic := range topics {
+				visible := host.disc.LocalTopicNodes(topic)
+				m := out[topic.String()]
+				for _, n := range visible {
+					id := n.ID()
+					if id == hostID {
+						continue
+					}
+					// Only count if this node is a registrant of this topic.
+					if regTopic[id] != topic {
+						continue
+					}
+					if _, already := m[id.String()]; !already {
+						m[id.String()] = nowNs
+					}
+				}
+			}
+		}
+	}
+
+	tick := time.NewTicker(period)
+	defer tick.Stop()
+
+	probe()
+	for {
+		select {
+		case <-stop:
+			probe() // one final sweep
+			return out
+		case <-tick.C:
+			probe()
+		}
+	}
 }
 
 // registrationCoverage holds the post-register-wait snapshot:
@@ -403,6 +473,10 @@ type searchResult struct {
 	TimeToCompletion time.Duration `json:"timeToCompletionNs"`
 	HitTimeoutBefore bool          `json:"hitTimeout"`
 	FoundIDs         []string      `json:"foundIds"`
+	// UniqueFoundAtMs is the wall-clock millisecond timestamp (relative to
+	// search start) at which the i-th *distinct* registrant was first seen
+	// by this searcher. Drives the "unique-found over time" figure.
+	UniqueFoundAtMs []int64 `json:"uniqueFoundAtMs"`
 }
 
 func runSearches(searchers []nodeRec, registrants map[enode.ID]struct{}, target int, timeout time.Duration) []searchResult {
@@ -431,6 +505,8 @@ func runSearches(searchers []nodeRec, registrants map[enode.ID]struct{}, target 
 				timeFirst  time.Duration
 				registered int
 				extra      int
+				seenReg    = make(map[enode.ID]struct{})
+				uniqueAtMs []int64
 			)
 			selfID := n.ln.ID()
 			for iter.Next() {
@@ -439,17 +515,23 @@ func runSearches(searchers []nodeRec, registrants map[enode.ID]struct{}, target 
 				}
 				id := iter.Node().ID()
 				if id == selfID {
-					continue // ignore self-discoveries when every node also registers
+					continue
 				}
 				found = append(found, id)
 				if _, ok := registrants[id]; ok {
+					if _, dup := seenReg[id]; !dup {
+						seenReg[id] = struct{}{}
+						uniqueAtMs = append(uniqueAtMs, time.Since(start).Milliseconds())
+					}
 					registered++
 				} else {
 					extra++
 				}
-				// Early-break removed on purpose: we want to observe whether
-				// iter.Next() returns false on its own with the IsDone fix
-				// (#27) and the search-tracking fix (#28) in place.
+				// Early-break removed on purpose: search ends only via the
+				// timeout firing (external Close) or iter.Next() returning
+				// false (natural IsDone) — letting us observe whether the
+				// IsDone fix (#27) and search-tracking fix (#28) trigger
+				// natural termination in real workloads.
 			}
 			elapsed := time.Since(start)
 
@@ -457,31 +539,23 @@ func runSearches(searchers []nodeRec, registrants map[enode.ID]struct{}, target 
 			for _, id := range found {
 				ids = append(ids, id.TerminalString())
 			}
+			hitTimeout := false
 			select {
 			case <-done:
-				results[slot] = searchResult{
-					NodeIdx:          n.idx,
-					NodeID:           n.ln.ID().TerminalString(),
-					Found:            len(found),
-					FoundRegistrant:  registered,
-					FoundExtra:       extra,
-					TimeToFirst:      timeFirst,
-					TimeToCompletion: elapsed,
-					HitTimeoutBefore: true,
-					FoundIDs:         ids,
-				}
+				hitTimeout = true
 			default:
-				results[slot] = searchResult{
-					NodeIdx:          n.idx,
-					NodeID:           n.ln.ID().TerminalString(),
-					Found:            len(found),
-					FoundRegistrant:  registered,
-					FoundExtra:       extra,
-					TimeToFirst:      timeFirst,
-					TimeToCompletion: elapsed,
-					HitTimeoutBefore: false,
-					FoundIDs:         ids,
-				}
+			}
+			results[slot] = searchResult{
+				NodeIdx:          n.idx,
+				NodeID:           n.ln.ID().TerminalString(),
+				Found:            len(found),
+				FoundRegistrant:  registered,
+				FoundExtra:       extra,
+				TimeToFirst:      timeFirst,
+				TimeToCompletion: elapsed,
+				HitTimeoutBefore: hitTimeout,
+				FoundIDs:         ids,
+				UniqueFoundAtMs:  uniqueAtMs,
 			}
 		}(i, n)
 	}
@@ -682,6 +756,8 @@ func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.T
 				timeFirst  time.Duration
 				registered int
 				extra      int
+				seenReg    = make(map[enode.ID]struct{})
+				uniqueAtMs []int64
 			)
 			selfID := n.ln.ID()
 			for iter.Next() {
@@ -694,6 +770,10 @@ func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.T
 				}
 				found = append(found, id)
 				if _, ok := regSet[id]; ok {
+					if _, dup := seenReg[id]; !dup {
+						seenReg[id] = struct{}{}
+						uniqueAtMs = append(uniqueAtMs, time.Since(start).Milliseconds())
+					}
 					registered++
 				} else {
 					extra++
@@ -715,6 +795,7 @@ func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.T
 				TimeToFirst:      timeFirst,
 				TimeToCompletion: elapsed,
 				FoundIDs:         ids,
+				UniqueFoundAtMs:  uniqueAtMs,
 			}
 			select {
 			case <-done:
@@ -728,7 +809,7 @@ func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.T
 	return results
 }
 
-func reportMultiTopic(results []searchResult, registrantsByTopic map[int]map[enode.ID]struct{}, metricsOut string, cov multiTopicCoverage) {
+func reportMultiTopic(results []searchResult, registrantsByTopic map[int]map[enode.ID]struct{}, topics []topicindex.TopicID, regTimingNs map[string]map[string]int64, metricsOut string, cov multiTopicCoverage) {
 	// Per-topic search aggregation.
 	type topicReport struct {
 		Topic         int     `json:"topic"`
@@ -787,11 +868,39 @@ func reportMultiTopic(results []searchResult, registrantsByTopic map[int]map[eno
 		})
 	}
 
+	// Brief stdout summary of registration timing (per topic mean/std in ms).
+	if len(regTimingNs) > 0 {
+		fmt.Println()
+		fmt.Println("=== registration timing (time to first remote admission, ms) ===")
+		fmt.Printf("%-6s %12s %12s %12s\n", "topic", "n", "mean", "std")
+		for _, t := range topicIdxs {
+			th := topics[t].String()
+			vals := regTimingNs[th]
+			if len(vals) == 0 {
+				continue
+			}
+			var sum, sumSq float64
+			for _, ns := range vals {
+				ms := float64(ns) / 1e6
+				sum += ms
+				sumSq += ms * ms
+			}
+			n := float64(len(vals))
+			mean := sum / n
+			variance := sumSq/n - mean*mean
+			if variance < 0 {
+				variance = 0
+			}
+			fmt.Printf("%-6d %12d %12.1f %12.1f\n", t, len(vals), mean, variance)
+		}
+	}
+
 	if metricsOut != "" {
 		out := map[string]any{
 			"perTopic":             reports,
 			"results":              results,
 			"registrationCoverage": cov,
+			"registrationTimingNs": regTimingNs,
 		}
 		f, err := os.Create(metricsOut)
 		if err != nil {

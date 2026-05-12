@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate figures and a Markdown report from a simnet testbed metrics JSON file
-(multi-topic Zipf workload — registrationCoverage.byTopic, per-topic results).
+"""Generate figures and a Markdown report from a simnet testbed multi-topic
+metrics JSON file.
 
 Usage:
     figures.py <metrics.json> [--out-dir DIR] [--label LABEL] [--params KEY=VAL ...]
@@ -9,11 +9,17 @@ Each --params entry is stamped into the report's parameters table.
 
 Produces in <DIR> (default ./figures-<label>):
 
-    01_topic_distribution.{png,pdf}        registrants per topic
-    02_per_topic_recall.{png,pdf}          per-topic full-recall and mean recall
-    03_per_topic_fanout.{png,pdf}          per-topic fan-out (registrants known by N hosts)
-    04_per_registrant_discovery.{png,pdf}  for each topic: how many searchers found each registrant
-    05_unique_recall_distribution.{png,pdf} per-topic CDF of per-searcher unique recall
+    01_topic_distribution.{png,pdf}        nodes per topic
+    02_time_to_first_cdf.{png,pdf}         CDF of time-to-first result, all searchers
+    03_unique_found_over_time.{png,pdf}    per-topic mean ± std of unique registrants
+                                           found vs time (drives off uniqueFoundAtMs)
+    04_id_space_registrants.{png,pdf}      strip plot of admitted registrants in
+                                           ID-space, one row per topic
+    05_id_space_found_vs_missed.{png,pdf}  per-topic discovery coverage across ID space
+    06_fanout_both_views.{png,pdf}         side-by-side: (a) per-registrant fan-out
+                                           and (b) per-host load, per topic
+    07_registration_latency_bar.{png,pdf}  mean ± std time-to-first-remote-admission
+                                           per topic, clipped at 0
     report.md                              Markdown report with embedded figures + tables
 """
 import argparse
@@ -59,8 +65,17 @@ def per_topic_fanout(topic_idx, cov_by_topic):
     return fan
 
 
+def per_topic_hostload(topic_idx, cov_by_topic):
+    """How many distinct registrants of this topic each host holds in its
+    topic table. Drives the (b) side of the fan-out figure."""
+    cov_t = cov_by_topic.get(str(topic_idx), {})
+    load = list(cov_t.get("byHost", {}).values())
+    load.sort()
+    return load
+
+
 def per_registrant_discovery(results_for_topic, cov_by_topic, topic_idx):
-    """Returns (sorted list of 'found-by-N-searchers' counts, target list of registrant short IDs)."""
+    """Returns (sorted list of 'found-by-N-searchers' counts, list of registrant short IDs)."""
     fanout = {short_id(k): v for k, v in cov_by_topic.get(str(topic_idx), {}).get("byRegistrant", {}).items()}
     found_count = collections.Counter()
     for r in results_for_topic:
@@ -83,52 +98,28 @@ def unique_recall_per_searcher(results_for_topic, cov_by_topic, topic_idx):
     return out, target
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Figure plotters
+# ────────────────────────────────────────────────────────────────────────────
+
+
 def plot_topic_distribution(per_topic, ax, label):
+    """01: nodes per topic. Ordered by descending count for legibility."""
     topics = sorted(per_topic, key=lambda r: -r["target"])
     xs = list(range(len(topics)))
-    ys = [r["target"] for r in topics]
+    ys = [r["numSearchers"] for r in topics]
     ax.bar(xs, ys, color="#3066BE")
     ax.set_xticks(xs)
     ax.set_xticklabels([f"topic {r['topic']}" for r in topics])
     ax.set_xlabel("topic")
-    ax.set_ylabel("registrants")
-    ax.set_title(f"{label}: topic distribution (Zipf draw)")
+    ax.set_ylabel("nodes")
+    ax.set_title(f"{label}: nodes per topic (Zipf draw — each node both registers and searches)")
     for i, y in enumerate(ys):
         ax.text(i, y + max(ys) * 0.01, str(y), ha="center", fontsize=9)
 
 
-def plot_per_topic_recall(per_topic, results, cov_by_topic, ax, label):
-    topics = sorted(per_topic, key=lambda r: -r["target"])
-    xs = list(range(len(topics)))
-    full = [r["fullRecall"] / r["numSearchers"] if r["numSearchers"] else 0 for r in topics]
-    # Compute per-search avg unique recall (true fraction, dedup) per topic.
-    by_topic = collections.defaultdict(list)
-    for r in results:
-        by_topic[r["topic"]].append(r)
-    mean_unique = []
-    for r in topics:
-        t = r["topic"]
-        rs = by_topic[t]
-        uniq, target = unique_recall_per_searcher(rs, cov_by_topic, t)
-        if not uniq or target == 0:
-            mean_unique.append(0.0)
-        else:
-            mean_unique.append(np.mean([u / target for u in uniq]))
-    width = 0.35
-    ax.bar([x - width / 2 for x in xs], mean_unique, width=width,
-           label="fraction of registrants found (unique, per-search avg)", color="#264653")
-    ax.bar([x + width / 2 for x in xs], full, width=width,
-           label="fraction of complete searches (found all)", color="#E76F51")
-    ax.set_xticks(xs)
-    ax.set_xticklabels([f"topic {r['topic']}\n({r['target']} regs)" for r in topics])
-    ax.set_xlabel("topic")
-    ax.set_ylabel("fraction")
-    ax.set_ylim(0, 1.05)
-    ax.set_title(f"{label}: discovery success per topic")
-    ax.legend(loc="lower right", fontsize=9)
-
-
 def plot_time_to_first_cdf(results, ax, label):
+    """02: CDF of time-to-first result across all searchers."""
     vals = [r["timeToFirstNs"] / 1e6 for r in results if r["timeToFirstNs"] > 0]
     if not vals:
         ax.set_title(f"{label}: no first-result data")
@@ -137,56 +128,97 @@ def plot_time_to_first_cdf(results, ax, label):
     ys = np.arange(1, len(xs) + 1) / len(xs)
     ax.plot(xs, ys, linewidth=1.8, color="#3066BE")
     ax.set_xlabel("time to first result (ms)")
-    ax.set_ylabel("CDF")
+    ax.set_ylabel("CDF over searchers")
     ax.set_title(f"{label}: time-to-first CDF (all searchers)")
     ax.grid(alpha=0.3)
     ax.set_ylim(0, 1.0)
 
 
-def plot_time_to_completion_cdf(per_topic, results, ax, label):
+def plot_unique_found_over_time(per_topic, results, ax, label):
+    """03: per-topic mean ± std of unique-registrants-found over wall time.
+
+    For each searcher, uniqueFoundAtMs is the timestamp (ms since search
+    start) at which the i-th distinct registrant was first observed. We
+    sample the per-searcher curves on a common time grid and plot the
+    cross-searcher mean ± 1σ band per topic.
+    """
     by_topic = collections.defaultdict(list)
     for r in results:
-        by_topic[r["topic"]].append(r["timeToCompletionNs"] / 1e6)
-    for rec in sorted(per_topic, key=lambda r: -r["target"]):
+        by_topic[r["topic"]].append(r)
+    # Build common time grid based on max observed completion time.
+    max_ms = max((r["timeToCompletionNs"] / 1e6 for r in results), default=0)
+    if max_ms <= 0:
+        ax.set_title(f"{label}: no completion data")
+        return
+    # 200 sample points along [0, max_ms]; per-searcher curve is the
+    # cumulative count of unique finds <= t.
+    grid = np.linspace(0, max_ms, 200)
+    cmap = plt.cm.tab10
+    for i, rec in enumerate(sorted(per_topic, key=lambda r: -r["target"])):
         t = rec["topic"]
-        vals = by_topic[t]
-        if not vals:
+        rs = by_topic[t]
+        per_search_curves = []
+        for r in rs:
+            ts = r.get("uniqueFoundAtMs") or []
+            if not ts:
+                per_search_curves.append(np.zeros_like(grid))
+                continue
+            ts_sorted = np.sort(ts)
+            # cumulative count at each grid time
+            counts = np.searchsorted(ts_sorted, grid, side="right")
+            per_search_curves.append(counts.astype(float))
+        if not per_search_curves:
             continue
-        xs = np.sort(vals)
-        ys = np.arange(1, len(xs) + 1) / len(xs)
-        ax.plot(xs, ys, linewidth=1.5, label=f"topic {t} ({rec['target']} regs)")
-    ax.set_xlabel("time to completion (ms)")
-    ax.set_ylabel("CDF")
-    ax.set_title(f"{label}: time-to-completion CDF, by topic")
+        arr = np.vstack(per_search_curves)
+        mean = arr.mean(axis=0)
+        std = arr.std(axis=0)
+        color = cmap(i % 10)
+        ax.plot(grid, mean, linewidth=1.6, color=color,
+                label=f"topic {t} ({rec['target']} target)")
+        ax.fill_between(grid, np.maximum(mean - std, 0), mean + std,
+                        alpha=0.18, color=color)
+    ax.set_xlabel("time since search start (ms)")
+    ax.set_ylabel("unique registrants found (mean ± 1σ)")
+    ax.set_title(f"{label}: unique registrants discovered over time, per topic")
     ax.legend(loc="lower right", fontsize=9)
     ax.grid(alpha=0.3)
-    ax.set_ylim(0, 1.05)
+    ax.set_ylim(bottom=0)
 
 
 def plot_id_space_registrants(per_topic, cov_by_topic, ax, label):
-    """Strip plot: one row per topic, registrants dotted along [0,1] ID axis."""
-    topics = sorted(per_topic, key=lambda r: -r["target"])
+    """04: strip plot of registrants present in ≥1 registrar's topic table.
+
+    Each dot is one registrant placed at its (normalised) top-64-bit ID
+    position on the x axis. Rows are topics, ordered ascending by topic
+    index for consistency across runs.
+    """
+    topics = sorted(per_topic, key=lambda r: r["topic"])
     rows = []
     for r in topics:
         t = r["topic"]
         ids = list(cov_by_topic.get(str(t), {}).get("byRegistrant", {}).keys())
-        if not ids:
-            continue
         rows.append((t, len(ids), ids))
     for row, (t, n, ids) in enumerate(rows):
+        if not ids:
+            continue
         xs = [int(i[:16], 16) / float(2**64) for i in ids]
         ax.scatter(xs, [row] * len(xs), s=14, alpha=0.7, color=plt.cm.tab10(row % 10))
     ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels([f"topic {t} ({n} regs)" for t, n, _ in rows])
+    ax.set_yticklabels([f"topic {t} ({n} regs admitted)" for t, n, _ in rows])
     ax.set_xlim(0, 1.0)
-    ax.set_xlabel("ID position (top 64 bits, normalized 0..1)")
-    ax.set_title(f"{label}: registrant ID-space distribution per topic")
+    ax.set_xlabel("ID position (top 64 bits, normalised 0..1)")
+    ax.set_title(f"{label}: ID-space distribution of registrants admitted to ≥1 registrar")
     ax.grid(True, axis="x", alpha=0.3)
 
 
 def plot_id_space_found_vs_missed(per_topic, results, cov_by_topic, fig, label):
-    """One subplot per topic: x = registrant ID position, y = #searchers that found it."""
-    topics = sorted(per_topic, key=lambda r: -r["target"])
+    """05: per-topic discovery coverage across the ID space.
+
+    One subplot per topic: x = registrant ID position, y = number of
+    searchers in the simulation that returned that registrant via the
+    iterator. Topics ordered ascending by index.
+    """
+    topics = sorted(per_topic, key=lambda r: r["topic"])
     n = len(topics)
     if n == 0:
         return
@@ -217,90 +249,118 @@ def plot_id_space_found_vs_missed(per_topic, results, cov_by_topic, fig, label):
         ax.set_ylim(-1, n_searchers + 5)
         ax.set_ylabel(f"topic {t}\ntimes found", fontsize=9)
         ax.grid(True, axis="x", alpha=0.3)
-    axs[-1].set_xlabel("registrant ID position (top 64 bits, normalized 0..1)")
-    fig.suptitle(f"{label}: times each registrant is found, by ID-space position", fontsize=12)
+    axs[-1].set_xlabel("registrant ID position (top 64 bits, normalised 0..1)")
+    fig.suptitle(f"{label}: per-registrant discovery coverage across ID space", fontsize=12)
 
 
-def plot_per_topic_fanout(cov_by_topic, per_topic, ax, label, num_hosts):
-    topics = sorted(per_topic, key=lambda r: -r["target"])
-    data = []
+def plot_fanout_both_views(per_topic, cov_by_topic, fig, label, num_hosts):
+    """06: per-topic side-by-side box plots — (a) per-registrant fan-out
+    (how many registrars hold each registrant's ad), and (b) per-host load
+    (how many registrants of this topic each host holds)."""
+    topics = sorted(per_topic, key=lambda r: r["topic"])
+    ax_a, ax_b = fig.subplots(nrows=1, ncols=2, sharey=False)
+
+    # (a) per-registrant fan-out
+    data_a = []
     labels_list = []
     for r in topics:
         t = r["topic"]
         fan = per_topic_fanout(t, cov_by_topic)
         if not fan:
             continue
-        data.append(fan)
-        labels_list.append(f"topic {t}\n({r['target']} regs)")
-    if not data:
-        return
-    bp = ax.boxplot(data, showfliers=True, patch_artist=True)
-    for box in bp["boxes"]:
-        box.set(facecolor="#3066BE", alpha=0.6)
-    ax.set_xticks(range(1, len(labels_list) + 1))
-    ax.set_xticklabels(labels_list)
-    ax.set_ylabel(f"hosts holding each registrant's ad (cap = {num_hosts - 1})")
-    ax.set_title(f"{label}: fan-out per topic at post-register-wait snapshot")
-    ax.grid(True, axis="y", alpha=0.3)
+        data_a.append(fan)
+        labels_list.append(f"topic {t}\n({r['target']} target)")
+    if data_a:
+        bp = ax_a.boxplot(data_a, showfliers=True, patch_artist=True)
+        for box in bp["boxes"]:
+            box.set(facecolor="#3066BE", alpha=0.6)
+        ax_a.set_xticks(range(1, len(labels_list) + 1))
+        ax_a.set_xticklabels(labels_list)
+    ax_a.set_ylabel(f"registrars holding each registrant (cap = {num_hosts - 1})")
+    ax_a.set_title("(a) per-registrant fan-out")
+    ax_a.grid(True, axis="y", alpha=0.3)
 
-
-def plot_per_registrant_discovery_grid(per_topic, results, cov_by_topic, fig, label):
-    """One subplot per topic: x = registrant rank, y = #searchers that found that registrant."""
-    topics = sorted(per_topic, key=lambda r: -r["target"])
-    n = len(topics)
-    if n == 0:
-        return
-    axs = fig.subplots(nrows=n, ncols=1, sharex=False)
-    if n == 1:
-        axs = [axs]
-    by_topic = collections.defaultdict(list)
-    for r in results:
-        by_topic[r["topic"]].append(r)
-    for ax, rec in zip(axs, topics):
-        t = rec["topic"]
-        rs = by_topic[t]
-        counts, _ = per_registrant_discovery(rs, cov_by_topic, t)
-        xs = list(range(len(counts)))
-        n_searchers = rec["numSearchers"]
-        colors = ["#2A9D8F" if c >= n_searchers else "#E76F51" if c < n_searchers * 0.9 else "#F4A261"
-                  for c in counts]
-        ax.scatter(xs, counts, c=colors, s=14, alpha=0.85)
-        ax.axhline(n_searchers, color="black", linestyle="--", linewidth=1, alpha=0.4,
-                   label=f"all searchers ({n_searchers})")
-        ax.set_xlim(-1, len(counts) + 1)
-        ax.set_ylim(-1, n_searchers + 5)
-        ax.set_ylabel(f"topic {t}\n# searchers\nthat found it", fontsize=9)
-        ax.grid(True, alpha=0.3)
-    axs[-1].set_xlabel("registrant (rank-sorted by found count)")
-    fig.suptitle(f"{label}: per-registrant discovery — searchers that found each registrant", fontsize=12)
-
-
-def plot_unique_recall_cdf(per_topic, results, cov_by_topic, ax, label):
-    topics = sorted(per_topic, key=lambda r: -r["target"])
-    by_topic = collections.defaultdict(list)
-    for r in results:
-        by_topic[r["topic"]].append(r)
-    for rec in topics:
-        t = rec["topic"]
-        rs = by_topic[t]
-        uniq, target = unique_recall_per_searcher(rs, cov_by_topic, t)
-        if not uniq:
+    # (b) per-host load
+    data_b = []
+    for r in topics:
+        t = r["topic"]
+        load = per_topic_hostload(t, cov_by_topic)
+        if not load:
             continue
-        # Normalise to recall fraction
-        rec_frac = [u / target if target > 0 else 1.0 for u in uniq]
-        rec_frac.sort()
-        ys = np.arange(1, len(rec_frac) + 1) / len(rec_frac)
-        ax.plot(rec_frac, ys, label=f"topic {t} ({target} regs)", linewidth=1.6)
-    ax.set_xlabel("per-searcher unique recall fraction")
-    ax.set_ylabel("CDF over searchers")
-    ax.set_title(f"{label}: per-searcher unique recall CDF per topic")
-    ax.legend(loc="lower right", fontsize=9)
-    ax.grid(alpha=0.3)
-    ax.set_xlim(0, 1.05)
-    ax.set_ylim(0, 1.02)
+        data_b.append(load)
+    if data_b:
+        bp = ax_b.boxplot(data_b, showfliers=True, patch_artist=True)
+        for box in bp["boxes"]:
+            box.set(facecolor="#E76F51", alpha=0.6)
+        ax_b.set_xticks(range(1, len(labels_list) + 1))
+        ax_b.set_xticklabels(labels_list)
+    ax_b.set_ylabel("registrants of this topic per host")
+    ax_b.set_title("(b) per-host load")
+    ax_b.grid(True, axis="y", alpha=0.3)
+
+    fig.suptitle(f"{label}: fan-out two views — per registrant vs per host", fontsize=12)
 
 
-def write_report(out_dir, label, params, per_topic, results, cov_by_topic, num_hosts):
+def plot_registration_latency_bar(per_topic, reg_timing, ax, label):
+    """07: mean ± std time-to-first-remote-admission per topic. Bars clipped
+    at zero so the lower error bar never crosses zero."""
+    if not reg_timing:
+        ax.set_title(f"{label}: no registration timing data")
+        return
+    # Sort by topic index (ascending) to match other per-topic figures.
+    topics = sorted(per_topic, key=lambda r: r["topic"])
+    # Look up timing per topic by matching the topic hex prefix (makeTopic
+    # encodes the index as a big-endian uint32 in bytes 3..6 = hex chars 6..14).
+    def topic_to_hex(t):
+        for hex_id in reg_timing:
+            try:
+                if int(hex_id[6:14], 16) == t:
+                    return hex_id
+            except (ValueError, IndexError):
+                pass
+        return None
+    means_ms = []
+    stds_ms = []
+    counts = []
+    xs_labels = []
+    for r in topics:
+        t = r["topic"]
+        hex_id = topic_to_hex(t)
+        if hex_id is None or not reg_timing[hex_id]:
+            continue
+        vals_ms = [d / 1e6 for d in reg_timing[hex_id].values()]
+        means_ms.append(float(np.mean(vals_ms)))
+        stds_ms.append(float(np.std(vals_ms)))
+        counts.append(len(vals_ms))
+        xs_labels.append(f"topic {t}\n({r['target']} target)")
+    if not means_ms:
+        ax.set_title(f"{label}: no registration timing data")
+        return
+    means_ms = np.array(means_ms)
+    stds_ms = np.array(stds_ms)
+    # Asymmetric error bars: lower error capped so the bar never dips below 0.
+    lower_err = np.minimum(stds_ms, means_ms)
+    upper_err = stds_ms
+    xs = np.arange(len(means_ms))
+    ax.bar(xs, means_ms, yerr=[lower_err, upper_err], capsize=6, color="#3066BE",
+           edgecolor="black", alpha=0.85, error_kw={"linewidth": 1.2})
+    ax.set_xticks(xs)
+    ax.set_xticklabels(xs_labels)
+    ax.set_ylabel("time to first remote admission (ms) — mean ± 1σ")
+    ax.set_title(f"{label}: registration latency per topic")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_ylim(bottom=0)
+    for i, (m, s, c) in enumerate(zip(means_ms, stds_ms, counts)):
+        ax.text(i, m + s + max(means_ms) * 0.04, f"{m:.0f}±{s:.0f}\nn={c}",
+                ha="center", fontsize=9)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Markdown report
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def write_report(out_dir, label, params, per_topic, results, cov_by_topic, reg_timing, num_hosts):
     path = os.path.join(out_dir, "report.md")
     lines = []
     lines.append(f"# Simnet experiment report — `{label}`\n")
@@ -319,23 +379,30 @@ def write_report(out_dir, label, params, per_topic, results, cov_by_topic, num_h
     lines.append("## Aggregate results\n")
     lines.append("| metric | value |")
     lines.append("|---|---|")
-    lines.append(f"| searchers | {n_searchers} |")
+    lines.append(f"| total nodes (every node both registers and searches its topic) | {n_searchers} |")
     lines.append(f"| topics | {len(per_topic)} |")
-    lines.append(f"| full-recall searchers (across topics) | {full} / {n_searchers} |")
-    lines.append(f"| timeouts (Go select-race flag) | {timeouts} / {n_searchers} |")
+    lines.append(f"| full-recall searches | {full} / {n_searchers} |")
+    lines.append(f"| searches that hit the wall-clock timeout | {timeouts} / {n_searchers} |")
     lines.append("")
 
-    # Per-topic
+    # Per-topic (single "nodes" column instead of registrants/searchers split)
     lines.append("## Per-topic results\n")
-    lines.append("| topic | registrants | searchers | full recall | mean recall (raw, with dupes) | timeouts |")
-    lines.append("|---:|---:|---:|---:|---:|---:|")
+    lines.append("| topic | nodes | full recall (unique) | timeouts |")
+    lines.append("|---:|---:|---:|---:|")
+    by_topic_results = collections.defaultdict(list)
+    for r in results:
+        by_topic_results[r["topic"]].append(r)
     for r in sorted(per_topic, key=lambda x: -x["target"]):
+        t = r["topic"]
+        # Recompute full-recall from unique counts (more accurate than raw foundRegistrant).
+        rs = by_topic_results[t]
+        uniq, target = unique_recall_per_searcher(rs, cov_by_topic, t)
+        atTarget = sum(1 for u in uniq if u >= target) if target > 0 else 0
         lines.append(
-            f"| {r['topic']} | {r['target']} | {r['numSearchers']} | "
-            f"{r['fullRecall']}/{r['numSearchers']} | {r['meanRecall']:.4f} | {r['hitTimeout']} |"
+            f"| {t} | {r['numSearchers']} | {atTarget}/{r['numSearchers']} | {r['hitTimeout']} |"
         )
     lines.append("")
-    lines.append("> *Mean recall reported here is the raw `foundRegistrant / target` ratio averaged over searchers. Because the iterator is infinite and emits duplicates within the timeout window, this number can exceed 1.0 (the same registrant can be counted multiple times across the iterator's sessions). For a true per-searcher recall metric, see the unique-recall CDF (figure 05).*\n")
+    lines.append("> *Every node is both a registrant and a searcher of its assigned topic. \"Full recall\" counts searches that discovered every other registrant of the same topic, deduplicated. The iterator does not self-terminate yet — completion is via the wall-clock timeout — so timeouts here are expected.*\n")
 
     # Coverage
     lines.append("## Post-register-wait coverage\n")
@@ -349,38 +416,58 @@ def write_report(out_dir, label, params, per_topic, results, cov_by_topic, num_h
             continue
         lines.append(f"| {t} | {len(fan)} | {fan[0]} | {fan[len(fan)//2]} | {fan[-1]} | {num_hosts - 1} |")
     lines.append("")
-    lines.append("> *Fan-out is the number of distinct hosts that hold each registrant's ad in their topic table at the moment the registration phase ends. Cap = `numHosts - 1` (self-exclusion).*\n")
+    lines.append("> *Fan-out is the number of distinct hosts that hold each registrant's ad in their topic table at the moment the registration phase ends.*\n")
 
     # Per-searcher unique recall
-    lines.append("## Per-searcher unique recall (true recall)\n")
+    lines.append("## Per-searcher unique recall\n")
     lines.append("| topic | min | med | max | target | ≥ target |")
     lines.append("|---:|---:|---:|---:|---:|---:|")
-    by_topic = collections.defaultdict(list)
-    for r in results:
-        by_topic[r["topic"]].append(r)
     for r in sorted(per_topic, key=lambda x: -x["target"]):
         t = r["topic"]
-        uniq, target = unique_recall_per_searcher(by_topic[t], cov_by_topic, t)
+        uniq, target = unique_recall_per_searcher(by_topic_results[t], cov_by_topic, t)
         if not uniq:
             continue
-        atTarget = sum(1 for u in uniq if u >= target)
+        atTarget = sum(1 for u in uniq if u >= target) if target > 0 else 0
         lines.append(
             f"| {t} | {uniq[0]} | {uniq[len(uniq)//2]} | {uniq[-1]} | {target} | {atTarget}/{len(uniq)} |"
         )
     lines.append("")
-    lines.append("> *Unique recall is the count of distinct registrant IDs each searcher's iterator yielded (deduplicated). Target = number of other registrants of the topic (excluding the searcher itself).*\n")
+
+    # Registration timing
+    if reg_timing:
+        lines.append("## Registration timing\n")
+        lines.append("| topic | observed | mean (ms) | std (ms) |")
+        lines.append("|---:|---:|---:|---:|")
+        def topic_to_hex(t):
+            for hex_id in reg_timing:
+                try:
+                    if int(hex_id[6:14], 16) == t:
+                        return hex_id
+                except (ValueError, IndexError):
+                    pass
+            return None
+        for r in sorted(per_topic, key=lambda x: -x["target"]):
+            t = r["topic"]
+            hex_id = topic_to_hex(t)
+            if hex_id is None:
+                continue
+            vals_ms = [d / 1e6 for d in reg_timing[hex_id].values()]
+            if not vals_ms:
+                lines.append(f"| {t} | 0 | — | — |")
+                continue
+            lines.append(f"| {t} | {len(vals_ms)} | {np.mean(vals_ms):.1f} | {np.std(vals_ms):.1f} |")
+        lines.append("")
+        lines.append("> *Wall-clock time from the start of the registration phase to the first time each registrant appeared in any other host's topic table (i.e. time-to-first-remote-admission). Sampling resolution = `-reg-probe-period`.*\n")
 
     lines.append("## Figures\n")
     figs = [
-        ("01_topic_distribution", "Registrant count per topic (Zipf draw)."),
-        ("02_per_topic_recall", "Per-topic discovery success: per-search avg fraction of registrants found (unique) and fraction of complete searches (found all)."),
-        ("03_time_to_first_cdf", "CDF of time-to-first result across all searchers."),
-        ("04_time_to_completion_cdf", "Per-topic CDF of time-to-completion (note: iterator is infinite; completion ≈ search-timeout for all searches)."),
-        ("05_id_space_registrants", "Strip plot of registrants placed in ID-space (top 64 bits, normalized 0..1), one row per topic."),
-        ("06_id_space_found_vs_missed", "Per-topic per-registrant view (one subplot per topic): x = registrant ID position, y = number of searchers that found that registrant. Green = found by all; orange = some missed; red = many missed."),
-        ("07_per_topic_fanout", "Per-topic fan-out distribution at the end of register-wait — hosts holding each registrant's ad."),
-        ("08_per_registrant_discovery", "Same per-registrant data as 06, rank-sorted on the x-axis instead of by ID-space position."),
-        ("09_unique_recall_distribution", "Per-topic CDF of per-searcher unique recall fraction (distinct registrants found / target)."),
+        ("01_topic_distribution", "Nodes per topic (Zipf draw)."),
+        ("02_time_to_first_cdf", "CDF of time-to-first result across all searchers."),
+        ("03_unique_found_over_time", "Per-topic mean ± 1σ of unique registrants discovered over time."),
+        ("04_id_space_registrants", "ID-space distribution of registrants admitted to ≥1 registrar (one row per topic)."),
+        ("05_id_space_found_vs_missed", "Per-topic discovery coverage across ID space — y is the number of searchers that returned each registrant. Green = found by all, orange = some misses, red = many misses."),
+        ("06_fanout_both_views", "Per-topic fan-out two views: (a) per-registrant — how many registrars hold each registrant's ad; (b) per-host — how many registrants each host holds for this topic."),
+        ("07_registration_latency_bar", "Mean ± 1σ time to first remote admission per topic (clipped at 0)."),
     ]
     for stem, caption in figs:
         if os.path.exists(os.path.join(out_dir, stem + ".png")):
@@ -410,9 +497,8 @@ def main():
     per_topic = data["perTopic"]
     results = data["results"]
     cov_by_topic = data.get("registrationCoverage", {}).get("byTopic", {})
+    reg_timing = data.get("registrationTimingNs", {})
 
-    # Derive number of hosts from the largest 'cap' visible in coverage data.
-    # Each topic's fan-out cap = numHosts - 1.
     num_hosts = max(
         (len(cov_by_topic.get(str(r["topic"]), {}).get("byHost", {}))
          for r in per_topic),
@@ -432,66 +518,52 @@ def main():
     fig.savefig(os.path.join(out, "01_topic_distribution.pdf"))
     plt.close(fig)
 
-    # 02 per-topic recall (mean unique + full)
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    plot_per_topic_recall(per_topic, results, cov_by_topic, ax, label)
-    fig.savefig(os.path.join(out, "02_per_topic_recall.png"))
-    fig.savefig(os.path.join(out, "02_per_topic_recall.pdf"))
-    plt.close(fig)
-
-    # 03 time-to-first CDF
+    # 02 time-to-first CDF
     fig, ax = plt.subplots(figsize=(7, 4))
     plot_time_to_first_cdf(results, ax, label)
-    fig.savefig(os.path.join(out, "03_time_to_first_cdf.png"))
-    fig.savefig(os.path.join(out, "03_time_to_first_cdf.pdf"))
+    fig.savefig(os.path.join(out, "02_time_to_first_cdf.png"))
+    fig.savefig(os.path.join(out, "02_time_to_first_cdf.pdf"))
     plt.close(fig)
 
-    # 04 time-to-completion CDF per topic
+    # 03 unique-found over time
     fig, ax = plt.subplots(figsize=(8, 5))
-    plot_time_to_completion_cdf(per_topic, results, ax, label)
-    fig.savefig(os.path.join(out, "04_time_to_completion_cdf.png"))
-    fig.savefig(os.path.join(out, "04_time_to_completion_cdf.pdf"))
+    plot_unique_found_over_time(per_topic, results, ax, label)
+    fig.savefig(os.path.join(out, "03_unique_found_over_time.png"))
+    fig.savefig(os.path.join(out, "03_unique_found_over_time.pdf"))
     plt.close(fig)
 
-    # 05 ID-space registrant distribution per topic
+    # 04 ID-space registrants
     fig, ax = plt.subplots(figsize=(10, 0.5 * len(per_topic) + 1.5))
     plot_id_space_registrants(per_topic, cov_by_topic, ax, label)
-    fig.savefig(os.path.join(out, "05_id_space_registrants.png"))
-    fig.savefig(os.path.join(out, "05_id_space_registrants.pdf"))
+    fig.savefig(os.path.join(out, "04_id_space_registrants.png"))
+    fig.savefig(os.path.join(out, "04_id_space_registrants.pdf"))
     plt.close(fig)
 
-    # 06 ID-space found-vs-missed grid (one row per topic, x = ID position)
+    # 05 ID-space found-vs-missed grid
     fig = plt.figure(figsize=(10, 1.7 * len(per_topic) + 1.5))
     plot_id_space_found_vs_missed(per_topic, results, cov_by_topic, fig, label)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(os.path.join(out, "06_id_space_found_vs_missed.png"))
-    fig.savefig(os.path.join(out, "06_id_space_found_vs_missed.pdf"))
+    fig.savefig(os.path.join(out, "05_id_space_found_vs_missed.png"))
+    fig.savefig(os.path.join(out, "05_id_space_found_vs_missed.pdf"))
     plt.close(fig)
 
-    # 07 per-topic fan-out box plot
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    plot_per_topic_fanout(cov_by_topic, per_topic, ax, label, num_hosts)
-    fig.savefig(os.path.join(out, "07_per_topic_fanout.png"))
-    fig.savefig(os.path.join(out, "07_per_topic_fanout.pdf"))
+    # 06 fan-out, both views
+    fig = plt.figure(figsize=(13, 4.5))
+    plot_fanout_both_views(per_topic, cov_by_topic, fig, label, num_hosts)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(os.path.join(out, "06_fanout_both_views.png"))
+    fig.savefig(os.path.join(out, "06_fanout_both_views.pdf"))
     plt.close(fig)
 
-    # 08 per-registrant discovery grid (rank-sorted)
-    fig = plt.figure(figsize=(10, 1.6 * len(per_topic) + 1.5))
-    plot_per_registrant_discovery_grid(per_topic, results, cov_by_topic, fig, label)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(os.path.join(out, "08_per_registrant_discovery.png"))
-    fig.savefig(os.path.join(out, "08_per_registrant_discovery.pdf"))
-    plt.close(fig)
-
-    # 09 unique recall CDF
-    fig, ax = plt.subplots(figsize=(8, 5))
-    plot_unique_recall_cdf(per_topic, results, cov_by_topic, ax, label)
-    fig.savefig(os.path.join(out, "09_unique_recall_distribution.png"))
-    fig.savefig(os.path.join(out, "09_unique_recall_distribution.pdf"))
+    # 07 registration latency bar
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    plot_registration_latency_bar(per_topic, reg_timing, ax, label)
+    fig.savefig(os.path.join(out, "07_registration_latency_bar.png"))
+    fig.savefig(os.path.join(out, "07_registration_latency_bar.pdf"))
     plt.close(fig)
 
     # Markdown report
-    write_report(out, label, params, per_topic, results, cov_by_topic, num_hosts)
+    write_report(out, label, params, per_topic, results, cov_by_topic, reg_timing, num_hosts)
 
     # Summary
     n_searchers = sum(r["numSearchers"] for r in per_topic)
