@@ -145,14 +145,12 @@ def plot_unique_found_over_time(per_topic, results, ax, label):
     by_topic = collections.defaultdict(list)
     for r in results:
         by_topic[r["topic"]].append(r)
-    # Build common time grid based on max observed completion time.
-    max_ms = max((r["timeToCompletionNs"] / 1e6 for r in results), default=0)
-    if max_ms <= 0:
-        ax.set_title(f"{label}: no completion data")
-        return
-    # 200 sample points along [0, max_ms]; per-searcher curve is the
-    # cumulative count of unique finds <= t.
-    grid = np.linspace(0, max_ms, 200)
+    # Cap the plotted window at 50s — discovery is essentially complete by
+    # the first few seconds, the rest is plateau that visually hides the
+    # early-growth dynamics. Per-searcher data beyond 50s is still counted
+    # via cumulative-at-cap, it's just not rendered.
+    x_limit_ms = 50_000
+    grid = np.linspace(0, x_limit_ms, 200)
     cmap = plt.cm.tab10
     for i, rec in enumerate(sorted(per_topic, key=lambda r: -r["target"])):
         t = rec["topic"]
@@ -164,7 +162,6 @@ def plot_unique_found_over_time(per_topic, results, ax, label):
                 per_search_curves.append(np.zeros_like(grid))
                 continue
             ts_sorted = np.sort(ts)
-            # cumulative count at each grid time
             counts = np.searchsorted(ts_sorted, grid, side="right")
             per_search_curves.append(counts.astype(float))
         if not per_search_curves:
@@ -179,9 +176,10 @@ def plot_unique_found_over_time(per_topic, results, ax, label):
                         alpha=0.18, color=color)
     ax.set_xlabel("time since search start (ms)")
     ax.set_ylabel("unique registrants found (mean ± 1σ)")
-    ax.set_title(f"{label}: unique registrants discovered over time, per topic")
+    ax.set_title(f"{label}: unique registrants discovered over time, per topic (first 50 s)")
     ax.legend(loc="lower right", fontsize=9)
     ax.grid(alpha=0.3)
+    ax.set_xlim(0, x_limit_ms)
     ax.set_ylim(bottom=0)
 
 
@@ -423,32 +421,6 @@ def write_report(out_dir, label, params, per_topic, results, cov_by_topic, reg_t
             f"| {t} | {uniq[0]} | {uniq[len(uniq)//2]} | {uniq[-1]} | {target} | {atTarget}/{len(uniq)} |"
         )
     lines.append("")
-
-    # Registration timing
-    if reg_timing:
-        lines.append("## Registration timing\n")
-        lines.append("| topic | observed | mean (ms) | std (ms) |")
-        lines.append("|---:|---:|---:|---:|")
-        def topic_to_hex(t):
-            for hex_id in reg_timing:
-                try:
-                    if int(hex_id[6:14], 16) == t:
-                        return hex_id
-                except (ValueError, IndexError):
-                    pass
-            return None
-        for r in sorted(per_topic, key=lambda x: -x["target"]):
-            t = r["topic"]
-            hex_id = topic_to_hex(t)
-            if hex_id is None:
-                continue
-            vals_ms = [d / 1e6 for d in reg_timing[hex_id].values()]
-            if not vals_ms:
-                lines.append(f"| {t} | 0 | — | — |")
-                continue
-            lines.append(f"| {t} | {len(vals_ms)} | {np.mean(vals_ms):.1f} | {np.std(vals_ms):.1f} |")
-        lines.append("")
-        lines.append("> *Wall-clock time from the start of the registration phase to the first time each registrant appeared in any other host's topic table (i.e. time-to-first-remote-admission). Sampling resolution = `-reg-probe-period`.*\n")
 
     lines.append("## Figures\n")
     # Figure 01 (topic distribution) is embedded above in the Simulation
