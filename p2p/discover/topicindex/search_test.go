@@ -186,6 +186,43 @@ func TestSearchQueryTargetPrefersFarthest(t *testing.T) {
 	}
 }
 
+// TestSearchQueryTargetWidensFrontierAfterResponse verifies that the
+// warm-up frontier admits a closer bucket to the random pool once the
+// current bucket has received at least one response. Before any response,
+// only bucket 0 is in the pool; after bucket 0 is queried, both bucket 0
+// (if refilled) and bucket 5 are eligible.
+func TestSearchQueryTargetWidensFrontierAfterResponse(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	far := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
+	mid := nodesAtDistanceFrom(enode.ID(topic1), 251, 1, 10)
+	s.AddNodes(nil, far)
+	s.AddNodes(nil, mid)
+
+	// Simulate a response on bucket 0: setAsked + numRequests++.
+	// This widens the frontier so bucket 5 becomes eligible.
+	s.AddQueryResults(far[0], nil)
+
+	// Refill bucket 0 so both bucket 0 and bucket 5 hold an unasked node.
+	refill := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 100)
+	s.AddNodes(nil, refill)
+
+	// Both buckets must now appear in QueryTarget picks across many calls.
+	seen := map[int]int{}
+	for i := 0; i < 200; i++ {
+		target := s.QueryTarget()
+		if target == nil {
+			t.Fatalf("QueryTarget returned nil at iter %d", i)
+		}
+		bi := s.bucketIndex(target.ID())
+		seen[bi]++
+	}
+	if seen[0] == 0 || seen[5] == 0 {
+		t.Fatalf("expected picks from both bucket[0] and bucket[5] after warm-up; got %v", seen)
+	}
+}
+
 // TestSearchQueryTargetRestartsAfterRefill verifies that newly-added far
 // nodes are picked up before further queries continue draining closer
 // buckets. Each QueryTarget call re-scans from the farthest bucket, so an
