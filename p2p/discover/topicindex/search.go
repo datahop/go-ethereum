@@ -17,8 +17,6 @@
 package topicindex
 
 import (
-	"math/rand"
-
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
@@ -51,10 +49,9 @@ type Search struct {
 }
 
 type searchBucket struct {
-	dist        int
-	new         map[enode.ID]*enode.Node
-	asked       map[enode.ID]struct{}
-	numRequests int
+	dist  int
+	new   map[enode.ID]*enode.Node
+	asked map[enode.ID]struct{}
 
 	ips netutil.DistinctNetSet
 }
@@ -157,25 +154,15 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
-// QueryTarget returns a random node to which a topic query should be sent.
+// QueryTarget returns an unasked node from the farthest non-empty bucket.
+// Buckets are walked far -> close; the current bucket is drained (including
+// any nodes added to it by AddNodes between calls) before progress advances
+// to a closer one. Empty buckets are skipped. As a result, the closest-to-
+// topic buckets are queried last, limiting load on the small set of nodes
+// responsible for the topic.
 func (s *Search) QueryTarget() *enode.Node {
-	// Collect buckets with new nodes.
-	withnew := make([]*searchBucket, 0, searchTableDepth)
 	for i := range s.buckets {
-		if len(s.buckets[i].new) > 0 {
-			withnew = append(withnew, &s.buckets[i])
-		}
-		// Stop here if no request was ever sent in this bucket.
-		// This is to avoid spamming nodes close to the topic.
-		if s.buckets[i].numRequests == 0 {
-			break
-		}
-	}
-
-	if len(withnew) > 0 {
-		// Select an unasked node in a random bucket.
-		b := withnew[rand.Intn(len(withnew))]
-		for _, n := range b.new {
+		for _, n := range s.buckets[i].new {
 			return n
 		}
 	}
@@ -186,7 +173,6 @@ func (s *Search) QueryTarget() *enode.Node {
 func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 	b := s.bucket(from.ID())
 	b.setAsked(from)
-	b.numRequests++
 
 	for _, n := range results {
 		if n.ID() == s.cfg.Self {
