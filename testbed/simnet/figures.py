@@ -385,36 +385,21 @@ def write_report(out_dir, label, params, per_topic, results, cov_by_topic, reg_t
     lines.append(f"| searches that hit the wall-clock timeout | {timeouts} / {n_searchers} |")
     lines.append("")
 
-    # Per-topic (single "nodes" column instead of registrants/searchers split)
-    lines.append("## Per-topic results\n")
-    lines.append("| topic | nodes | full recall (unique) | timeouts |")
-    lines.append("|---:|---:|---:|---:|")
     by_topic_results = collections.defaultdict(list)
     for r in results:
         by_topic_results[r["topic"]].append(r)
-    for r in sorted(per_topic, key=lambda x: -x["target"]):
-        t = r["topic"]
-        # Recompute full-recall from unique counts (more accurate than raw foundRegistrant).
-        rs = by_topic_results[t]
-        uniq, target = unique_recall_per_searcher(rs, cov_by_topic, t)
-        atTarget = sum(1 for u in uniq if u >= target) if target > 0 else 0
-        lines.append(
-            f"| {t} | {r['numSearchers']} | {atTarget}/{r['numSearchers']} | {r['hitTimeout']} |"
-        )
-    lines.append("")
-    lines.append("> *Every node is both a registrant and a searcher of its assigned topic. \"Full recall\" counts searches that discovered every other registrant of the same topic, deduplicated. The iterator does not self-terminate yet — completion is via the wall-clock timeout — so timeouts here are expected.*\n")
 
     # Coverage
     lines.append("## Post-register-wait coverage\n")
-    lines.append("| topic | registrants visible | fan-out min | med | max | cap |")
-    lines.append("|---:|---:|---:|---:|---:|---:|")
+    lines.append("| topic | registrants visible | fan-out min | med | max |")
+    lines.append("|---:|---:|---:|---:|---:|")
     for r in sorted(per_topic, key=lambda x: -x["target"]):
         t = r["topic"]
         fan = per_topic_fanout(t, cov_by_topic)
         if not fan:
-            lines.append(f"| {t} | 0 | — | — | — | {num_hosts - 1} |")
+            lines.append(f"| {t} | 0 | — | — | — |")
             continue
-        lines.append(f"| {t} | {len(fan)} | {fan[0]} | {fan[len(fan)//2]} | {fan[-1]} | {num_hosts - 1} |")
+        lines.append(f"| {t} | {len(fan)} | {fan[0]} | {fan[len(fan)//2]} | {fan[-1]} |")
     lines.append("")
     lines.append("> *Fan-out is the number of distinct hosts that hold each registrant's ad in their topic table at the moment the registration phase ends.*\n")
 
