@@ -40,6 +40,13 @@ type Packet interface {
 }
 
 // Message types.
+//
+// IDs 0x07-0x0a are the DISC-NG topic-discovery messages and match the
+// wire-protocol spec (discv5/discv5-wire.md). Earlier drafts of the
+// discv5 spec reserved 0x07 / 0x08 for a separate REQUEST_TICKET /
+// TICKET pair that was never finalised; that pair has been removed
+// from the spec and from this implementation. REGCONFIRMATION now
+// carries the ticket + wait-time previously returned in TICKET.
 const (
 	PingMsg byte = iota + 1
 	PongMsg
@@ -47,8 +54,6 @@ const (
 	NodesMsg
 	TalkRequestMsg
 	TalkResponseMsg
-	RequestTicketMsg
-	TicketMsg
 	RegtopicMsg
 	RegconfirmationMsg
 	TopicQueryMsg
