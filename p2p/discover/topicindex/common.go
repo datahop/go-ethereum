@@ -95,13 +95,27 @@ func (t TopicID) String() string {
 // It indicates that the event should not be scheduled.
 const Never = ^mclock.AbsTime(0)
 
-// DiscNG is an ENR entry indicating that a node supports the DISC-NG
-// topic discovery protocol. Its presence in a node's ENR signals capability.
-type DiscNG struct{}
+// TopicDiscovery is the "topic-discovery" ENR entry. It signals that a node
+// implements the topic discovery capability for Discv5 and is willing to
+// participate in topic service tables, registrations, and lookups. The value
+// is an unsigned integer identifying the supported protocol version, so
+// non-backwards-compatible revisions can bump the value in place rather than
+// introducing a new ENR key.
+type TopicDiscovery uint
 
-func (DiscNG) ENRKey() string { return "discng" }
+// TopicDiscoveryVersion is the protocol version implemented by this code.
+const TopicDiscoveryVersion TopicDiscovery = 1
 
-// SupportsDiscNG reports whether a node's ENR contains the discng capability flag.
-func SupportsDiscNG(n *enode.Node) bool {
-	return n.Record().Load(new(DiscNG)) == nil
+func (TopicDiscovery) ENRKey() string { return "topic-discovery" }
+
+// SupportsTopicDiscovery reports whether n advertises a version of the topic
+// discovery capability that this implementation supports. A node whose ENR
+// does not contain the entry, or whose value does not match a supported
+// version, is treated as not supporting the capability.
+func SupportsTopicDiscovery(n *enode.Node) bool {
+	var v TopicDiscovery
+	if err := n.Record().Load(&v); err != nil {
+		return false
+	}
+	return v == TopicDiscoveryVersion
 }

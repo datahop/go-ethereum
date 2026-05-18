@@ -163,12 +163,12 @@ func TestTopicRegNodeTableUpdates(t *testing.T) {
 	key1 := newkey()
 	addr1 := netip.MustParseAddrPort("10.0.1.101:30303")
 	ln1 := test.getNode(key1, addr1)
-	ln1.Set(topicindex.DiscNG{})
+	ln1.Set(topicindex.TopicDiscoveryVersion)
 
 	key2 := newkey()
 	addr2 := netip.MustParseAddrPort("10.0.1.102:30303")
 	ln2 := test.getNode(key2, addr2)
-	ln2.Set(topicindex.DiscNG{})
+	ln2.Set(topicindex.TopicDiscoveryVersion)
 
 	test.table.addFoundNode(ln1.Node(), true)
 	test.udp.RegisterTopic(testTopic1, 1)
@@ -202,37 +202,36 @@ func TestTopicRegNodeTableUpdates(t *testing.T) {
 	}
 }
 
-// TestDiscNGENRFlag verifies that the discng ENR flag is set on nodes
-// and that the filter function works correctly.
-func TestDiscNGENRFlag(t *testing.T) {
+// TestTopicDiscoveryENRFlag verifies that the topic-discovery ENR entry is
+// set on nodes and that the support check works correctly.
+func TestTopicDiscoveryENRFlag(t *testing.T) {
 	t.Parallel()
 
 	node := startLocalhostV5(t, Config{})
 	defer node.Close()
 
-	// The local node should have the discng ENR flag set.
-	if !topicindex.SupportsDiscNG(node.Self()) {
-		t.Fatal("local node should have discng ENR flag")
+	if !topicindex.SupportsTopicDiscovery(node.Self()) {
+		t.Fatal("local node should advertise topic-discovery ENR entry")
 	}
 }
 
-// TestDiscNGFilterNodes verifies that filterDiscNG correctly filters
-// nodes based on ENR capability.
-func TestDiscNGFilterNodes(t *testing.T) {
+// TestTopicDiscoveryFilterNodes verifies that filterTopicDiscovery correctly
+// filters nodes based on the topic-discovery ENR capability.
+func TestTopicDiscoveryFilterNodes(t *testing.T) {
 	t.Parallel()
 
-	// Create a node with discng flag (via startLocalhostV5 which sets it).
+	// Node with topic-discovery entry (startLocalhostV5 sets it).
 	withFlag := startLocalhostV5(t, Config{})
 	defer withFlag.Close()
 
-	// Create a node record without the discng flag.
+	// Node record without the topic-discovery entry.
 	var r enr.Record
 	r.Set(enr.IP(net.IPv4(127, 0, 0, 1)))
 	r.Set(enr.UDP(9999))
 	withoutFlag := enode.SignNull(&r, enode.ID{1, 2, 3})
 
 	nodes := []*enode.Node{withFlag.Self(), withoutFlag}
-	filtered := filterDiscNG(nodes)
+	filtered := filterTopicDiscovery(nodes)
 
 	if len(filtered) != 1 {
 		t.Fatalf("expected 1 node after filter, got %d", len(filtered))
