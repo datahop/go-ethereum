@@ -59,8 +59,6 @@ func TestTopicReg(t *testing.T) {
 }
 
 func TestTopicSearch(t *testing.T) {
-	t.Skip("disabled: topicSearch.runRequests can block past Close; see datahop/go-ethereum#30")
-
 	node0 := startLocalhostV5(t, Config{})
 	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
 	node2 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
@@ -71,8 +69,11 @@ func TestTopicSearch(t *testing.T) {
 		}
 	}()
 
-	node1.topicTable.Add(node0.Self(), testTopic1)
-	node1.topicTable.Add(node3.Self(), testTopic1)
+	// Seed node1's topic table with the registrants. The topic table is
+	// owned by node1's dispatch goroutine, so the writes must be performed
+	// there (via onDispatchCh) rather than directly from the test goroutine,
+	// which would race with the dispatch loop's NextExpiryTime read.
+	seedTopicTable(t, node1, testTopic1, node0.Self(), node3.Self())
 
 	it := node2.TopicSearch(testTopic1, 0)
 	defer it.Close()
@@ -83,6 +84,25 @@ func TestTopicSearch(t *testing.T) {
 	sortByID(want)
 	if err := checkNodesEqual(found, want); err != nil {
 		t.Error(err)
+	}
+}
+
+// seedTopicTable registers the given nodes for a topic in t's local topic
+// table. The work runs on the dispatch goroutine, which owns the table.
+func seedTopicTable(t *testing.T, node *UDPv5, topic topicindex.TopicID, regs ...*enode.Node) {
+	t.Helper()
+	done := make(chan struct{})
+	fn := func() {
+		for _, n := range regs {
+			node.topicTable.Add(n, topic)
+		}
+		close(done)
+	}
+	select {
+	case node.onDispatchCh <- fn:
+		<-done
+	case <-node.closeCtx.Done():
+		t.Fatal("node closed before topic table could be seeded")
 	}
 }
 
