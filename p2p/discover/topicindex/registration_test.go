@@ -248,6 +248,56 @@ func TestRegistrationExpiry(t *testing.T) {
 	}
 }
 
+// TestRegistrationExpiryDropsWhenStandbyFull checks that an expired registration
+// is dropped (not demoted) when the bucket's standby pool is already full, so the
+// standby limit is never exceeded.
+func TestRegistrationExpiryDropsWhenStandbyFull(t *testing.T) {
+	simclock := new(mclock.Simulated)
+
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdLifetime = 20
+	cfg.RegBucketSize = 1
+	cfg.RegBucketStandbyLimit = 2
+	r := NewRegistration(topic1, cfg)
+
+	// Three nodes in the same bucket: one becomes active (Waiting), the other
+	// two fill the standby pool to its limit.
+	nodes := nodesAtDistanceFrom(enode.ID(r.Topic()), 30, 3, 1)
+	r.AddNodes(nil, nodes)
+
+	// Register the active attempt.
+	att := r.Update()
+	if att == nil || att.State != Waiting {
+		t.Fatal("no waiting attempt scheduled")
+	}
+	registeredID := att.Node.ID()
+	r.StartRequest(att)
+	r.HandleRegistered(att, cfg.AdLifetime)
+
+	// The standby pool is full while this ad is Registered.
+	b := &r.buckets[r.bucketIndex(registeredID)]
+	if b.count[Standby] != cfg.RegBucketStandbyLimit {
+		t.Fatalf("standby=%d, want %d", b.count[Standby], cfg.RegBucketStandbyLimit)
+	}
+	before := r.NodeCount()
+
+	// On expiry, with the standby pool already full, the attempt must be
+	// dropped rather than demoted back to Standby.
+	simclock.Run(cfg.AdLifetime)
+	r.Update()
+
+	if _, ok := b.att[registeredID]; ok {
+		t.Fatal("expired attempt was not dropped despite a full standby pool")
+	}
+	if got := r.NodeCount(); got != before-1 {
+		t.Fatalf("NodeCount=%d after drop, want %d", got, before-1)
+	}
+	if b.count[Standby] > cfg.RegBucketStandbyLimit {
+		t.Fatalf("standby count %d exceeds limit %d", b.count[Standby], cfg.RegBucketStandbyLimit)
+	}
+}
+
 // TestRegistrationHandleTicketResponseDropAboveBudget verifies that a
 // registrar quoting a wait time above RegAttemptTimeout causes the attempt
 // to be dropped, freeing the bucket slot for another registrar. Without

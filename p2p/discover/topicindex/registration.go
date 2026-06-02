@@ -276,19 +276,26 @@ func (r *Registration) Update() *RegAttempt {
 		case Standby:
 			panic("standby attempt in Registration.heap")
 		case Registered:
-			// Demote the expired attempt back to Standby instead of
-			// deleting it. The candidate registrar is still in our
-			// routing table and remains a valid target for renewal —
-			// removing it permanently drains the bucket's candidate
-			// pool, which caps fan-out at ceil(register-wait /
-			// AdLifetime) candidates per registrant. Resetting the
-			// ticket / wait-time counters lets refillAttempts treat it
-			// as a fresh re-registration candidate.
-			heap.Remove(&r.heap, att.index)
-			att.Ticket = nil
-			att.totalWaitTime = 0
-			att.reqCount = 0
-			r.setAttemptState(att, Standby)
+			// On expiry, demote back to Standby instead of deleting, so
+			// the candidate registrar — still in our routing table —
+			// remains a target for renewal. Permanently removing it would
+			// drain the bucket's candidate pool, capping fan-out at
+			// ceil(register-wait / AdLifetime) candidates per registrant.
+			//
+			// Demote only while there is room in the standby pool. If the
+			// pool is already full there are enough renewal candidates, so
+			// drop this one instead and keep count[Standby] within
+			// RegBucketStandbyLimit. Either way the freed Registered slot
+			// is backfilled from standby by refillAttempts.
+			if att.bucket.count[Standby] >= r.cfg.RegBucketStandbyLimit {
+				r.removeAttempt(att, "expired")
+			} else {
+				heap.Remove(&r.heap, att.index)
+				att.Ticket = nil
+				att.totalWaitTime = 0
+				att.reqCount = 0
+				r.setAttemptState(att, Standby)
+			}
 			r.refillAttempts(att.bucket)
 		case Waiting:
 			return att
