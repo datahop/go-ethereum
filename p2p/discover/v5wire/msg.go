@@ -47,8 +47,6 @@ const (
 	NodesMsg
 	TalkRequestMsg
 	TalkResponseMsg
-	RequestTicketMsg
-	TicketMsg
 	RegtopicMsg
 	RegconfirmationMsg
 	TopicQueryMsg
