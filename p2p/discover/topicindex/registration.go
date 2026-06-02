@@ -171,6 +171,10 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		if id == r.cfg.Self {
 			continue
 		}
+		// Skip nodes that are temporarily blacklisted for repeated RPC failures.
+		if r.cfg.Blacklist.Contains(id) {
+			continue
+		}
 
 		bi := r.bucketIndex(id)
 		b := &r.buckets[bi]
@@ -217,6 +221,24 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 		r.refillAttempts(att.bucket)
 	}
+}
+
+// RemoveNode drops any registration attempt for the given node from the table.
+// It is used to evict nodes that have become unresponsive. An attempt with an
+// in-flight request (index == -2) is left in place: removing it would desync the
+// pending response handling. Such an attempt is harmless — blacklist gating in
+// AddNodes prevents the node from being re-selected once the request completes.
+func (r *Registration) RemoveNode(id enode.ID) {
+	b := &r.buckets[r.bucketIndex(id)]
+	att, ok := b.att[id]
+	if !ok {
+		return
+	}
+	if att.index == -2 {
+		return
+	}
+	r.removeAttempt(att, "evicted")
+	r.refillAttempts(b)
 }
 
 func (r *Registration) setAttemptState(att *RegAttempt, state RegAttemptState) {
