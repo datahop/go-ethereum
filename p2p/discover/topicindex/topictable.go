@@ -35,7 +35,12 @@ const (
 )
 
 // If a node has less than this time to wait, they will be accepted anyway.
-const topicTableWaitTimeFloor = 50 * time.Millisecond
+// Acts as an admission slack absorbing one-way network latency, queueing
+// delay, and minor clock drift, so honest registrants whose REGTOPIC arrives
+// fractionally before the formula's requirement aren't bounced into a
+// retry. Not a security feature; the bucket-slot squat via a huge quote is
+// handled on the registrant side in registration.go.
+const topicTableWaitTimeFloor = 1 * time.Second
 
 // TopicTable holds node registrations.
 type TopicTable struct {
@@ -235,6 +240,9 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 }
 
 // Register adds node n for topic t if it has waited long enough.
+//
+// Returns 0 if the node is admitted, otherwise the new wait time the
+// registrant should observe before retrying.
 func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration) time.Duration {
 	// Reject attempt if node is already registered.
 	if tab.isRegistered(n, t) {

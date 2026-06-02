@@ -212,6 +212,34 @@ func TestRegistrationExpiry(t *testing.T) {
 	}
 }
 
+// TestRegistrationHandleTicketResponseDropAboveBudget verifies that a
+// registrar quoting a wait time above RegAttemptTimeout causes the attempt
+// to be dropped, freeing the bucket slot for another registrar. Without
+// this, a single packet could park the slot for the quoted duration.
+func TestRegistrationHandleTicketResponseDropAboveBudget(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdLifetime = 15 * time.Minute
+	cfg.RegAttemptTimeout = 22*time.Minute + 30*time.Second
+	r := NewRegistration(topic1, cfg)
+
+	node := nodesAtDistance(enode.ID(r.Topic()), 30, 1)
+	r.AddNodes(nil, node)
+	att := r.Update()
+	if att == nil {
+		t.Fatal("no request scheduled")
+	}
+	r.StartRequest(att)
+
+	// Registrar quotes 49 days (well above RegAttemptTimeout). Expect the
+	// attempt to be removed from the bucket.
+	r.HandleTicketResponse(att, []byte("t"), 49*24*time.Hour)
+	if att.bucket.att[node[0].ID()] != nil {
+		t.Fatal("attempt not removed after wait time above RegAttemptTimeout")
+	}
+}
+
 // nodesAtDistance creates n nodes for which enode.LogDist(base, node.ID()) == ld.
 func nodesAtDistance(base enode.ID, ld int, n int) []*enode.Node {
 	return nodesAtDistanceFrom(base, ld, n, 1)
