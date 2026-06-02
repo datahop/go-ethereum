@@ -34,16 +34,97 @@ type topicSystem struct {
 	transport *UDPv5
 	config    topicindex.Config
 
-	mu  sync.Mutex
-	reg map[topicindex.TopicID]*topicReg
+	mu       sync.Mutex
+	reg      map[topicindex.TopicID]*topicReg
+	searches map[*topicSearch]struct{}
+
+	wg   sync.WaitGroup
+	quit chan struct{}
 }
 
 func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
-	return &topicSystem{
+	config = config.WithDefaults()
+	// Create the shared blacklist used to skip nodes that repeatedly fail to
+	// respond, and make it visible to all registration/search state machines.
+	if config.Blacklist == nil {
+		config.Blacklist = topicindex.NewBlacklist(config.BlacklistTTL, config.Clock)
+	}
+	sys := &topicSystem{
 		transport: transport,
 		config:    config,
 		reg:       make(map[topicindex.TopicID]*topicReg),
+		searches:  make(map[*topicSearch]struct{}),
+		quit:      make(chan struct{}),
 	}
+	sys.wg.Add(1)
+	go sys.trackFailures()
+	return sys
+}
+
+// trackFailures consumes per-call liveness samples and maintains the failure
+// counter and blacklist. A node that fails MaxNodeFailures consecutive RPCs
+// (across any message type, topic or DHT) is blacklisted and evicted from all
+// registration/search tables and the local ad cache.
+func (sys *topicSystem) trackFailures() {
+	defer sys.wg.Done()
+	for {
+		select {
+		case <-sys.quit:
+			return
+		case o := <-sys.transport.callOutcomeCh:
+			sys.handleCallOutcome(o)
+		}
+	}
+}
+
+func (sys *topicSystem) handleCallOutcome(o callOutcome) {
+	if !o.ip.IsValid() {
+		return
+	}
+	db := sys.transport.db
+	if o.success {
+		db.UpdateFindFailsV5(o.id, o.ip, 0)
+		return
+	}
+	fails := db.FindFailsV5(o.id, o.ip) + 1
+	if fails < sys.config.MaxNodeFailures {
+		db.UpdateFindFailsV5(o.id, o.ip, fails)
+		return
+	}
+	// Threshold reached: blacklist and evict. Reset the counter so that, after
+	// the ban expires, the node gets a fresh budget of MaxNodeFailures attempts.
+	db.UpdateFindFailsV5(o.id, o.ip, 0)
+	sys.banAndEvict(o.id)
+}
+
+// banAndEvict blacklists a node and removes it from all topic tables.
+func (sys *topicSystem) banAndEvict(id enode.ID) {
+	sys.config.Blacklist.Ban(id)
+
+	sys.mu.Lock()
+	regs := make([]*topicReg, 0, len(sys.reg))
+	for _, r := range sys.reg {
+		regs = append(regs, r)
+	}
+	searches := make([]*topicSearch, 0, len(sys.searches))
+	for s := range sys.searches {
+		searches = append(searches, s)
+	}
+	sys.mu.Unlock()
+
+	for _, r := range regs {
+		r.evict(id)
+	}
+	for _, s := range searches {
+		s.evict(id)
+	}
+	sys.transport.evictTopicTableNode(id)
+}
+
+func (sys *topicSystem) removeSearch(s *topicSearch) {
+	sys.mu.Lock()
+	delete(sys.searches, s)
+	sys.mu.Unlock()
 }
 
 func (sys *topicSystem) register(topic topicindex.TopicID, opid uint64) {
@@ -67,6 +148,9 @@ func (sys *topicSystem) stopRegister(topic topicindex.TopicID) {
 }
 
 func (sys *topicSystem) stop() {
+	close(sys.quit)
+	sys.wg.Wait()
+
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
@@ -82,6 +166,9 @@ func (sys *topicSystem) newSearchIterator(topic topicindex.TopicID, opid uint64)
 
 	resultCh := make(chan *enode.Node, 200)
 	s := newTopicSearch(sys, topic, resultCh, opid)
+	// Track the search so it can receive eviction broadcasts. Done here, under
+	// the lock already held, rather than in newTopicSearch (which would re-lock).
+	sys.searches[s] = struct{}{}
 	return newTopicSearchIterator(sys, s, resultCh)
 }
 
@@ -97,9 +184,37 @@ type topicReg struct {
 	regRequest  chan topicRegJob
 	regResponse chan topicRegResult
 
+	// evictCh delivers node IDs to be removed from the registration table.
+	evictCh chan enode.ID
+
+	// controlCh runs a function on the registration loop goroutine, which owns
+	// reg.state. Used for goroutine-safe introspection (testing).
+	controlCh chan func()
+
 	// nodes subscription
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
+}
+
+// evict requests removal of a node from the registration table. It is called
+// from the topic system's failure-tracking goroutine.
+func (reg *topicReg) evict(id enode.ID) {
+	select {
+	case reg.evictCh <- id:
+	case <-reg.quit:
+	}
+}
+
+// nodeCount returns the number of nodes in the registration table. It runs on
+// the registration loop goroutine to avoid racing with state mutation.
+func (reg *topicReg) nodeCount() int {
+	res := make(chan int, 1)
+	select {
+	case reg.controlCh <- func() { res <- reg.state.NodeCount() }:
+		return <-res
+	case <-reg.quit:
+		return 0
+	}
 }
 
 func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topicReg {
@@ -110,6 +225,8 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 		quit:        make(chan struct{}),
 		regRequest:  make(chan topicRegJob),
 		regResponse: make(chan topicRegResult),
+		evictCh:     make(chan enode.ID, 64),
+		controlCh:   make(chan func()),
 	}
 
 	// Set up the subscription for new main table nodes.
@@ -177,6 +294,10 @@ func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
 				return false
 			case <-reg.newNodesCh:
 				// Drain the channel to avoid blocking the Table's feed sender.
+			case id := <-reg.evictCh:
+				reg.state.RemoveNode(id)
+			case fn := <-reg.controlCh:
+				fn()
 			case <-reg.quit:
 				return true
 			}
@@ -214,6 +335,12 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			if topicindex.SupportsDiscNG(n) {
 				reg.state.AddNodes(nil, []*enode.Node{n})
 			}
+
+		case id := <-reg.evictCh:
+			reg.state.RemoveNode(id)
+
+		case fn := <-reg.controlCh:
+			fn()
 
 		case <-updateCh:
 			attempt := reg.state.Update()
@@ -287,6 +414,7 @@ func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 
 // topicSearch handles searching in a single topic.
 type topicSearch struct {
+	sys    *topicSystem
 	topic  topicindex.TopicID
 	opid   uint64
 	config topicindex.Config
@@ -298,12 +426,25 @@ type topicSearch struct {
 	queryRespCh chan topicQueryResult
 	resultCh    chan *enode.Node
 
+	// evictCh delivers node IDs to be removed from the search table.
+	evictCh chan enode.ID
+
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
 }
 
+// evict requests removal of a node from the search table. It is called from the
+// topic system's failure-tracking goroutine.
+func (s *topicSearch) evict(id enode.ID) {
+	select {
+	case s.evictCh <- id:
+	case <-s.quit:
+	}
+}
+
 func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.Node, opid uint64) *topicSearch {
 	s := &topicSearch{
+		sys:      sys,
 		topic:    topic,
 		config:   sys.config,
 		opid:     opid,
@@ -312,6 +453,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
+		evictCh:     make(chan enode.ID, 64),
 	}
 
 	s.newNodesCh = make(chan *enode.Node, 100)
@@ -326,6 +468,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 func (s *topicSearch) stop() {
 	close(s.quit)
 	s.wg.Wait()
+	s.sys.removeSearch(s)
 }
 
 func (s *topicSearch) runLoop(sys *topicSystem) {
@@ -369,6 +512,9 @@ func (s *topicSearch) pause(lastTime mclock.AbsTime) bool {
 				return false
 			case <-s.newNodesCh:
 				// Drain the channel to avoid blocking the Table's feed sender.
+			case <-s.evictCh:
+				// Drain: no active search state to remove from between iterations.
+				// Blacklist gating prevents re-adding the node on the next cycle.
 			case <-s.quit:
 				return true
 			}
@@ -412,6 +558,9 @@ func (s *topicSearch) run(state *topicindex.Search) (exit bool) {
 		select {
 		case <-s.quit:
 			return true
+
+		case id := <-s.evictCh:
+			state.RemoveNode(id)
 
 		case queryCh <- nextQuery:
 		case resp := <-s.queryRespCh:

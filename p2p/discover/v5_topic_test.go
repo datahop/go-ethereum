@@ -197,7 +197,19 @@ func TestTopicRegNodeTableUpdates(t *testing.T) {
 		})
 	})
 
-	if got := test.udp.topicSys.reg[testTopic1].state.NodeCount(); got != 2 {
+	// Registration responses are processed asynchronously on the registration
+	// loop goroutine. Poll the count via the loop (nodeCount is goroutine-safe)
+	// until both registrations have been processed.
+	reg := test.udp.topicSys.reg[testTopic1]
+	deadline := time.Now().Add(2 * time.Second)
+	var got int
+	for time.Now().Before(deadline) {
+		if got = reg.nodeCount(); got == 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got != 2 {
 		t.Fatalf("wrong node count in reg state: got %d, want 2", got)
 	}
 }

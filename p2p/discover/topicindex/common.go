@@ -41,9 +41,29 @@ type Config struct {
 	// Search settings.
 	SearchBucketSize int // number of nodes in search buckets
 
+	// Liveness / blacklist settings.
+	//
+	// MaxNodeFailures is the number of consecutive discv5 RPC failures (across
+	// any message type, topic or DHT) after which a node is temporarily
+	// blacklisted. BlacklistTTL is how long the ban lasts. These are independent
+	// of the DHT routing table's own findnode-failure eviction.
+	MaxNodeFailures int
+	BlacklistTTL    time.Duration
+
+	// Blacklist is the shared set of temporarily-banned nodes. It is populated by
+	// the topic system and consulted by registration and search to skip banned
+	// nodes. May be nil, in which case no nodes are considered banned.
+	Blacklist *Blacklist
+
 	// These settings are exposed for testing purposes.
 	Clock mclock.Clock
 	Log   log.Logger
+}
+
+// WithDefaults returns a copy of the config with defaults filled in for unset
+// options.
+func (cfg Config) WithDefaults() Config {
+	return cfg.withDefaults()
 }
 
 // withDefaults configures defaults for unset config options.
@@ -69,6 +89,12 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.SearchBucketSize == 0 {
 		cfg.SearchBucketSize = 8
+	}
+	if cfg.MaxNodeFailures == 0 {
+		cfg.MaxNodeFailures = 3
+	}
+	if cfg.BlacklistTTL == 0 {
+		cfg.BlacklistTTL = 15 * time.Minute
 	}
 
 	if cfg.Log == nil {

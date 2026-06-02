@@ -131,6 +131,10 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		if id == s.cfg.Self {
 			continue
 		}
+		// Skip nodes that are temporarily blacklisted for repeated RPC failures.
+		if s.cfg.Blacklist.Contains(id) {
+			continue
+		}
 
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
@@ -155,6 +159,20 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		// All checks passed, add the node.
 		b.new[id] = n
 	}
+}
+
+// RemoveNode drops a node from the search table. It is used to evict nodes that
+// have become unresponsive. The node is removed from both the unasked ('new')
+// and asked sets of its bucket.
+func (s *Search) RemoveNode(id enode.ID) {
+	b := s.bucket(id)
+	if n, ok := b.new[id]; ok {
+		if ip := n.IP(); ip != nil && !netutil.IsLAN(ip) {
+			b.ips.Remove(ip)
+		}
+		delete(b.new, id)
+	}
+	delete(b.asked, id)
 }
 
 // QueryTarget returns a random node to which a topic query should be sent.
