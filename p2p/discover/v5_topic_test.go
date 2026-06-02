@@ -17,6 +17,7 @@
 package discover
 
 import (
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/p2p/enr"
 )
 
 var testTopic1 = topicindex.TopicID{1, 1, 1, 1}
@@ -161,10 +163,12 @@ func TestTopicRegNodeTableUpdates(t *testing.T) {
 	key1 := newkey()
 	addr1 := netip.MustParseAddrPort("10.0.1.101:30303")
 	ln1 := test.getNode(key1, addr1)
+	ln1.Set(topicindex.TopicDiscoveryVersion)
 
 	key2 := newkey()
 	addr2 := netip.MustParseAddrPort("10.0.1.102:30303")
 	ln2 := test.getNode(key2, addr2)
+	ln2.Set(topicindex.TopicDiscoveryVersion)
 
 	test.table.addFoundNode(ln1.Node(), true)
 	test.udp.RegisterTopic(testTopic1, 1)
@@ -196,4 +200,53 @@ func TestTopicRegNodeTableUpdates(t *testing.T) {
 	if got := test.udp.topicSys.reg[testTopic1].state.NodeCount(); got != 2 {
 		t.Fatalf("wrong node count in reg state: got %d, want 2", got)
 	}
+}
+
+// TestTopicDiscoveryENRFlag verifies that the topic-discovery ENR entry is
+// set on nodes and that the support check works correctly.
+func TestTopicDiscoveryENRFlag(t *testing.T) {
+	t.Parallel()
+
+	node := startLocalhostV5(t, Config{})
+	defer node.Close()
+
+	if !topicindex.SupportsTopicDiscovery(node.Self()) {
+		t.Fatal("local node should advertise topic-discovery ENR entry")
+	}
+}
+
+// TestTopicDiscoveryFilterNodes verifies that filterTopicDiscovery correctly
+// filters nodes based on the topic-discovery ENR capability.
+func TestTopicDiscoveryFilterNodes(t *testing.T) {
+	t.Parallel()
+
+	// Node with topic-discovery entry (startLocalhostV5 sets it).
+	withFlag := startLocalhostV5(t, Config{})
+	defer withFlag.Close()
+
+	// Node record without the topic-discovery entry.
+	var r enr.Record
+	r.Set(enr.IP(net.IPv4(127, 0, 0, 1)))
+	r.Set(enr.UDP(9999))
+	withoutFlag := enode.SignNull(&r, enode.ID{1, 2, 3})
+
+	nodes := []*enode.Node{withFlag.Self(), withoutFlag}
+	filtered := filterTopicDiscovery(nodes)
+
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 node after filter, got %d", len(filtered))
+	}
+	if filtered[0].ID() != withFlag.Self().ID() {
+		t.Fatal("wrong node passed filter")
+	}
+}
+
+func countRegistrants(found map[enode.ID]bool, registrants map[enode.ID]bool) int {
+	count := 0
+	for id := range found {
+		if registrants[id] {
+			count++
+		}
+	}
+	return count
 }
