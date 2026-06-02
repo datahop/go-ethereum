@@ -39,6 +39,8 @@ func main() {
 	searchTargetCount := flag.Int("search-target-count", 0, "stop each searcher once it has seen this many distinct registrants (0 = no limit, run for full search-timeout)")
 	checkpointInterval := flag.Duration("checkpoint-interval", 0, "if > 0, print per-topic coverage snapshot at this cadence during the search phase; useful for long continuous runs to see progress without waiting for the final report")
 	refreshInterval := flag.Duration("refresh-interval", 0, "discv5 routing table refresh interval (0 = use discv5 default of 30 min). Lower values run more background random lookups; useful for long-running simnets where coverage plateaus if routing tables freeze")
+	churnInterval := flag.Duration("churn-interval", 0, "if > 0, run the churn workload: kill -churn-frac of the active nodes every interval during the search phase, exercising failure-driven blacklist/eviction (#71)")
+	churnFrac := flag.Float64("churn-frac", 0.1, "fraction of the active population killed each churn round (only used when -churn-interval > 0)")
 	flag.Parse()
 
 	fmt.Printf("simnet-testbed: spawning %d nodes (latency=%dms, bw=%dMibps)\n",
@@ -105,6 +107,9 @@ func main() {
 	}
 
 	switch {
+	case *churnInterval > 0:
+		runChurnWorkload(all, *numTopics, *zipfS, *seed, *registerWait, *searchTimeout, *regProbePeriod, *registerStagger,
+			churnParams{Interval: *churnInterval, Frac: *churnFrac}, *metricsOut, pacing)
 	case *legacyFrac > 0 && *numTopics <= 1:
 		runDiscNGValidationWorkload(all, *registerWait, *searchTimeout, *metricsOut)
 	case *numTopics <= 1:

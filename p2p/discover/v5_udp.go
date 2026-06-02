@@ -342,6 +342,12 @@ func (t *UDPv5) LocalTopicNodes(topic topicindex.TopicID) []*enode.Node {
 	}
 }
 
+// BlacklistLen reports how many nodes are currently blacklisted for repeated
+// RPC failures. Exposed for testbed/metrics observability.
+func (t *UDPv5) BlacklistLen() int {
+	return t.topicSys.config.Blacklist.Len()
+}
+
 // TopicSearch returns an iterator over random nodes found in a topic.
 func (t *UDPv5) TopicSearch(topic topicindex.TopicID, opid uint64) enode.Iterator {
 	return t.topicSys.newSearchIterator(topic, opid)
