@@ -288,17 +288,26 @@ func (r *Registration) validate(att *RegAttempt) {
 // request with a ticket and waiting time.
 func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, waitTime time.Duration) {
 	r.validate(att)
-	att.totalWaitTime += waitTime
 
-	// Drop the attempt when the registrar makes us wait for longer than AdLifetime. This
-	// works because the entire ad cache will have been rotated after one lifetime, and so
-	// the registrar must be misbehaving if they didn't accept
-	if att.reqCount > 1 && att.totalWaitTime > r.cfg.RegAttemptTimeout {
-		r.removeAttempt(att, "wtime-too-high")
+	// Drop the attempt when a single quote already exceeds the registrant's
+	// total budget for this (topic, registrar) pair. Waiting longer than
+	// RegAttemptTimeout on one response is strictly worse than picking
+	// another registrar — the §6 eq. 1 formula can legitimately produce
+	// values above AdLifetime under heavy contention, so AdLifetime is too
+	// aggressive a threshold here; the cumulative cap below is the real
+	// budget.
+	if waitTime > r.cfg.RegAttemptTimeout {
+		r.removeAttempt(att, "wtime-above-budget")
 		return
 	}
 
-	// TODO: should a maximum number of retries be enforced here?
+	att.totalWaitTime += waitTime
+
+	// Drop the attempt when cumulative waiting exceeds RegAttemptTimeout.
+	if att.totalWaitTime > r.cfg.RegAttemptTimeout {
+		r.removeAttempt(att, "wtime-too-high")
+		return
+	}
 
 	att.Ticket = ticket
 	att.NextTime = r.cfg.Clock.Now().Add(waitTime)
