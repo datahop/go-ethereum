@@ -9,7 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
-func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, registerWait, searchTimeout, regProbePeriod time.Duration, metricsOut string) {
+func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, registerWait, searchTimeout, regProbePeriod, registerStagger time.Duration, metricsOut string, pacing searchPacing) {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
@@ -21,33 +21,61 @@ func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int
 		topics[i] = makeTopic(i)
 	}
 
+	// Topic assignment: only non-legacy (DISC-NG-flagged) nodes get a
+	// topic. Legacy nodes stay passive — they participate in ordinary
+	// Discv5 routing but do not register or search. nodeTopic[i] == -1
+	// marks "no topic" for legacy nodes; registrantsByTopic only contains
+	// flagged registrants.
 	nodeTopic := make([]int, len(all))
 	registrantsByTopic := make(map[int]map[enode.ID]struct{}, numTopics)
+	var activeCount, legacyCount int
 	for i := range all {
+		if all[i].legacy {
+			nodeTopic[i] = -1
+			legacyCount++
+			continue
+		}
 		t := int(zipf.Uint64())
 		nodeTopic[i] = t
 		if registrantsByTopic[t] == nil {
 			registrantsByTopic[t] = make(map[enode.ID]struct{})
 		}
 		registrantsByTopic[t][all[i].ln.ID()] = struct{}{}
+		activeCount++
 	}
 
 	dist := make([]int, numTopics)
 	for _, t := range nodeTopic {
-		dist[t]++
+		if t >= 0 {
+			dist[t]++
+		}
 	}
-	fmt.Printf("workload: %d nodes across %d topics (Zipf s=%.2f, seed=%d), each registers AND searches its own topic\n",
-		len(all), numTopics, zipfS, seed)
+	fmt.Printf("workload: %d nodes total, %d DISC-NG-active across %d topics (Zipf s=%.2f, seed=%d), %d legacy passive\n",
+		len(all), activeCount, numTopics, zipfS, seed, legacyCount)
 	for t, c := range dist {
 		fmt.Printf("  topic %d: %d nodes\n", t, c)
 	}
 
-	// Phase 1: register.
+	// Phase 1: register. Optionally stagger the start of each registrant's
+	// RegisterTopic call. Synchronized starts cause synchronized AdLifetime
+	// expiries: when the renewal path demotes a Registered attempt back to
+	// Standby (registration.go), N nodes try to renew at the same wall-clock
+	// moment, saturating router/link buffers. Spreading initial calls across
+	// a window keeps expiries/renewals spread across the same window. Legacy
+	// nodes are skipped — they remain passive Discv5 peers.
 	regStart := time.Now()
+	staggered := 0
 	for i, n := range all {
+		if nodeTopic[i] < 0 {
+			continue
+		}
+		if registerStagger > 0 && staggered > 0 {
+			time.Sleep(registerStagger)
+		}
+		staggered++
 		n.disc.RegisterTopic(topics[nodeTopic[i]], uint64(n.idx))
 	}
-	fmt.Printf("registrations started; register-wait=%s probe-period=%s\n", registerWait, regProbePeriod)
+	fmt.Printf("registrations started; register-wait=%s probe-period=%s register-stagger=%s\n", registerWait, regProbePeriod, registerStagger)
 
 	// Run the registration probe in parallel with register-wait so we can
 	// timestamp the first time each registrant shows up in any registrar's
@@ -66,7 +94,7 @@ func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int
 	printMultiTopicCoverage(allCov, registrantsByTopic, len(all))
 
 	// Phase 2: searches.
-	results := runMultiTopicSearches(all, nodeTopic, topics, registrantsByTopic, searchTimeout)
+	results := runMultiTopicSearches(all, nodeTopic, topics, registrantsByTopic, searchTimeout, pacing)
 	reportMultiTopic(results, registrantsByTopic, topics, regTimingNs, metricsOut, allCov)
 }
 
@@ -80,6 +108,9 @@ func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int
 func runRegistrationProbe(all []nodeRec, topics []topicindex.TopicID, nodeTopic []int, regStart time.Time, stop <-chan struct{}, period time.Duration) map[string]map[string]int64 {
 	regTopic := make(map[enode.ID]topicindex.TopicID, len(all))
 	for i, n := range all {
+		if nodeTopic[i] < 0 {
+			continue // legacy node, not a registrant
+		}
 		regTopic[n.ln.ID()] = topics[nodeTopic[i]]
 	}
 

@@ -14,12 +14,14 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
-// maxBootnodes caps how many of the previously-spawned nodes a fresh node
-// uses as its bootstrap set. Without a cap, node N tries to PING all N-1
-// predecessors at startup, producing O(N^2) bootstrap traffic that stalls
-// at scale (n=2000 stalls indefinitely). Mirrors the Python testbed's
-// select_bootnodes helper which uses ~20.
-const maxBootnodes = 20
+// defaultMaxBootnodes caps how many of the previously-spawned nodes a
+// fresh node uses as its bootstrap set. Without a cap, node N tries to
+// PING all N-1 predecessors at startup, producing O(N^2) bootstrap
+// traffic that stalls at scale (n=2000 stalls indefinitely). Mirrors the
+// Python testbed's select_bootnodes helper which uses ~20. Configurable
+// via -max-bootnodes — smaller values reduce startup traffic at the cost
+// of slower routing-table convergence.
+const defaultMaxBootnodes = 20
 
 // testTopic is the legacy single-topic ID used when -topics is unset or 1.
 // Identical across runs so behaviour is reproducible.
@@ -67,9 +69,15 @@ func pickLegacySet(total int, frac float64, seed int64) map[int]bool {
 	return set
 }
 
-func spawnNodes(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, count int, legacySet map[int]bool) []nodeRec {
+func spawnNodes(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, count int, legacySet map[int]bool, maxBootnodes int, spawnDelay time.Duration, refreshInterval time.Duration) []nodeRec {
+	if maxBootnodes <= 0 {
+		maxBootnodes = defaultMaxBootnodes
+	}
 	all := make([]nodeRec, 0, count)
 	for i := 0; i < count; i++ {
+		if i > 0 && spawnDelay > 0 {
+			time.Sleep(spawnDelay)
+		}
 		key, err := crypto.GenerateKey()
 		if err != nil {
 			fatalf("generate key %d: %v", i, err)
@@ -101,6 +109,9 @@ func spawnNodes(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, count 
 		ln.SetFallbackUDP(addr.Port)
 
 		cfg := discover.Config{PrivateKey: key}
+		if refreshInterval > 0 {
+			cfg.RefreshInterval = refreshInterval
+		}
 		if len(all) > 0 {
 			cfg.Bootnodes = append(cfg.Bootnodes, all[0].ln.Node())
 			pool := all[1:]

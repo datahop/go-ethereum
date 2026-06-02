@@ -255,7 +255,19 @@ func (r *Registration) Update() *RegAttempt {
 		case Standby:
 			panic("standby attempt in Registration.heap")
 		case Registered:
-			r.removeAttempt(att, "expired")
+			// Demote the expired attempt back to Standby instead of
+			// deleting it. The candidate registrar is still in our
+			// routing table and remains a valid target for renewal —
+			// removing it permanently drains the bucket's candidate
+			// pool, which caps fan-out at ceil(register-wait /
+			// AdLifetime) candidates per registrant. Resetting the
+			// ticket / wait-time counters lets refillAttempts treat it
+			// as a fresh re-registration candidate.
+			heap.Remove(&r.heap, att.index)
+			att.Ticket = nil
+			att.totalWaitTime = 0
+			att.reqCount = 0
+			r.setAttemptState(att, Standby)
 			r.refillAttempts(att.bucket)
 		case Waiting:
 			return att

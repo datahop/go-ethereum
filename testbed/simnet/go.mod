@@ -4,6 +4,8 @@ go 1.25.1
 
 replace github.com/ethereum/go-ethereum => ../..
 
+replace github.com/marcopolo/simnet => /Users/sergi/workspace/srene-simnet
+
 require (
 	github.com/ethereum/go-ethereum v1.17.2
 	github.com/marcopolo/simnet v0.0.7

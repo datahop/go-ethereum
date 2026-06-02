@@ -20,9 +20,7 @@ import (
 	"math/rand"
 	"net"
 	"testing"
-	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
@@ -188,27 +186,23 @@ func TestRegistrationExpiry(t *testing.T) {
 		t.Fatal("wrong next update time:", next)
 	}
 
-	// The attempt should be removed when the ad expires.
+	// When the ad expires, the candidate should be demoted to Standby and
+	// then promoted again to Waiting via refillAttempts (renewal), so the
+	// same candidate becomes eligible for re-registration without needing
+	// AddNodes to be called again.
 	simclock.Run(cfg.AdLifetime)
-	if a := r.Update(); a != nil {
-		t.Log(spew.Sdump(a))
-		t.Fatal("Update returned an attempt, but nothing to do.")
-	}
-	if r.heap.Len() > 0 {
-		t.Fatal("attempt not removed")
-	}
-
-	// Re-add the node.
-	simclock.Run(1 * time.Second)
-	r.AddNodes(nil, node)
-
-	// It should get scheduled for registration again.
 	att = r.Update()
 	if att == nil {
-		t.Fatal("no request scheduled")
+		t.Fatal("expired Registered attempt was not re-scheduled for renewal")
 	}
 	if att.State != Waiting {
-		t.Fatal("attempt should be in state", Waiting, "but has state", att.State)
+		t.Fatal("renewed attempt should be in state", Waiting, "but has state", att.State)
+	}
+	if att.Ticket != nil {
+		t.Fatal("renewed attempt should have its ticket cleared")
+	}
+	if att.reqCount != 0 || att.totalWaitTime != 0 {
+		t.Fatal("renewed attempt should have reqCount and totalWaitTime reset")
 	}
 }
 
