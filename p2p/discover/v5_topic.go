@@ -338,6 +338,12 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 
 		case id := <-reg.evictCh:
 			reg.state.RemoveNode(id)
+			// If the evicted node was the attempt selected for the next
+			// request, cancel the pending send: its attempt has been removed,
+			// so StartRequest would operate on a stale (removed) attempt.
+			if sendAttemptCh != nil && nextAttempt.node.ID() == id {
+				sendAttemptCh = nil
+			}
 
 		case fn := <-reg.controlCh:
 			fn()
