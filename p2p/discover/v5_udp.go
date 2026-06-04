@@ -99,6 +99,10 @@ type UDPv5 struct {
 	ticketSealer *topicindex.TicketSealer
 	topicSys     *topicSystem
 
+	// callOutcomeCh carries per-call liveness samples out of the dispatch loop to
+	// the topic system. Buffered; samples are dropped if the buffer is full.
+	callOutcomeCh chan callOutcome
+
 	// channels into dispatch
 	onDispatchCh chan func()
 	packetInCh    chan ReadPacket
@@ -145,6 +149,20 @@ type callV5 struct {
 	handshakeCount int               // # times we attempted handshake for this call
 	challenge      *v5wire.Whoareyou // last sent handshake challenge
 	timeout        mclock.Timer
+
+	// Liveness tracking. These are set in the dispatch goroutine and read when
+	// the call finishes to report whether the node responded.
+	responded bool // a matching response was received
+	timedOut  bool // the response timeout fired
+}
+
+// callOutcome reports whether a node responded to a discv5 call. It is emitted
+// for every completed call (any message type) and consumed by the topic system
+// to drive failure-based blacklisting.
+type callOutcome struct {
+	id      enode.ID
+	ip      netip.Addr
+	success bool
 }
 
 // callTimeout is the response timeout event of a call.
@@ -198,6 +216,7 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		sendCh:        make(chan sendRequest),
 		respTimeoutCh: make(chan *callTimeout),
 		onDispatchCh:  make(chan func()),
+		callOutcomeCh: make(chan callOutcome, 1024),
 		unhandled:     cfg.Unhandled,
 		// state of dispatch
 		codec:            v5wire.NewCodec(ln, cfg.PrivateKey, cfg.Clock, cfg.V5ProtocolID),
@@ -770,6 +789,7 @@ func (t *UDPv5) dispatch() {
 		case ct := <-t.respTimeoutCh:
 			active := t.activeCallByNode[ct.c.id]
 			if ct.c == active && ct.timer == active.timeout {
+				ct.c.timedOut = true
 				ct.c.err <- errTimeout
 			}
 
@@ -781,6 +801,7 @@ func (t *UDPv5) dispatch() {
 			c.timeout.Stop()
 			delete(t.activeCallByAuth, c.nonce)
 			delete(t.activeCallByNode, c.id)
+			t.emitCallOutcome(c)
 			t.sendNextCall(c.id)
 
 		case r := <-t.sendCh:
@@ -974,8 +995,38 @@ func (t *UDPv5) handleCallResponse(fromID enode.ID, fromAddr netip.AddrPort, p v
 		return false
 	}
 	t.startResponseTimeout(ac)
+	ac.responded = true
 	ac.ch <- p
 	return true
+}
+
+// emitCallOutcome reports a finished call's liveness result to the topic system.
+// A call that received at least one response counts as a success; one that timed
+// out without any response counts as a failure. Calls cancelled by the caller
+// (e.g. iterator close) produce no sample. Runs in the dispatch goroutine.
+func (t *UDPv5) emitCallOutcome(c *callV5) {
+	var o callOutcome
+	switch {
+	case c.responded:
+		o = callOutcome{id: c.id, ip: c.addr.Addr(), success: true}
+	case c.timedOut:
+		o = callOutcome{id: c.id, ip: c.addr.Addr(), success: false}
+	default:
+		return // cancelled/closed: not a liveness signal
+	}
+	select {
+	case t.callOutcomeCh <- o:
+	default: // buffer full: drop the sample, liveness is sampled best-effort
+	}
+}
+
+// evictTopicTableNode removes all ads advertised by id from the local topic
+// table. It runs the removal on the dispatch goroutine, which owns the table.
+func (t *UDPv5) evictTopicTableNode(id enode.ID) {
+	select {
+	case t.onDispatchCh <- func() { t.topicTable.RemoveNode(id) }:
+	case <-t.closeCtx.Done():
+	}
 }
 
 // GetNode looks for a node record in table and database.
