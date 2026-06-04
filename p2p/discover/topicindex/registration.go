@@ -48,8 +48,6 @@ type Registration struct {
 	// Note: registration buckets are ordered far -> close.
 	buckets [regTableDepth]regBucket
 	heap    regHeap
-
-	bucketCheck map[int]struct{}
 }
 
 //go:generate go run golang.org/x/tools/cmd/stringer@latest -type RegAttemptState
@@ -97,6 +95,14 @@ type RegAttempt struct {
 	// reqCount tracks the number of registration requests sent.
 	reqCount int
 
+	// filledBuckets records the bucket indexes that this registrar, acting as a
+	// source of nodes, has already contributed an entry to. It enforces the
+	// 'one-per-source-per-bucket' rule across multiple responses. Because it
+	// lives on the attempt, it is freed when the registrar is evicted — so the
+	// per-source accounting is tied to the registrar's lifetime rather than
+	// accumulating forever in the buckets.
+	filledBuckets map[int]struct{}
+
 	index  int // index in regHeap
 	bucket *regBucket
 }
@@ -104,10 +110,9 @@ type RegAttempt struct {
 func NewRegistration(topic TopicID, cfg Config) *Registration {
 	cfg = cfg.withDefaults()
 	r := &Registration{
-		topic:       topic,
-		cfg:         cfg,
-		log:         cfg.Log.New("topic", topic),
-		bucketCheck: make(map[int]struct{}, regTableDepth),
+		topic: topic,
+		cfg:   cfg,
+		log:   cfg.Log.New("topic", topic),
 	}
 	dist := 256
 	for i := range r.buckets {
@@ -149,14 +154,18 @@ func (r *Registration) BucketsWithFreeSpace(dists []uint) []uint {
 
 // AddNodes notifies the registration process about found nodes.
 //
-// 'src' is the source of the nodes.
+// 'src' is the registrar that returned these nodes, or nil when they come from
+// our own routing table (bootstrap / the node feed).
 func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
-	// Clear the one-per-bucket checker.
-	for i := range r.bucketCheck {
-		delete(r.bucketCheck, i)
+	// When the nodes come from a remote registrar, find that registrar's own
+	// attempt. The 'one-per-source-per-bucket' rule is tracked on it (in
+	// filledBuckets), so the accounting is freed when the registrar is evicted
+	// instead of accumulating forever.
+	var srcAtt *RegAttempt
+	if src != nil {
+		srcAtt = r.buckets[r.bucketIndex(src.ID())].att[src.ID()]
 	}
 
-	// Add the nodes.
 	for _, n := range nodes {
 		id := n.ID()
 		if id == r.cfg.Self {
@@ -175,16 +184,14 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			continue
 		}
 
-		if src != nil {
-			// The node is supplied by a remote registrar. Enforce 'one-per-bucket' rule:
-			// in the list given by the registrar, there should be at most one node for
-			// every registration bucket. This avoids attacks where a single registrar can
-			// dominate a bucket.
-			if _, ok := r.bucketCheck[bi]; ok {
-				r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "one-per-bucket-rule")
+		// One-per-source-per-bucket rule: a registrar may contribute at most one
+		// entry to a given bucket, within a single response and across responses.
+		// This prevents a single registrar from dominating a bucket.
+		if srcAtt != nil {
+			if _, ok := srcAtt.filledBuckets[bi]; ok {
+				r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "source-already-in-bucket")
 				continue
 			}
-			r.bucketCheck[bi] = struct{}{}
 		}
 
 		if b.count[Standby] >= r.cfg.RegBucketStandbyLimit {
@@ -200,9 +207,14 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 
 		// Create a new attempt.
-		att := &RegAttempt{Node: n, bucket: b, index: -1}
+		att := &RegAttempt{Node: n, bucket: b, index: -1, filledBuckets: make(map[int]struct{})}
 		b.att[id] = att
 		b.count[att.State]++
+		// Record that the source has now filled this bucket, so a later
+		// response from the same registrar can't add another entry here.
+		if srcAtt != nil {
+			srcAtt.filledBuckets[bi] = struct{}{}
+		}
 		r.refillAttempts(att.bucket)
 	}
 }
