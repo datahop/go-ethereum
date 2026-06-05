@@ -776,7 +776,28 @@ func (t *UDPv5) dispatch() {
 		case c := <-t.callDoneCh:
 			active := t.activeCallByNode[c.id]
 			if active != c {
-				panic("BUG: callDone for inactive call")
+				// c is not the active call for c.id. This happens when a call
+				// was still waiting in callQueue (behind another active call to
+				// the same node) and its caller returned early — e.g. a
+				// TOPICQUERY/REGTOPIC whose quit channel fired on iter.Close /
+				// reg.stop. Such a call was never sent, so c.timeout is nil and
+				// the activeCall* maps don't reference it. Remove it from the
+				// queue so it isn't sent later, and skip the active-call cleanup.
+				if c.timeout != nil {
+					c.timeout.Stop()
+				}
+				if q := t.callQueue[c.id]; len(q) > 0 {
+					for i, qc := range q {
+						if qc == c {
+							t.callQueue[c.id] = append(q[:i], q[i+1:]...)
+							if len(t.callQueue[c.id]) == 0 {
+								delete(t.callQueue, c.id)
+							}
+							break
+						}
+					}
+				}
+				continue
 			}
 			c.timeout.Stop()
 			delete(t.activeCallByAuth, c.nonce)
