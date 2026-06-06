@@ -61,18 +61,29 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 	return sys
 }
 
-// trackFailures consumes per-call liveness samples and maintains the failure
-// counter and blacklist. A node that fails MaxNodeFailures consecutive RPCs
-// (across any message type, topic or DHT) is blacklisted and evicted from all
-// registration/search tables and the local ad cache.
+// trackFailures drives topic-discovery liveness eviction from two signals:
+//
+//  1. Per-call outcomes (callOutcomeCh): a node that fails MaxNodeFailures
+//     consecutive discv5 RPCs is blacklisted and evicted (banAndEvict).
+//  2. DHT routing-table evictions (subscribeRemovedNodes): when the core DHT
+//     decides a node is dead (failed revalidation), it is evicted from the topic
+//     tables and ad cache too — without a ban (it's gone, not proven malicious).
+//
+// Both feed the same evictEverywhere path, so the ad cache, registration tables
+// and search tables are cleaned by either signal.
 func (sys *topicSystem) trackFailures() {
 	defer sys.wg.Done()
+	removed := make(chan enode.ID, 1024)
+	sub := sys.transport.tab.subscribeRemovedNodes(removed)
+	defer sub.Unsubscribe()
 	for {
 		select {
 		case <-sys.quit:
 			return
 		case o := <-sys.transport.callOutcomeCh:
 			sys.handleCallOutcome(o)
+		case id := <-removed:
+			sys.evictEverywhere(id)
 		}
 	}
 }
@@ -83,24 +94,23 @@ func (sys *topicSystem) handleCallOutcome(o callOutcome) {
 	}
 	db := sys.transport.db
 	if o.success {
-		db.UpdateFindFailsV5(o.id, o.ip, 0)
+		db.SetTopDiscLivenessFails(o.id, o.ip, 0)
 		return
 	}
-	fails := db.FindFailsV5(o.id, o.ip) + 1
+	fails := db.TopDiscLivenessFails(o.id, o.ip) + 1
 	if fails < sys.config.MaxNodeFailures {
-		db.UpdateFindFailsV5(o.id, o.ip, fails)
+		db.SetTopDiscLivenessFails(o.id, o.ip, fails)
 		return
 	}
 	// Threshold reached: blacklist and evict. Reset the counter so that, after
 	// the ban expires, the node gets a fresh budget of MaxNodeFailures attempts.
-	db.UpdateFindFailsV5(o.id, o.ip, 0)
+	db.SetTopDiscLivenessFails(o.id, o.ip, 0)
 	sys.banAndEvict(o.id)
 }
 
-// banAndEvict blacklists a node and removes it from all topic tables.
-func (sys *topicSystem) banAndEvict(id enode.ID) {
-	sys.config.Blacklist.Ban(id)
-
+// evictEverywhere removes a node from all topic state: every active registration
+// and search table, and the local ad cache. It does not blacklist the node.
+func (sys *topicSystem) evictEverywhere(id enode.ID) {
 	sys.mu.Lock()
 	regs := make([]*topicReg, 0, len(sys.reg))
 	for _, r := range sys.reg {
@@ -119,6 +129,13 @@ func (sys *topicSystem) banAndEvict(id enode.ID) {
 		s.evict(id)
 	}
 	sys.transport.evictTopicTableNode(id)
+}
+
+// banAndEvict blacklists a node (so it can't re-enter while banned) and evicts
+// it from all topic state.
+func (sys *topicSystem) banAndEvict(id enode.ID) {
+	sys.config.Blacklist.Ban(id)
+	sys.evictEverywhere(id)
 }
 
 func (sys *topicSystem) removeSearch(s *topicSearch) {

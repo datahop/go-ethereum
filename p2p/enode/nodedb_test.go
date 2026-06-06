@@ -467,6 +467,6 @@ func TestDBExpireV5(t *testing.T) {
 	defer db.Close()
 
 	ip := netip.MustParseAddr("127.0.0.1")
-	db.UpdateFindFailsV5(ID{}, ip, 4)
+	db.SetTopDiscLivenessFails(ID{}, ip, 4)
 	db.expireNodes()
 }
