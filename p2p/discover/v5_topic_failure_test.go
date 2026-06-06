@@ -21,6 +21,8 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 )
 
 // waitForCond polls cond until it returns true or the deadline passes.
@@ -56,7 +58,7 @@ func TestTopicFailureBlacklist(t *testing.T) {
 		fail()
 	}
 	waitForCond(t, "failure counter reaches N-1", func() bool {
-		return test.db.FindFailsV5(id, ip) == N-1
+		return test.db.TopDiscLivenessFails(id, ip) == N-1
 	})
 	if bl.Contains(id) {
 		t.Fatal("node blacklisted before reaching MaxNodeFailures")
@@ -66,7 +68,7 @@ func TestTopicFailureBlacklist(t *testing.T) {
 	// reset so a future ban needs a fresh budget.
 	fail()
 	waitForCond(t, "node blacklisted", func() bool { return bl.Contains(id) })
-	if got := test.db.FindFailsV5(id, ip); got != 0 {
+	if got := test.db.TopDiscLivenessFails(id, ip); got != 0 {
 		t.Fatalf("failure counter not reset after ban, got %d", got)
 	}
 }
@@ -94,16 +96,44 @@ func TestTopicFailureSuccessResets(t *testing.T) {
 	for i := 0; i < N-1; i++ {
 		fail()
 	}
-	waitForCond(t, "counter reaches N-1", func() bool { return test.db.FindFailsV5(id, ip) == N-1 })
+	waitForCond(t, "counter reaches N-1", func() bool { return test.db.TopDiscLivenessFails(id, ip) == N-1 })
 	ok()
-	waitForCond(t, "counter resets to 0", func() bool { return test.db.FindFailsV5(id, ip) == 0 })
+	waitForCond(t, "counter resets to 0", func() bool { return test.db.TopDiscLivenessFails(id, ip) == 0 })
 
 	// N-1 more failures must still not ban (proves the success reset the count).
 	for i := 0; i < N-1; i++ {
 		fail()
 	}
-	waitForCond(t, "counter reaches N-1 again", func() bool { return test.db.FindFailsV5(id, ip) == N-1 })
+	waitForCond(t, "counter reaches N-1 again", func() bool { return test.db.TopDiscLivenessFails(id, ip) == N-1 })
 	if bl.Contains(id) {
 		t.Fatal("node blacklisted despite an intervening success")
 	}
+}
+
+// TestTopicDHTEvictionEvictsAd checks the #21 hook: when the DHT routing table
+// evicts a node, that node's ads are removed from the local ad cache too.
+func TestTopicDHTEvictionEvictsAd(t *testing.T) {
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	topic := topicindex.TopicID{1, 2, 3}
+	n := nodeAtDistance(test.table.self().ID(), 128, net.IP{203, 0, 113, 9})
+
+	// Seed the ad cache with n. The topic table is owned by the dispatch
+	// goroutine, so add it there.
+	done := make(chan struct{})
+	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, topic); close(done) }
+	<-done
+
+	if got := test.udp.LocalTopicNodes(topic); len(got) != 1 || got[0].ID() != n.ID() {
+		t.Fatalf("ad not present before eviction: %v", got)
+	}
+
+	// Fire a DHT routing-table eviction for n; the topic system subscribes to
+	// this feed and should drop n's ads from the ad cache.
+	test.table.removedFeed.Send(n.ID())
+
+	waitForCond(t, "ad removed from cache after DHT eviction", func() bool {
+		return len(test.udp.LocalTopicNodes(topic)) == 0
+	})
 }
