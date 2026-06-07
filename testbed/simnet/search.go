@@ -149,7 +149,7 @@ func runSearches(searchers []nodeRec, registrants map[enode.ID]struct{}, target 
 	return results
 }
 
-func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.TopicID, registrantsByTopic map[int]map[enode.ID]struct{}, timeout time.Duration, pacing searchPacing) []searchResult {
+func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.TopicID, registrantsByTopic map[int]map[enode.ID]struct{}, timeout time.Duration, pacing searchPacing, deadTracker *deadResultTracker) []searchResult {
 	results := make([]searchResult, len(all))
 	var wg sync.WaitGroup
 	wg.Add(len(all))
@@ -235,6 +235,7 @@ func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.T
 				seenReg     = make(map[enode.ID]struct{})
 				uniqueAtMs  []int64
 				hitDeadline bool
+				dl          deadLocal
 			)
 			selfID := n.ln.ID()
 		loop:
@@ -264,6 +265,11 @@ func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.T
 						seenReg[id] = struct{}{}
 						uniqueAtMs = append(uniqueAtMs, time.Since(start).Milliseconds())
 						stats.recordUniqueFind(topicIdx, id)
+						// Record whether this registrant was already dead when
+						// first returned to this searcher, and how stale it was.
+						if deadTracker != nil {
+							dl.record(deadTracker, id, time.Now())
+						}
 					}
 					registered++
 				} else {
@@ -312,6 +318,9 @@ func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.T
 				HitTimeoutBefore:   hitDeadline,
 			}
 			results[slot] = r
+			if deadTracker != nil {
+				deadTracker.merge(dl.total, dl.dead, dl.ages)
+			}
 		}(i, n, nodeTopic[i])
 	}
 	wg.Wait()

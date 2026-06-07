@@ -94,7 +94,7 @@ func runMultiTopicWorkload(all []nodeRec, numTopics int, zipfS float64, seed int
 	printMultiTopicCoverage(allCov, registrantsByTopic, len(all))
 
 	// Phase 2: searches.
-	results := runMultiTopicSearches(all, nodeTopic, topics, registrantsByTopic, searchTimeout, pacing)
+	results := runMultiTopicSearches(all, nodeTopic, topics, registrantsByTopic, searchTimeout, pacing, nil)
 	reportMultiTopic(results, registrantsByTopic, topics, regTimingNs, metricsOut, allCov)
 }
 

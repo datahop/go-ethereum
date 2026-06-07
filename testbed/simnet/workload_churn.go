@@ -99,6 +99,8 @@ func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, r
 		killMu    sync.Mutex
 		killedSet = make(map[enode.ID]bool)
 	)
+	// Tracks kill times to measure dead results returned in searches.
+	deadTracker := newDeadResultTracker()
 	snapshotKilled := func() map[enode.ID]bool {
 		killMu.Lock()
 		defer killMu.Unlock()
@@ -145,10 +147,12 @@ func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, r
 				}
 				round++
 				killMu.Lock()
+				now := time.Now()
 				for c := 0; c < k; c++ {
 					rec := pool[next]
 					next++
 					killedSet[rec.ln.ID()] = true
+					deadTracker.markKilled(rec.ln.ID(), now)
 					go rec.disc.Close() // detached: Close can be slow at scale
 				}
 				total := len(killedSet)
@@ -192,7 +196,7 @@ func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, r
 	}()
 
 	// Phase 2: searches run for the full search-timeout, concurrently with churn.
-	results := runMultiTopicSearches(all, nodeTopic, topics, registrantsByTopic, searchTimeout, pacing)
+	results := runMultiTopicSearches(all, nodeTopic, topics, registrantsByTopic, searchTimeout, pacing, deadTracker)
 
 	close(churnStop)
 	<-churnDone
@@ -223,6 +227,7 @@ func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, r
 	fmt.Printf("  blacklist entries across alive nodes (sum):           %d\n", totalBL)
 	fmt.Printf("  killed registrants still visible in any topic table:  %d / %d  (lower = eviction working)\n",
 		visible, killedRegistrants)
+	deadTracker.report()
 
 	reportMultiTopic(results, registrantsByTopic, topics, regTimingNs, metricsOut, allCov)
 }
