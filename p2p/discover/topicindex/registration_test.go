@@ -22,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
@@ -293,27 +292,74 @@ func TestRegistrationExpiry(t *testing.T) {
 		t.Fatal("wrong next update time:", next)
 	}
 
-	// The attempt should be removed when the ad expires.
+	// When the ad expires, the candidate should be demoted to Standby and
+	// then promoted again to Waiting via refillAttempts (renewal), so the
+	// same candidate becomes eligible for re-registration without needing
+	// AddNodes to be called again.
 	simclock.Run(cfg.AdLifetime)
-	if a := r.Update(); a != nil {
-		t.Log(spew.Sdump(a))
-		t.Fatal("Update returned an attempt, but nothing to do.")
-	}
-	if r.heap.Len() > 0 {
-		t.Fatal("attempt not removed")
-	}
-
-	// Re-add the node.
-	simclock.Run(1 * time.Second)
-	r.AddNodes(nil, node)
-
-	// It should get scheduled for registration again.
 	att = r.Update()
 	if att == nil {
-		t.Fatal("no request scheduled")
+		t.Fatal("expired Registered attempt was not re-scheduled for renewal")
 	}
 	if att.State != Waiting {
-		t.Fatal("attempt should be in state", Waiting, "but has state", att.State)
+		t.Fatal("renewed attempt should be in state", Waiting, "but has state", att.State)
+	}
+	if att.Ticket != nil {
+		t.Fatal("renewed attempt should have its ticket cleared")
+	}
+	if att.reqCount != 0 || att.totalWaitTime != 0 {
+		t.Fatal("renewed attempt should have reqCount and totalWaitTime reset")
+	}
+}
+
+// TestRegistrationExpiryDropsWhenStandbyFull checks that when a Registered ad
+// expires and the bucket's standby pool is already full, the expired registrar
+// is dropped (not retained for renewal) so a fresh standby candidate rotates
+// in. Retaining it would provide no anti-drain benefit (the pool is full) while
+// blocking newly discovered nodes from entering the bucket.
+func TestRegistrationExpiryDropsWhenStandbyFull(t *testing.T) {
+	simclock := new(mclock.Simulated)
+
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdLifetime = 20
+	cfg.RegBucketSize = 1
+	cfg.RegBucketStandbyLimit = 2
+	r := NewRegistration(topic1, cfg)
+
+	// Register one node, which will later expire. (intIP(1))
+	r.AddNodes(nil, nodesAtDistanceFrom(enode.ID(r.Topic()), 30, 1, 1))
+	att := r.Update()
+	if att == nil || att.State != Waiting {
+		t.Fatal("registration attempt not scheduled")
+	}
+	regID := att.Node.ID()
+	r.StartRequest(att)
+	r.HandleRegistered(att, cfg.AdLifetime)
+
+	// Fill the standby pool with other candidates in the same bucket. (intIP(2), intIP(3))
+	r.AddNodes(nil, nodesAtDistanceFrom(enode.ID(r.Topic()), 30, 2, 2))
+
+	b := &r.buckets[r.bucketIndex(regID)]
+	if b.count[Standby] != cfg.RegBucketStandbyLimit {
+		t.Fatalf("standby pool not full before expiry: got %d want %d", b.count[Standby], cfg.RegBucketStandbyLimit)
+	}
+
+	// Expire the ad. With standby full, the expired registrar must be dropped,
+	// and a different (standby) candidate promoted in its place.
+	simclock.Run(cfg.AdLifetime)
+	att = r.Update()
+	if att == nil || att.State != Waiting {
+		t.Fatal("no candidate promoted after expiry")
+	}
+	if att.Node.ID() == regID {
+		t.Fatal("expired registrar should have been dropped, not renewed, when standby is full")
+	}
+	if _, ok := b.att[regID]; ok {
+		t.Fatal("expired registrar still present in bucket after drop")
+	}
+	if b.count[Standby] >= cfg.RegBucketStandbyLimit {
+		t.Fatalf("standby pool should have room for fresh discovery after drop: got %d", b.count[Standby])
 	}
 }
 
