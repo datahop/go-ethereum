@@ -796,7 +796,28 @@ func (t *UDPv5) dispatch() {
 		case c := <-t.callDoneCh:
 			active := t.activeCallByNode[c.id]
 			if active != c {
-				panic("BUG: callDone for inactive call")
+				// c is not the active call for c.id. The only legitimate
+				// cause is that c's caller cancelled (its quit channel
+				// fired) while c was still parked in callQueue, behind
+				// another active call to the same node ID. Such a call was
+				// never sent, so it has no timeout armed and is absent from
+				// the activeCall* maps; dropping it from the queue is all
+				// the cleanup it needs.
+				//
+				// If c is neither active nor queued, dispatch has been asked
+				// to finish a call it has no record of. That is a real
+				// bookkeeping bug, so keep failing loudly on it rather than
+				// silently ignoring it.
+				queue := t.callQueue[c.id]
+				i := slices.Index(queue, c)
+				if i < 0 {
+					panic("BUG: callDone for call that is neither active nor queued")
+				}
+				t.callQueue[c.id] = slices.Delete(queue, i, i+1)
+				if len(t.callQueue[c.id]) == 0 {
+					delete(t.callQueue, c.id)
+				}
+				continue
 			}
 			c.timeout.Stop()
 			delete(t.activeCallByAuth, c.nonce)

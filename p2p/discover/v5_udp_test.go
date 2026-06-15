@@ -31,6 +31,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/internal/testlog"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/discover/v4wire"
 	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -566,6 +567,68 @@ func TestUDPv5_callTimeoutReset(t *testing.T) {
 	})
 	if err := <-done; err != nil {
 		t.Fatalf("unexpected error: %q", err)
+	}
+}
+
+// TestUDPv5_callDoneQueued checks that cancelling a call which is still parked
+// in the per-node call queue (because another call to the same node is active)
+// does not crash the dispatch loop. dispatch keeps at most one active call per
+// node ID and queues the rest; when the caller's quit channel fires while its
+// call is still queued, callDone reports a call that is not the active one.
+// dispatch used to panic ("BUG: callDone for inactive call") in that case,
+// which is what turned a saturated-buffer shutdown into a hard hang.
+func TestUDPv5_callDoneQueued(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	remote := test.getNode(test.remotekey, test.remoteaddr).Node()
+	topic := topicindex.TopicID{1, 2, 3}
+
+	// Call A becomes the active call for the remote node. We never answer it,
+	// so it holds the node's single call slot for the duration of the test.
+	doneA := make(chan topicQueryResult, 1)
+	quitA := make(chan struct{})
+	go func() {
+		doneA <- test.udp.topicQuery(quitA, remote, topic, nil, 0)
+	}()
+	test.waitPacketOut(func(p *v5wire.TopicQuery, addr netip.AddrPort, _ v5wire.Nonce) {})
+
+	// Call B targets the same node. Because A is active, B is parked in
+	// callQueue and never sent. callCh is unbuffered, so by the time topicQuery
+	// reaches its select loop B is already enqueued; closing quitB therefore
+	// always cancels a queued (not active) call, driving callDone for a call
+	// that is not the active one.
+	doneB := make(chan topicQueryResult, 1)
+	quitB := make(chan struct{})
+	go func() {
+		doneB <- test.udp.topicQuery(quitB, remote, topic, nil, 0)
+	}()
+	close(quitB)
+	if r := <-doneB; r.err != errClosed {
+		t.Fatalf("queued call B: want errClosed, got %v", r.err)
+	}
+
+	// Cancel A. This is the active-call path: dispatch runs the normal cleanup
+	// and starts the next queued call. B was removed when it was cancelled, so
+	// the queue is empty and no stray TopicQuery must be sent.
+	close(quitA)
+	if r := <-doneA; r.err != errClosed {
+		t.Fatalf("active call A: want errClosed, got %v", r.err)
+	}
+
+	// The dispatch loop must still be alive and the queue consistent: a fresh
+	// call goes out as a normal Ping, not a leftover TopicQuery from B.
+	pingDone := make(chan error, 1)
+	go func() {
+		_, err := test.udp.ping(remote)
+		pingDone <- err
+	}()
+	test.waitPacketOut(func(p *v5wire.Ping, addr netip.AddrPort, _ v5wire.Nonce) {
+		test.packetInFrom(test.remotekey, test.remoteaddr, &v5wire.Pong{ReqID: p.ReqID})
+	})
+	if err := <-pingDone; err != nil {
+		t.Fatalf("ping after queued-call cancel failed: %v", err)
 	}
 }
 
