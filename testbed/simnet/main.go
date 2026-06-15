@@ -39,7 +39,28 @@ func main() {
 	searchTargetCount := flag.Int("search-target-count", 0, "stop each searcher once it has seen this many distinct registrants (0 = no limit, run for full search-timeout)")
 	checkpointInterval := flag.Duration("checkpoint-interval", 0, "if > 0, print per-topic coverage snapshot at this cadence during the search phase; useful for long continuous runs to see progress without waiting for the final report")
 	refreshInterval := flag.Duration("refresh-interval", 0, "discv5 routing table refresh interval (0 = use discv5 default of 30 min). Lower values run more background random lookups; useful for long-running simnets where coverage plateaus if routing tables freeze")
+	churnInterval := flag.Duration("churn-interval", 0, "if > 0, run the churn workload: kill -churn-frac of the active nodes every interval during the search phase, exercising failure-driven blacklist/eviction (#71)")
+	churnFrac := flag.Float64("churn-frac", 0.1, "fraction of the active population churned each round (only used when -churn-interval > 0)")
+	churnMode := flag.String("churn-mode", "steadystate", "churn model when -churn-interval > 0: 'steadystate' (each action is 50/50 leave/join, keeping population ~constant) or 'killonly' (kill -churn-frac each round; population decays to zero)")
+	vanillaFrac := flag.Float64("vanilla-frac", 0, "if > 0, run the mixed-binary interop workload: this fraction of nodes run stock upstream geth v1.17.3 discv5 as routing substrate (real separate stack), the rest run TopDisc; measures whether TopDisc discovery interoperates with real upstream geth. TopDisc penetration = 1 - vanilla-frac")
 	flag.Parse()
+
+	// Absolute watchdog: guarantee the process exits even if the workload or
+	// teardown wedges. The discv5 search-shutdown path can deadlock when a
+	// heavily- or fully-churned network leaves searcher goroutines stuck, and
+	// the post-teardown watchdog below only arms after the workload returns —
+	// so it cannot help if the workload itself hangs. This one is armed up
+	// front. It must clear every healthy-run delay before search even starts —
+	// the per-node spawn and register staggers (spawnDelay×N, registerStagger×N
+	// are minutes at 10k), plus bootstrap-wait, register-wait and the full
+	// search-timeout — then an 8-minute grace for teardown.
+	n := time.Duration(*nodes)
+	hardCap := n*(*spawnDelay) + *bootstrapWait + n*(*registerStagger) + *registerWait + *searchTimeout + 8*time.Minute
+	go func() {
+		time.Sleep(hardCap)
+		fmt.Printf("absolute watchdog (%s) expired; force-exiting\n", hardCap)
+		os.Exit(0)
+	}()
 
 	fmt.Printf("simnet-testbed: spawning %d nodes (latency=%dms, bw=%dMibps)\n",
 		*nodes, *latencyMs, *bandwidthMibps)
@@ -64,6 +85,24 @@ func main() {
 	// burst across the spawn window instead of concentrating it at t=0.
 	sim.Start()
 	defer sim.Close()
+
+	// Mixed-binary interop workload: a fraction of nodes run the real stock
+	// upstream geth v1.17.3 discv5 stack as substrate; the rest run TopDisc.
+	// This path has its own spawn/teardown (two stacks) and bypasses the normal
+	// single-stack path below.
+	if *vanillaFrac > 0 {
+		monitorStop := make(chan struct{})
+		monitorDone := make(chan struct{})
+		go monitorBuffers(sim, monitorStop, monitorDone)
+		pacing := searchPacing{Stagger: *searchStagger, MaxPause: *searchPauseMax, TargetCount: *searchTargetCount, Checkpoint: *checkpointInterval}
+		runVanillaInterop(sim, settings, *nodes, *vanillaFrac, *numTopics, *zipfS, *seed,
+			*bootstrapWait, *registerWait, *searchTimeout, *regProbePeriod, *registerStagger, *refreshInterval,
+			*maxBootnodes, *spawnDelay, *metricsOut, pacing)
+		close(monitorStop)
+		<-monitorDone
+		fmt.Println("teardown complete")
+		return
+	}
 
 	all := spawnNodes(sim, settings, *nodes, legacySet, *maxBootnodes, *spawnDelay, *refreshInterval)
 	defer func() {
@@ -105,6 +144,9 @@ func main() {
 	}
 
 	switch {
+	case *churnInterval > 0:
+		runChurnWorkload(sim, settings, *maxBootnodes, *refreshInterval, all, *numTopics, *zipfS, *seed, *registerWait, *searchTimeout, *regProbePeriod, *registerStagger,
+			churnParams{Interval: *churnInterval, Frac: *churnFrac, SteadyState: *churnMode == "steadystate"}, *metricsOut, pacing)
 	case *legacyFrac > 0 && *numTopics <= 1:
 		runDiscNGValidationWorkload(all, *registerWait, *searchTimeout, *metricsOut)
 	case *numTopics <= 1:

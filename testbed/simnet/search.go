@@ -149,7 +149,7 @@ func runSearches(searchers []nodeRec, registrants map[enode.ID]struct{}, target 
 	return results
 }
 
-func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.TopicID, registrantsByTopic map[int]map[enode.ID]struct{}, timeout time.Duration, pacing searchPacing) []searchResult {
+func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.TopicID, registrantsByTopic map[int]map[enode.ID]struct{}, timeout time.Duration, pacing searchPacing, deadTracker *deadResultTracker) []searchResult {
 	results := make([]searchResult, len(all))
 	var wg sync.WaitGroup
 	wg.Add(len(all))
@@ -163,161 +163,228 @@ func runMultiTopicSearches(all []nodeRec, nodeTopic []int, topics []topicindex.T
 		close(checkpointDone)
 	}
 
+	// Static registrant sets: membership never changes here, so a plain map
+	// read is race-free.
+	has := func(id enode.ID, topic int) bool {
+		_, ok := registrantsByTopic[topic][id]
+		return ok
+	}
+	deadline := time.Now().Add(timeout)
+
 	for i, n := range all {
 		go func(slot int, n nodeRec, topicIdx int) {
 			defer wg.Done()
-
-			// Legacy (non-DISC-NG) nodes don't search. They stay
-			// passive in the routing-table substrate.
 			if topicIdx < 0 {
-				return
+				return // legacy nodes stay passive
 			}
-
-			// Stagger the start of this searcher. Spreads concurrent
-			// search activity across the run instead of having all
-			// searchers hammer simultaneously.
+			// Stagger spreads concurrent search activity across the run.
 			if pacing.Stagger > 0 {
 				time.Sleep(time.Duration(slot) * pacing.Stagger)
 			}
-
-			topic := topics[topicIdx]
-			regSet := registrantsByTopic[topicIdx]
-			target := len(regSet) - 1 // exclude self
+			target := len(registrantsByTopic[topicIdx]) - 1 // exclude self
 			if target < 0 {
 				target = 0
 			}
-
-			iter := n.disc.TopicSearch(topic, uint64(n.idx))
-			deadline := time.After(timeout)
-			// Best-effort close. The discv5 topicSearch shutdown path
-			// (search.stop -> wg.Wait) can hang at high node counts when
-			// internal runLoop/runRequests goroutines are stuck on a
-			// saturated UDP socket and never observe quit. Calling Close
-			// in a detached goroutine lets the searcher's outer
-			// wg.Done() fire so the workload can complete; the leaked
-			// shutdown goroutine is reaped by main()'s teardown
-			// watchdog.
-			closeIter := func() { go iter.Close() }
-			defer closeIter()
-
-			// Decouple iter.Next() from the searcher's main loop via a
-			// helper goroutine. Reason: iter.Close() does not reliably
-			// unblock a parked iter.Next() at scale (the underlying
-			// search machinery can hang inside its own shutdown path).
-			// Reading via a channel lets us bail when the deadline
-			// fires even if iter.Next() is stuck.
-			//
-			// The pump goroutine may leak if iter.Next() blocks forever
-			// after the deadline; the watchdog in main() force-exits
-			// after teardown so leaked goroutines do not delay process
-			// exit.
-			nodeCh := make(chan *enode.Node, 1)
-			go func() {
-				defer close(nodeCh)
-				for iter.Next() {
-					select {
-					case nodeCh <- iter.Node():
-					case <-deadline:
-						return
-					}
-				}
-			}()
-
-			// Per-searcher RNG, so pacing pauses don't all align.
-			rng := rand.New(rand.NewSource(int64(slot) * 2654435761))
-
-			start := time.Now()
-			var (
-				found       []enode.ID
-				timeFirst   time.Duration
-				registered  int
-				extra       int
-				seenReg     = make(map[enode.ID]struct{})
-				uniqueAtMs  []int64
-				hitDeadline bool
-			)
-			selfID := n.ln.ID()
-		loop:
-			for {
-				var nd *enode.Node
-				var ok bool
-				select {
-				case <-deadline:
-					hitDeadline = true
-					closeIter()
-					break loop
-				case nd, ok = <-nodeCh:
-					if !ok {
-						break loop
-					}
-				}
-				if timeFirst == 0 {
-					timeFirst = time.Since(start)
-				}
-				id := nd.ID()
-				if id == selfID {
-					continue
-				}
-				found = append(found, id)
-				if _, ok := regSet[id]; ok {
-					if _, dup := seenReg[id]; !dup {
-						seenReg[id] = struct{}{}
-						uniqueAtMs = append(uniqueAtMs, time.Since(start).Milliseconds())
-						stats.recordUniqueFind(topicIdx, id)
-					}
-					registered++
-				} else {
-					extra++
-				}
-				// Early termination: enough unique registrants found.
-				if pacing.TargetCount > 0 && len(seenReg) >= pacing.TargetCount {
-					closeIter()
-					break loop
-				}
-				// Per-iteration random pause to avoid running the
-				// iterator at full polling speed.
-				if pacing.MaxPause > 0 {
-					select {
-					case <-deadline:
-						hitDeadline = true
-						iter.Close()
-						break loop
-					case <-time.After(time.Duration(rng.Int63n(int64(pacing.MaxPause)))):
-					}
-				}
-			}
-			elapsed := time.Since(start)
-			ids := make([]string, 0, len(found))
-			for _, id := range found {
-				ids = append(ids, id.TerminalString())
-			}
-			foundRegIDs := make([]string, 0, len(seenReg))
-			for rid := range seenReg {
-				foundRegIDs = append(foundRegIDs, rid.TerminalString())
-			}
-			r := searchResult{
-				NodeIdx:            n.idx,
-				NodeID:             n.ln.ID().TerminalString(),
-				Topic:              topicIdx,
-				Target:             target,
-				Found:              len(found),
-				FoundRegistrant:    registered,
-				UniqueRegistrant:   len(seenReg),
-				FoundExtra:         extra,
-				TimeToFirst:        timeFirst,
-				TimeToCompletion:   elapsed,
-				FoundIDs:           ids,
-				FoundRegistrantIDs: foundRegIDs,
-				UniqueFoundAtMs:    uniqueAtMs,
-				HitTimeoutBefore:   hitDeadline,
-			}
-			results[slot] = r
+			results[slot] = runOneSearcher(n, topicIdx, topics[topicIdx], deadline,
+				pacing, has, target, int64(slot)*2654435761, stats, deadTracker)
 		}(i, n, nodeTopic[i])
 	}
 	wg.Wait()
 	close(checkpointStop)
 	<-checkpointDone
 	return results
+}
+
+// runOneSearcher executes a single node's TopicSearch until the absolute
+// deadline (or early-termination), and returns its result. Membership is
+// queried via has() so the caller can back it with either a static map
+// (multi-topic workload) or a concurrent registry (steady-state churn, where
+// registrants join and leave while searches run). The deadline is absolute so
+// that nodes which join late stop at the same wall-clock instant as everyone
+// else rather than each running for a full timeout past their start.
+func runOneSearcher(n nodeRec, topicIdx int, topic topicindex.TopicID, deadlineAt time.Time,
+	pacing searchPacing, has func(enode.ID, int) bool, target int, rngSeed int64,
+	stats *liveStats, deadTracker *deadResultTracker) searchResult {
+
+	iter := n.disc.TopicSearch(topic, uint64(n.idx))
+	deadline := time.After(time.Until(deadlineAt))
+	// Best-effort close. The discv5 topicSearch shutdown path
+	// (search.stop -> wg.Wait) can hang at high node counts when internal
+	// runLoop/runRequests goroutines are stuck on a saturated UDP socket and
+	// never observe quit. Calling Close in a detached goroutine lets the
+	// searcher's outer goroutine return so the workload can complete; the
+	// leaked shutdown goroutine is reaped by main()'s teardown watchdog.
+	closeIter := func() { go iter.Close() }
+	defer closeIter()
+
+	// Decouple iter.Next() from the main loop via a pump goroutine: iter.Close()
+	// does not reliably unblock a parked iter.Next() at scale, so reading via a
+	// channel lets us bail when the deadline fires even if iter.Next() is stuck.
+	nodeCh := make(chan *enode.Node, 1)
+	go func() {
+		defer close(nodeCh)
+		for iter.Next() {
+			select {
+			case nodeCh <- iter.Node():
+			case <-deadline:
+				return
+			}
+		}
+	}()
+
+	rng := rand.New(rand.NewSource(rngSeed)) // per-searcher, so pacing pauses don't align
+	start := time.Now()
+	var (
+		found       []enode.ID
+		timeFirst   time.Duration
+		registered  int
+		extra       int
+		seenReg     = make(map[enode.ID]struct{})
+		uniqueAtMs  []int64
+		hitDeadline bool
+		dl          deadLocal
+	)
+	selfID := n.ln.ID()
+loop:
+	for {
+		var nd *enode.Node
+		var ok bool
+		select {
+		case <-deadline:
+			hitDeadline = true
+			closeIter()
+			break loop
+		case nd, ok = <-nodeCh:
+			if !ok {
+				break loop
+			}
+		}
+		if timeFirst == 0 {
+			timeFirst = time.Since(start)
+		}
+		id := nd.ID()
+		if id == selfID {
+			continue
+		}
+		found = append(found, id)
+		if has(id, topicIdx) {
+			if _, dup := seenReg[id]; !dup {
+				seenReg[id] = struct{}{}
+				uniqueAtMs = append(uniqueAtMs, time.Since(start).Milliseconds())
+				stats.recordUniqueFind(topicIdx, id)
+				// Record whether this registrant was already dead when first
+				// returned to this searcher, and how stale it was.
+				if deadTracker != nil {
+					dl.record(deadTracker, id, time.Now())
+				}
+			}
+			registered++
+		} else {
+			extra++
+		}
+		if pacing.TargetCount > 0 && len(seenReg) >= pacing.TargetCount {
+			closeIter()
+			break loop
+		}
+		if pacing.MaxPause > 0 {
+			select {
+			case <-deadline:
+				hitDeadline = true
+				closeIter()
+				break loop
+			case <-time.After(time.Duration(rng.Int63n(int64(pacing.MaxPause)))):
+			}
+		}
+	}
+	elapsed := time.Since(start)
+	ids := make([]string, 0, len(found))
+	for _, id := range found {
+		ids = append(ids, id.TerminalString())
+	}
+	foundRegIDs := make([]string, 0, len(seenReg))
+	for rid := range seenReg {
+		foundRegIDs = append(foundRegIDs, rid.TerminalString())
+	}
+	if deadTracker != nil {
+		deadTracker.merge(dl.total, dl.dead, dl.ages)
+	}
+	return searchResult{
+		NodeIdx:            n.idx,
+		NodeID:             n.ln.ID().TerminalString(),
+		Topic:              topicIdx,
+		Target:             target,
+		Found:              len(found),
+		FoundRegistrant:    registered,
+		UniqueRegistrant:   len(seenReg),
+		FoundExtra:         extra,
+		TimeToFirst:        timeFirst,
+		TimeToCompletion:   elapsed,
+		FoundIDs:           ids,
+		FoundRegistrantIDs: foundRegIDs,
+		UniqueFoundAtMs:    uniqueAtMs,
+		HitTimeoutBefore:   hitDeadline,
+	}
+}
+
+// searchManager runs searchers that can be launched dynamically while the
+// search phase is in progress, so that nodes joining mid-run under steady-state
+// churn participate as searchers too. All searchers share one absolute deadline
+// and write their results into a mutex-guarded slice as they finish.
+type searchManager struct {
+	deadline    time.Time
+	pacing      searchPacing
+	topics      []topicindex.TopicID
+	mem         *topicMembership
+	stats       *liveStats
+	deadTracker *deadResultTracker
+
+	wg      sync.WaitGroup
+	mu      sync.Mutex
+	results []searchResult
+	seqCtr  int64 // distinct rng seeds across dynamically-launched searchers
+}
+
+// launch starts a searcher for n on its assigned topic. Legacy nodes (topicIdx
+// < 0) are ignored. Safe to call concurrently and at any time before wait().
+func (sm *searchManager) launch(n nodeRec, topicIdx int) {
+	if topicIdx < 0 {
+		return
+	}
+	sm.wg.Add(1)
+	sm.mu.Lock()
+	seed := sm.seqCtr * 2654435761
+	sm.seqCtr++
+	sm.mu.Unlock()
+	go func() {
+		defer sm.wg.Done()
+		target := sm.mem.countTopic(topicIdx) - 1
+		if target < 0 {
+			target = 0
+		}
+		r := runOneSearcher(n, topicIdx, sm.topics[topicIdx], sm.deadline,
+			sm.pacing, sm.mem.has, target, seed, sm.stats, sm.deadTracker)
+		sm.mu.Lock()
+		sm.results = append(sm.results, r)
+		sm.mu.Unlock()
+	}()
+}
+
+// wait blocks until all launched searchers finish or until hardLimit elapses,
+// whichever comes first, then returns the results collected so far. The
+// hard limit guards against the discv5 search-shutdown path wedging a searcher
+// goroutine (observed when a node is killed mid-search): the run still produces
+// its report from partial results instead of hanging indefinitely.
+func (sm *searchManager) wait(hardLimit time.Duration) []searchResult {
+	done := make(chan struct{})
+	go func() { sm.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(hardLimit):
+		fmt.Printf("search wait exceeded %s past deadline; reporting partial results\n", hardLimit)
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return append([]searchResult(nil), sm.results...)
 }
 
 // liveStats accumulates per-topic, per-registrant find counts while searches
@@ -345,6 +412,14 @@ func newLiveStats(numTopics int, registrantsByTopic map[int]map[enode.ID]struct{
 		ls.assigned[i] = len(registrantsByTopic[i])
 	}
 	return ls
+}
+
+// addAssigned increments the assigned-registrant denominator for a topic, used
+// when a node joins mid-run under steady-state churn and registers.
+func (ls *liveStats) addAssigned(topicIdx int) {
+	ls.mus[topicIdx].Lock()
+	ls.assigned[topicIdx]++
+	ls.mus[topicIdx].Unlock()
 }
 
 func (ls *liveStats) recordUniqueFind(topicIdx int, regID enode.ID) {

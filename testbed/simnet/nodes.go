@@ -46,17 +46,8 @@ type nodeRec struct {
 	key    *ecdsa.PrivateKey
 	ln     *enode.LocalNode
 	disc   *discover.UDPv5
-	legacy bool // true if the topic-discovery (ng) ENR flag was stripped — used by the validation workload
+	legacy bool // true if the DiscNG ENR flag was stripped — used by the validation workload
 }
-
-// ngFlag mirrors the "ng" (topic-discovery) ENR capability entry. We define it
-// locally rather than importing the go-ethereum type so the testbed builds
-// against both topdisc (topicindex.TopicDiscovery) and enr-discng-flag
-// (topicindex.DiscNG) unchanged — LocalNode.Delete removes the entry by its
-// ENRKey, so the concrete type doesn't matter.
-type ngFlag uint
-
-func (ngFlag) ENRKey() string { return "ng" }
 
 // pickLegacySet deterministically chooses which node indices will have the
 // DISC-NG ENR flag stripped, simulating legacy Discv5 peers in a mixed
@@ -87,68 +78,98 @@ func spawnNodes(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, count 
 		if i > 0 && spawnDelay > 0 {
 			time.Sleep(spawnDelay)
 		}
-		key, err := crypto.GenerateKey()
-		if err != nil {
-			fatalf("generate key %d: %v", i, err)
-		}
-
-		// Use 4-byte IP form so endpoint addresses match what the discv5 ->
-		// adapter -> WriteTo path produces; 16-byte forms surface as router
-		// "unknown destination" drops.
-		//
-		// Use a non-LAN public-style range (33.x.x.x). RFC1918 ranges like
-		// 10.0.0.0/8 are treated as LAN by go-ethereum's netutil.IsLAN,
-		// which silently disables the IP-bucket cap (regBucketSubnet=24)
-		// and the IP-similarity score in §6 eq. 1. Spreading nodes across
-		// distinct /24s (byte 33.N1.N2.1 with N1*256+N2 = node index) makes
-		// the cap actually fire, exercising the full DISC-NG IP-defence
-		// pathway.
-		addr := &net.UDPAddr{
-			IP:   net.IP{33, byte(i / 256), byte(i % 256), 1},
-			Port: 30303,
-		}
-		conn := &simUDPConn{SimConn: sim.NewEndpoint(addr, settings)}
-
-		db, err := enode.OpenDB("")
-		if err != nil {
-			fatalf("open enode db %d: %v", i, err)
-		}
-		ln := enode.NewLocalNode(db, key)
-		ln.SetStaticIP(addr.IP)
-		ln.SetFallbackUDP(addr.Port)
-
-		cfg := discover.Config{PrivateKey: key}
-		if refreshInterval > 0 {
-			cfg.RefreshInterval = refreshInterval
-		}
+		// Bootstrap set: the very first node, plus a random sample of the
+		// already-spawned predecessors, capped at maxBootnodes (see the
+		// defaultMaxBootnodes comment for the O(N^2) rationale).
+		var boot []*enode.Node
 		if len(all) > 0 {
-			cfg.Bootnodes = append(cfg.Bootnodes, all[0].ln.Node())
+			boot = append(boot, all[0].ln.Node())
 			pool := all[1:]
 			n := maxBootnodes - 1
 			if n > len(pool) {
 				n = len(pool)
 			}
 			for _, idx := range rand.Perm(len(pool))[:n] {
-				cfg.Bootnodes = append(cfg.Bootnodes, pool[idx].ln.Node())
+				boot = append(boot, pool[idx].ln.Node())
 			}
 		}
-
-		disc, err := discover.ListenV5(conn, ln, cfg)
-		if err != nil {
-			fatalf("listen v5 on node %d: %v", i, err)
-		}
-
-		// Strip the DISC-NG capability flag from the LocalNode's record
-		// before sim.Start() so this node looks like a stock-Discv5 peer
-		// on the wire. ListenV5 sets the flag inside newUDPv5; we delete
-		// here, before any packet is sent, so peers only ever see the
-		// legacy version of this node's ENR.
-		legacy := legacySet[i]
-		if legacy {
-			ln.Delete(new(ngFlag))
-		}
-
-		all = append(all, nodeRec{idx: i, key: key, ln: ln, disc: disc, legacy: legacy})
+		all = append(all, spawnNode(sim, settings, i, legacySet[i], boot, refreshInterval))
 	}
 	return all
+}
+
+// spawnNode creates and starts a single discv5 node. It is used both for the
+// initial population (via spawnNodes) and for nodes that join mid-run under
+// steady-state churn. The caller supplies the bootstrap set (nil for the very
+// first node) and the node index, which determines the endpoint IP.
+func spawnNode(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, idx int, legacy bool, bootnodes []*enode.Node, refreshInterval time.Duration) nodeRec {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		fatalf("generate key %d: %v", idx, err)
+	}
+
+	// Use 4-byte IP form so endpoint addresses match what the discv5 ->
+	// adapter -> WriteTo path produces; 16-byte forms surface as router
+	// "unknown destination" drops.
+	//
+	// Use a non-LAN public-style range (33.x.x.x). RFC1918 ranges like
+	// 10.0.0.0/8 are treated as LAN by go-ethereum's netutil.IsLAN,
+	// which silently disables the IP-bucket cap (regBucketSubnet=24)
+	// and the IP-similarity score in §6 eq. 1. Spreading nodes across
+	// distinct /24s (byte 33.N1.N2.1 with N1*256+N2 = node index) makes
+	// the cap actually fire, exercising the full DISC-NG IP-defence
+	// pathway.
+	addr := &net.UDPAddr{
+		IP:   net.IP{33, byte(idx / 256), byte(idx % 256), 1},
+		Port: 30303,
+	}
+	conn := &simUDPConn{SimConn: sim.NewEndpoint(addr, settings)}
+
+	db, err := enode.OpenDB("")
+	if err != nil {
+		fatalf("open enode db %d: %v", idx, err)
+	}
+	ln := enode.NewLocalNode(db, key)
+	ln.SetStaticIP(addr.IP)
+	ln.SetFallbackUDP(addr.Port)
+
+	cfg := discover.Config{PrivateKey: key, Bootnodes: bootnodes}
+	if refreshInterval > 0 {
+		cfg.RefreshInterval = refreshInterval
+	}
+
+	disc, err := discover.ListenV5(conn, ln, cfg)
+	if err != nil {
+		fatalf("listen v5 on node %d: %v", idx, err)
+	}
+
+	// Strip the DISC-NG capability flag from the LocalNode's record so this
+	// node looks like a stock-Discv5 peer on the wire. ListenV5 sets the
+	// flag inside newUDPv5; we delete here, before any packet is sent, so
+	// peers only ever see the legacy version of this node's ENR.
+	if legacy {
+		ln.Delete(new(topicindex.TopicDiscovery))
+	}
+
+	return nodeRec{idx: idx, key: key, ln: ln, disc: disc, legacy: legacy}
+}
+
+// sampleBootnodes returns up to max ENRs drawn at random from the given pool of
+// (alive) nodes, for use as a joiner's bootstrap set.
+func sampleBootnodes(pool []nodeRec, max int, rng *rand.Rand) []*enode.Node {
+	if max <= 0 {
+		max = defaultMaxBootnodes
+	}
+	if len(pool) == 0 {
+		return nil
+	}
+	n := max
+	if n > len(pool) {
+		n = len(pool)
+	}
+	boot := make([]*enode.Node, 0, n)
+	for _, idx := range rng.Perm(len(pool))[:n] {
+		boot = append(boot, pool[idx].ln.Node())
+	}
+	return boot
 }
