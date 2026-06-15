@@ -82,3 +82,21 @@ func (b *Blacklist) Contains(id enode.ID) bool {
 	}
 	return true
 }
+
+// Len returns the number of currently-banned (non-expired) nodes. Intended for
+// metrics/observability.
+func (b *Blacklist) Len() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.clock.Now()
+	n := 0
+	for _, exp := range b.banned {
+		if now < exp {
+			n++
+		}
+	}
+	return n
+}

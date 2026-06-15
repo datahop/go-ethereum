@@ -347,6 +347,12 @@ func (t *UDPv5) TopicSearch(topic topicindex.TopicID, opid uint64) enode.Iterato
 	return t.topicSys.newSearchIterator(topic, opid)
 }
 
+// BlacklistLen returns the number of currently-banned nodes in the topic
+// failure blacklist. Intended for testbed metrics/observability.
+func (t *UDPv5) BlacklistLen() int {
+	return t.topicSys.config.Blacklist.Len()
+}
+
 // AddKnownNode adds a node to the routing table.
 // The function should be used for testing only.
 func (t *UDPv5) AddKnownNode(n *enode.Node) bool {
