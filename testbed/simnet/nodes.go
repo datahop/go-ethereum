@@ -27,6 +27,12 @@ const defaultMaxBootnodes = 20
 // Identical across runs so behaviour is reproducible.
 var testTopic = topicindex.TopicID{0x55, 0x49, 0x43, 0x4e, 0x47, 0x54, 0x45, 0x53, 0x54}
 
+// adLifetime overrides the topic ad lifetime / registration TTL for every
+// TopDisc node when > 0 (set from the -ad-lifetime flag in main). 0 keeps the
+// discv5 default (15m). Read by spawnNode, so it applies to the initial
+// population and to churn joiners alike.
+var adLifetime time.Duration
+
 // makeTopic returns a deterministic 32-byte topic ID for index i, used when
 // -topics > 1.
 func makeTopic(i int) topicindex.TopicID {
@@ -136,6 +142,9 @@ func spawnNode(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, idx int
 	cfg := discover.Config{PrivateKey: key, Bootnodes: bootnodes}
 	if refreshInterval > 0 {
 		cfg.RefreshInterval = refreshInterval
+	}
+	if adLifetime > 0 {
+		cfg.Topic.AdLifetime = adLifetime
 	}
 
 	disc, err := discover.ListenV5(conn, ln, cfg)

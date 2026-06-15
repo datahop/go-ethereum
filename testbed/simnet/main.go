@@ -43,7 +43,11 @@ func main() {
 	churnFrac := flag.Float64("churn-frac", 0.1, "fraction of the active population churned each round (only used when -churn-interval > 0)")
 	churnMode := flag.String("churn-mode", "steadystate", "churn model when -churn-interval > 0: 'steadystate' (each action is 50/50 leave/join, keeping population ~constant) or 'killonly' (kill -churn-frac each round; population decays to zero)")
 	vanillaFrac := flag.Float64("vanilla-frac", 0, "if > 0, run the mixed-binary interop workload: this fraction of nodes run stock upstream geth v1.17.3 discv5 as routing substrate (real separate stack), the rest run TopDisc; measures whether TopDisc discovery interoperates with real upstream geth. TopDisc penetration = 1 - vanilla-frac")
+	adLifetimeFlag := flag.Duration("ad-lifetime", 0, "topic ad lifetime / registration TTL (0 = discv5 default of 15m). Lower values cycle registrations and renewals faster.")
 	flag.Parse()
+
+	// Applied to every TopDisc node built by spawnNode (initial + churn joiners).
+	adLifetime = *adLifetimeFlag
 
 	// Absolute watchdog: guarantee the process exits even if the workload or
 	// teardown wedges. The discv5 search-shutdown path can deadlock when a
