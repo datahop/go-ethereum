@@ -800,36 +800,30 @@ func (t *UDPv5) dispatch() {
 			}
 
 		case c := <-t.callDoneCh:
-			active := t.activeCallByNode[c.id]
-			if active != c {
-				// c is not the active call for c.id. The only legitimate
-				// cause is that c's caller cancelled (its quit channel
-				// fired) while c was still parked in callQueue, behind
-				// another active call to the same node ID. Such a call was
-				// never sent, so it has no timeout armed and is absent from
-				// the activeCall* maps; dropping it from the queue is all
-				// the cleanup it needs.
-				//
-				// If c is neither active nor queued, dispatch has been asked
-				// to finish a call it has no record of. That is a real
-				// bookkeeping bug, so keep failing loudly on it rather than
-				// silently ignoring it.
-				queue := t.callQueue[c.id]
-				i := slices.Index(queue, c)
-				if i < 0 {
-					panic("BUG: callDone for call that is neither active nor queued")
-				}
-				t.callQueue[c.id] = slices.Delete(queue, i, i+1)
+			// A call reported done must be in exactly one of two states: the
+			// active call for its node, or still parked in callQueue. dispatch
+			// makes a call active and removes it from the queue atomically, so
+			// both-at-once or neither is a bookkeeping bug.
+			isActive := t.activeCallByNode[c.id] == c
+			qi := slices.Index(t.callQueue[c.id], c)
+			inQueue := qi >= 0
+			if isActive == inQueue {
+				panic(fmt.Sprintf("BUG: callDone: call must be either active or queued (active=%v queued=%v)", isActive, inQueue))
+			}
+			if inQueue {
+				// Queued call cancelled before being sent: drop just this call.
+				t.callQueue[c.id] = slices.Delete(t.callQueue[c.id], qi, qi+1)
 				if len(t.callQueue[c.id]) == 0 {
 					delete(t.callQueue, c.id)
 				}
-				continue
+			} else {
+				// Active call finished: tear it down and start the next queued call.
+				c.timeout.Stop()
+				delete(t.activeCallByAuth, c.nonce)
+				delete(t.activeCallByNode, c.id)
+				t.emitCallOutcome(c)
+				t.sendNextCall(c.id)
 			}
-			c.timeout.Stop()
-			delete(t.activeCallByAuth, c.nonce)
-			delete(t.activeCallByNode, c.id)
-			t.emitCallOutcome(c)
-			t.sendNextCall(c.id)
 
 		case r := <-t.sendCh:
 			t.send(r.destID, r.destAddr, r.msg, nil)
