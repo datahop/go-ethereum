@@ -255,24 +255,10 @@ func (r *Registration) Update() *RegAttempt {
 		case Standby:
 			panic("standby attempt in Registration.heap")
 		case Registered:
-			// This branch is reached only for a successful registration
-			// (set via HandleRegistered) whose ad has now reached its
-			// TTL. Failed attempts never get here: they are deleted at
-			// the point of failure by HandleErrorResponse and by the
-			// wait-time-too-high drop in HandleTicketResponse. So only a
-			// genuinely-valid registration is kept on expiry.
-			//
-			// On expiry, demote back to Standby instead of deleting, so
-			// the candidate registrar — still in our routing table —
-			// remains a target for renewal. Permanently removing it would
-			// drain the bucket's candidate pool, capping fan-out at
-			// ceil(register-wait / AdLifetime) candidates per registrant.
-			//
-			// Demote only while there is room in the standby pool. If the
-			// pool is already full there are enough renewal candidates, so
-			// drop this one instead and keep count[Standby] within
-			// RegBucketStandbyLimit. Either way the freed Registered slot
-			// is backfilled from standby by refillAttempts.
+			// Ad expired: demote the registration back to Standby so its
+			// registrar stays a renewal candidate (deleting would drain the
+			// bucket's candidate pool and cap fan-out). If the standby pool is
+			// already full, drop instead. refillAttempts backfills the slot.
 			if att.bucket.count[Standby] >= r.cfg.RegBucketStandbyLimit {
 				r.removeAttempt(att, "expired")
 			} else {
