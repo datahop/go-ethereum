@@ -57,9 +57,12 @@ func main() {
 	// front. It must clear every healthy-run delay before search even starts —
 	// the per-node spawn and register staggers (spawnDelay×N, registerStagger×N
 	// are minutes at 10k), plus bootstrap-wait, register-wait and the full
-	// search-timeout — then an 8-minute grace for teardown.
+	// search-timeout — then a 20-minute grace for teardown. (Churn runs tear
+	// down a partially-stuck network and the search wg.Wait can overrun the
+	// nominal deadline; 8m was too tight — churn-repl22 hit the cap before
+	// writing metrics on the 2026-06-15 10k sweep.)
 	n := time.Duration(*nodes)
-	hardCap := n*(*spawnDelay) + *bootstrapWait + n*(*registerStagger) + *registerWait + *searchTimeout + 8*time.Minute
+	hardCap := n*(*spawnDelay) + *bootstrapWait + n*(*registerStagger) + *registerWait + *searchTimeout + 20*time.Minute
 	go func() {
 		time.Sleep(hardCap)
 		fmt.Printf("absolute watchdog (%s) expired; force-exiting\n", hardCap)
