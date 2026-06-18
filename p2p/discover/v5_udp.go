@@ -100,7 +100,7 @@ type UDPv5 struct {
 	topicSys     *topicSystem
 
 	// channels into dispatch
-	onDispatchCh chan func()
+	onDispatchCh  chan func()
 	packetInCh    chan ReadPacket
 	readNextCh    chan struct{}
 	callCh        chan *callV5
@@ -774,14 +774,28 @@ func (t *UDPv5) dispatch() {
 			}
 
 		case c := <-t.callDoneCh:
-			active := t.activeCallByNode[c.id]
-			if active != c {
-				panic("BUG: callDone for inactive call")
+			// A call reported done must be in exactly one of two states: the
+			// active call for its node, or still parked in callQueue.
+			// remove call or panic if not found.
+			isActive := t.activeCallByNode[c.id] == c
+			qi := slices.Index(t.callQueue[c.id], c)
+			inQueue := qi >= 0
+			if isActive == inQueue {
+				panic(fmt.Sprintf("BUG: callDone: call must be either active or queued (active=%v queued=%v)", isActive, inQueue))
 			}
-			c.timeout.Stop()
-			delete(t.activeCallByAuth, c.nonce)
-			delete(t.activeCallByNode, c.id)
-			t.sendNextCall(c.id)
+			if inQueue {
+				// Queued call cancelled before being sent: drop just this call.
+				t.callQueue[c.id] = slices.Delete(t.callQueue[c.id], qi, qi+1)
+				if len(t.callQueue[c.id]) == 0 {
+					delete(t.callQueue, c.id)
+				}
+			} else {
+				// Active call finished: tear it down and start the next queued call.
+				c.timeout.Stop()
+				delete(t.activeCallByAuth, c.nonce)
+				delete(t.activeCallByNode, c.id)
+				t.sendNextCall(c.id)
+			}
 
 		case r := <-t.sendCh:
 			t.send(r.destID, r.destAddr, r.msg, nil)
