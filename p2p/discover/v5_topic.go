@@ -36,13 +36,57 @@ type topicSystem struct {
 
 	mu  sync.Mutex
 	reg map[topicindex.TopicID]*topicReg
+
+	wg   sync.WaitGroup
+	quit chan struct{}
 }
 
 func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
-	return &topicSystem{
+	sys := &topicSystem{
 		transport: transport,
 		config:    config,
 		reg:       make(map[topicindex.TopicID]*topicReg),
+		quit:      make(chan struct{}),
+	}
+	sys.wg.Add(1)
+	go sys.evictRemovedNodes()
+	return sys
+}
+
+// evictRemovedNodes evicts nodes dropped by the DHT routing table (#21) from
+// the topic state that cannot find out on its own in reasonable time:
+//
+//   - the local ad cache, which has no liveness probe at all — advertisers are
+//     never the target of topic RPCs. (Its other cleanup signal is a topic RPC
+//     timeout observed by a registration or search loop, which evicts the
+//     failed node's ads directly.)
+//   - the registration tables, whose attempts can sit unprobed for a long time
+//     (Standby nodes are never contacted, Registered ones only at ad expiry).
+//
+// The search tables are left out: search state is short-lived and every node
+// in it is queried within seconds, so its own failure handling
+// (Search.HandleErrorResponse) is fast enough.
+func (sys *topicSystem) evictRemovedNodes() {
+	defer sys.wg.Done()
+	removed := make(chan enode.ID, 1024)
+	sub := sys.transport.tab.subscribeRemovedNodes(removed)
+	defer sub.Unsubscribe()
+	for {
+		select {
+		case <-sys.quit:
+			return
+		case id := <-removed:
+			sys.transport.evictTopicTableNode(id)
+			sys.mu.Lock()
+			regs := make([]*topicReg, 0, len(sys.reg))
+			for _, r := range sys.reg {
+				regs = append(regs, r)
+			}
+			sys.mu.Unlock()
+			for _, r := range regs {
+				r.evict(id)
+			}
+		}
 	}
 }
 
@@ -67,6 +111,9 @@ func (sys *topicSystem) stopRegister(topic topicindex.TopicID) {
 }
 
 func (sys *topicSystem) stop() {
+	close(sys.quit)
+	sys.wg.Wait()
+
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
@@ -97,9 +144,38 @@ type topicReg struct {
 	regRequest  chan topicRegJob
 	regResponse chan topicRegResult
 
+	// evictCh delivers node IDs dropped by the DHT, to be removed from the
+	// registration table.
+	evictCh chan enode.ID
+
+	// controlCh runs a function on the registration loop goroutine, which owns
+	// reg.state. Used for goroutine-safe introspection (testing).
+	controlCh chan func()
+
 	// nodes subscription
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
+}
+
+// evict requests removal of a node from the registration table. It is called
+// from the topic system's DHT-removal goroutine (evictRemovedNodes).
+func (reg *topicReg) evict(id enode.ID) {
+	select {
+	case reg.evictCh <- id:
+	case <-reg.quit:
+	}
+}
+
+// nodeCount returns the number of nodes in the registration table. It runs on
+// the registration loop goroutine to avoid racing with state mutation.
+func (reg *topicReg) nodeCount() int {
+	res := make(chan int, 1)
+	select {
+	case reg.controlCh <- func() { res <- reg.state.NodeCount() }:
+		return <-res
+	case <-reg.quit:
+		return 0
+	}
 }
 
 func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topicReg {
@@ -110,6 +186,8 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 		quit:        make(chan struct{}),
 		regRequest:  make(chan topicRegJob),
 		regResponse: make(chan topicRegResult),
+		evictCh:     make(chan enode.ID, 64),
+		controlCh:   make(chan func()),
 	}
 
 	// Set up the subscription for new main table nodes.
@@ -177,6 +255,10 @@ func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
 				return false
 			case <-reg.newNodesCh:
 				// Drain the channel to avoid blocking the Table's feed sender.
+			case id := <-reg.evictCh:
+				reg.state.RemoveNode(id)
+			case fn := <-reg.controlCh:
+				fn()
 			case <-reg.quit:
 				return true
 			}
@@ -215,6 +297,18 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 				reg.state.AddNodes(nil, []*enode.Node{n})
 			}
 
+		case id := <-reg.evictCh:
+			reg.state.RemoveNode(id)
+			// If the evicted node was the attempt selected for the next
+			// request, cancel the pending send: its attempt has been removed,
+			// so StartRequest would operate on a stale (removed) attempt.
+			if sendAttemptCh != nil && nextAttempt.node.ID() == id {
+				sendAttemptCh = nil
+			}
+
+		case fn := <-reg.controlCh:
+			fn()
+
 		case <-updateCh:
 			attempt := reg.state.Update()
 			if attempt != nil {
@@ -237,6 +331,12 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			}
 			if resp.err != nil {
 				reg.state.HandleErrorResponse(resp.att, resp.err)
+				// A timed-out registrar is dead: drop any ads it has stored
+				// with us too. Only timeouts are a liveness signal — errClosed
+				// means we cancelled the call ourselves.
+				if resp.err == errTimeout {
+					sys.transport.evictTopicTableNode(resp.att.Node.ID())
+				}
 				continue
 			}
 			wt := time.Duration(resp.msg.WaitTime) * time.Millisecond
@@ -350,7 +450,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		shuffleNodes(nodes)
 		state.AddNodes(nil, nodes)
 
-		if exit := s.run(state); exit {
+		if exit := s.run(sys, state); exit {
 			return
 		}
 	}
@@ -382,7 +482,7 @@ type topicQueryJob struct {
 	buckets []uint
 }
 
-func (s *topicSearch) run(state *topicindex.Search) (exit bool) {
+func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool) {
 	var (
 		queryCh   chan<- topicQueryJob
 		nextQuery topicQueryJob
@@ -415,10 +515,21 @@ func (s *topicSearch) run(state *topicindex.Search) (exit bool) {
 
 		case queryCh <- nextQuery:
 		case resp := <-s.queryRespCh:
-			state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
-			state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
-			if resp.err != nil {
-				s.config.Log.Debug("TOPICQUERY/v5 failed", "topic", s.topic, "id", resp.src.ID(), "err", resp.err)
+			if resp.err != nil && len(resp.topicNodes)+len(resp.auxNodes) == 0 {
+				// The queried node did not respond at all: drop it from the
+				// search table. A response that delivered some nodes before
+				// erroring (e.g. a multi-packet response that timed out
+				// halfway) still counts as a response below.
+				state.HandleErrorResponse(resp.src, resp.err)
+				// A timed-out node is dead: drop any ads it has stored with
+				// us too. Only timeouts are a liveness signal — errClosed
+				// means we cancelled the call ourselves.
+				if resp.err == errTimeout {
+					sys.transport.evictTopicTableNode(resp.src.ID())
+				}
+			} else {
+				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
+				state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
 			}
 			queryCh = nil
 

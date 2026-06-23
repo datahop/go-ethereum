@@ -155,6 +155,31 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
+// HandleErrorResponse should be called when a topic query to a node fails.
+// The node is dropped from the table, freeing its bucket slot and IP-limit
+// entry for replacements. Unlike AddQueryResults, the failure does not count
+// as a response: the bucket is not warmed, so QueryTarget keeps preferring the
+// bucket's remaining candidates. A bucket whose nodes all fail becomes empty
+// and no longer blocks the walk, and a search whose nodes all fail becomes
+// IsDone and rolls over.
+func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
+	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
+	s.removeNode(from.ID())
+}
+
+// removeNode drops a node from the search table. The node is removed from both
+// the unasked ('new') and asked sets of its bucket.
+func (s *Search) removeNode(id enode.ID) {
+	b := s.bucket(id)
+	if n, ok := b.new[id]; ok {
+		if ip := n.IP(); ip != nil && !netutil.IsLAN(ip) {
+			b.ips.Remove(ip)
+		}
+		delete(b.new, id)
+	}
+	delete(b.asked, id)
+}
+
 // QueryTarget returns a random node to which a topic query should be sent.
 // Random nodes are collected from buckets progressively: only buckets with unasked nodes
 // that have received at least one response, plus the next unqueried bucket
