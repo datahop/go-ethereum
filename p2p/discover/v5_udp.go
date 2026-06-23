@@ -992,6 +992,15 @@ func (t *UDPv5) handleCallResponse(fromID enode.ID, fromAddr netip.AddrPort, p v
 	return true
 }
 
+// evictTopicTableNode removes all ads advertised by id from the local topic
+// table. It runs the removal on the dispatch goroutine, which owns the table.
+func (t *UDPv5) evictTopicTableNode(id enode.ID) {
+	select {
+	case t.onDispatchCh <- func() { t.topicTable.RemoveNode(id) }:
+	case <-t.closeCtx.Done():
+	}
+}
+
 // GetNode looks for a node record in table and database.
 func (t *UDPv5) GetNode(id enode.ID) *enode.Node {
 	if n := t.tab.getNode(id); n != nil {

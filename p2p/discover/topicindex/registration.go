@@ -214,6 +214,26 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
+// RemoveNode drops any registration attempt for the given node from the table.
+// It is used to evict nodes that the DHT has found dead: unlike search nodes,
+// registration attempts can sit unprobed for a long time (Standby nodes are
+// never contacted, Registered ones only at ad expiry), so waiting for our own
+// RPC failure would leave a dead node squatting in its bucket. An attempt with
+// an in-flight request (index == -2) is left in place: removing it would desync
+// the pending response handling, and the response (or its timeout) removes it.
+func (r *Registration) RemoveNode(id enode.ID) {
+	b := &r.buckets[r.bucketIndex(id)]
+	att, ok := b.att[id]
+	if !ok {
+		return
+	}
+	if att.index == -2 {
+		return
+	}
+	r.removeAttempt(att, "dht-eviction")
+	r.refillAttempts(b)
+}
+
 func (r *Registration) setAttemptState(att *RegAttempt, state RegAttemptState) {
 	att.bucket.count[att.State]--
 	att.bucket.count[state]++
