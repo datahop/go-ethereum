@@ -87,18 +87,123 @@ func rbContainsAll(b regBucket, nodes []*enode.Node) bool {
 	return true
 }
 
-// This checks that the one-per-bucket rule is applied in AddNodes.
+// This checks that the one-per-source-per-bucket rule is applied within a single
+// AddNodes call. The source must be a registrar in the table (the rule is
+// tracked on its attempt), which mirrors production.
 func TestRegistrationOnePerBucketCheck(t *testing.T) {
 	cfg := testConfig(t)
 	r := NewRegistration(topic1, cfg)
 	src := nodeAtDistance(enode.ID(topic1), 255, intIP(1))
+	r.AddNodes(nil, []*enode.Node{src})
 
-	// Attempt to insert multiple nodes in the same bucket.
+	// Attempt to insert multiple nodes from src into the same bucket.
 	// Only one of them should actually be added.
+	bi := r.bucketIndex(nodeAtDistance(enode.ID(topic1), 200, intIP(1)).ID())
 	nodes := nodesAtDistance(enode.ID(topic1), 200, 10)
 	r.AddNodes(src, nodes)
-	if r.NodeCount() > 1 {
-		t.Fatal("too many nodes added")
+	got := 0
+	for _, c := range r.buckets[bi].count {
+		got += c
+	}
+	if got != 1 {
+		t.Fatalf("expected 1 node in target bucket under one-per-source-per-bucket, got %d", got)
+	}
+}
+
+// TestRegistrationSourcePersistentCap verifies that a single source cannot
+// contribute more than one node to a given bucket across multiple AddNodes
+// calls. The per-source accounting lives on the source registrar's own attempt,
+// so the sources must themselves be registrars in the table — which mirrors
+// production, where the source of nodes is always a registrar we queried. Once
+// src has contributed an entry to a bucket, subsequent calls from src to that
+// bucket are rejected, while different sources and bootstrap (src == nil) calls
+// remain admissible.
+func TestRegistrationSourcePersistentCap(t *testing.T) {
+	cfg := testConfig(t)
+	r := NewRegistration(topic1, cfg)
+
+	// The sources must be registrars in the table for the cap to be tracked on
+	// their attempts. They land in their own (distinct) buckets.
+	src1 := nodeAtDistance(enode.ID(topic1), 255, intIP(1))
+	src2 := nodeAtDistance(enode.ID(topic1), 254, intIP(2))
+	r.AddNodes(nil, []*enode.Node{src1, src2})
+
+	// All contributed nodes share one bucket (distance 200); count entries in
+	// just that bucket so the source registrars above don't skew the totals.
+	bi := r.bucketIndex(nodeAtDistance(enode.ID(topic1), 200, intIP(3)).ID())
+	bucketCount := func() int {
+		n := 0
+		for _, c := range r.buckets[bi].count {
+			n += c
+		}
+		return n
+	}
+
+	// First call from src1 admits one node into the bucket.
+	node1 := nodeAtDistance(enode.ID(topic1), 200, intIP(3))
+	r.AddNodes(src1, []*enode.Node{node1})
+	if bucketCount() != 1 {
+		t.Fatalf("after 1st call: expected 1 node, got %d", bucketCount())
+	}
+
+	// Second call from the same src1 to the same bucket is rejected.
+	node2 := nodeAtDistance(enode.ID(topic1), 200, intIP(4))
+	r.AddNodes(src1, []*enode.Node{node2})
+	if bucketCount() != 1 {
+		t.Fatalf("after 2nd call from src1 (cross-RPC cap): expected 1 node, got %d", bucketCount())
+	}
+
+	// A different src2 is allowed to contribute to the same bucket.
+	node3 := nodeAtDistance(enode.ID(topic1), 200, intIP(5))
+	r.AddNodes(src2, []*enode.Node{node3})
+	if bucketCount() != 2 {
+		t.Fatalf("after 3rd call from src2: expected 2 nodes, got %d", bucketCount())
+	}
+
+	// Bootstrap path (src == nil) is not subject to the cap.
+	node4 := nodeAtDistance(enode.ID(topic1), 200, intIP(6))
+	r.AddNodes(nil, []*enode.Node{node4})
+	if bucketCount() != 3 {
+		t.Fatalf("after bootstrap (src=nil): expected 3 nodes, got %d", bucketCount())
+	}
+}
+
+// TestRegistrationSourceCapFreedOnEviction verifies that the per-source bucket
+// accounting is released when the source registrar is removed, so a re-added
+// registrar gets a fresh budget (the property the per-attempt design buys over
+// a never-cleared per-bucket map).
+func TestRegistrationSourceCapFreedOnEviction(t *testing.T) {
+	cfg := testConfig(t)
+	r := NewRegistration(topic1, cfg)
+
+	src := nodeAtDistance(enode.ID(topic1), 255, intIP(1))
+	r.AddNodes(nil, []*enode.Node{src})
+
+	bi := r.bucketIndex(nodeAtDistance(enode.ID(topic1), 200, intIP(3)).ID())
+	bucketCount := func() int {
+		n := 0
+		for _, c := range r.buckets[bi].count {
+			n += c
+		}
+		return n
+	}
+
+	// src fills the bucket once; a second entry is capped.
+	r.AddNodes(src, []*enode.Node{nodeAtDistance(enode.ID(topic1), 200, intIP(3))})
+	r.AddNodes(src, []*enode.Node{nodeAtDistance(enode.ID(topic1), 200, intIP(4))})
+	if bucketCount() != 1 {
+		t.Fatalf("expected cap to hold: want 1, got %d", bucketCount())
+	}
+
+	// Evict the source registrar. Its filledBuckets set goes with it.
+	srcBucket := &r.buckets[r.bucketIndex(src.ID())]
+	r.removeAttempt(srcBucket.att[src.ID()], "test")
+
+	// Re-add the source and let it contribute again — the cap budget is fresh.
+	r.AddNodes(nil, []*enode.Node{src})
+	r.AddNodes(src, []*enode.Node{nodeAtDistance(enode.ID(topic1), 200, intIP(7))})
+	if bucketCount() != 2 {
+		t.Fatalf("expected fresh budget after re-add: want 2, got %d", bucketCount())
 	}
 }
 
