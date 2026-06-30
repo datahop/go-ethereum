@@ -154,6 +154,10 @@ func (tab *TopicTable) Expire() {
 		tab.wt.removeReg(reg)
 		e = next
 	}
+	// Drop lower-bound tuples that have fully decayed. They only matter while a
+	// registrant is actively waiting, so this keeps the maps from growing
+	// unboundedly with churn.
+	tab.wt.expireBounds(now)
 }
 
 // isRegistered reports whether n is currently registered for topic t.
@@ -236,7 +240,15 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	ipMod := tab.wt.ipModifier(n)
 
 	neededTime := baseTime * math.Max(topicMod+ipMod, 0.000001)
-	return time.Duration(math.Ceil(neededTime * float64(time.Second)))
+	computed := time.Duration(math.Ceil(neededTime * float64(time.Second)))
+
+	// Enforce the paper's §6 anti-gaming lower bound: a wait time quoted at t2
+	// must not be smaller than the wait quoted at t1 by more than the elapsed
+	// time, i.e. w(t2) >= w(t1) - (t2 - t1). This stops an incumbent from
+	// resetting its accumulated wait to ~0 by re-requesting through a brief
+	// occupancy dip, which is what lets it permanently hold the registrars
+	// closest to a topic.
+	return tab.wt.lowerBound(n, t, computed, tab.config.Clock.Now())
 }
 
 // Register adds node n for topic t if it has waited long enough.
@@ -277,12 +289,119 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 type waitTimeState struct {
 	ipv4 *ipTree
 	ipv6 *ipTree
+
+	// Lower-bound anti-gaming state (paper §6 / spec §2.1.5). Each map holds, per
+	// active registrant key, the last wait time quoted and the clock time it was
+	// quoted at. idBounds is keyed by (topic, advertiser id); ipBounds by (topic,
+	// IP) so that an attacker cannot evade the bound by rotating advertiser IDs
+	// from the same address.
+	idBounds map[idBoundKey]waitBound
+	ipBounds map[ipBoundKey]waitBound
+}
+
+// idBoundKey keys the per-(topic, advertiser id) lower bound.
+type idBoundKey struct {
+	topic TopicID
+	id    enode.ID
+}
+
+// ipBoundKey keys the per-(topic, IP) lower bound. The IP is stored in its
+// canonical string form so v4 and v6 addresses share one map.
+type ipBoundKey struct {
+	topic TopicID
+	ip    string
+}
+
+// waitBound is a (value, timestamp) lower-bound tuple.
+type waitBound struct {
+	value time.Duration
+	time  mclock.AbsTime
+}
+
+// floor returns the lower bound on the wait time at 'now', decayed by the real
+// time elapsed since the bound was recorded: bound - (now - timestamp).
+func (b waitBound) floor(now mclock.AbsTime) time.Duration {
+	return b.value - time.Duration(now.Sub(b.time))
+}
+
+// expired reports whether the bound has fully decayed and can be dropped.
+func (b waitBound) expired(now mclock.AbsTime) bool {
+	return b.floor(now) <= 0
 }
 
 func newWaitTimeState() waitTimeState {
 	return waitTimeState{
-		ipv4: newIPTree(32),
-		ipv6: newIPTree(128),
+		ipv4:     newIPTree(32),
+		ipv6:     newIPTree(128),
+		idBounds: make(map[idBoundKey]waitBound),
+		ipBounds: make(map[ipBoundKey]waitBound),
+	}
+}
+
+// lowerBound enforces the paper's §6 retry-protection invariant on a freshly
+// computed wait time. It raises 'computed' to the highest still-active lower
+// bound recorded for n's (topic, id) and (topic, IP) keys, then records the
+// result as the new bound at 'now' so a later re-quote cannot drop faster than
+// real elapsed time.
+func (wt *waitTimeState) lowerBound(n *enode.Node, t TopicID, computed time.Duration, now mclock.AbsTime) time.Duration {
+	result := computed
+
+	idKey := idBoundKey{topic: t, id: n.ID()}
+	if b, ok := wt.idBounds[idKey]; ok {
+		if f := b.floor(now); f > result {
+			result = f
+		}
+	}
+
+	ipKeys := wt.ipBoundKeys(t, n)
+	for _, k := range ipKeys {
+		if b, ok := wt.ipBounds[k]; ok {
+			if f := b.floor(now); f > result {
+				result = f
+			}
+		}
+	}
+
+	// Record the (possibly raised) result as the new bound.
+	nb := waitBound{value: result, time: now}
+	wt.idBounds[idKey] = nb
+	for _, k := range ipKeys {
+		wt.ipBounds[k] = nb
+	}
+	return result
+}
+
+// ipBoundKeys returns the per-IP lower-bound keys for node n under topic t. A
+// dual-stack node contributes both its v4 and v6 key. LAN addresses are skipped,
+// matching ipModifier. The longest-prefix aggregation hinted at by the spec is
+// approximated here by the full address; an explicit IPv6 prefix policy is
+// tracked separately (see compliance doc §3.2 / Issue #54).
+func (wt *waitTimeState) ipBoundKeys(t TopicID, n *enode.Node) []ipBoundKey {
+	var (
+		ip4  enr.IPv4
+		ip6  enr.IPv6
+		keys []ipBoundKey
+	)
+	if n.Load(&ip4) == nil && !netutil.IsLAN(net.IP(ip4)) {
+		keys = append(keys, ipBoundKey{topic: t, ip: net.IP(ip4).String()})
+	}
+	if n.Load(&ip6) == nil && !netutil.IsLAN(net.IP(ip6)) {
+		keys = append(keys, ipBoundKey{topic: t, ip: net.IP(ip6).String()})
+	}
+	return keys
+}
+
+// expireBounds drops lower-bound tuples that have fully decayed at 'now'.
+func (wt *waitTimeState) expireBounds(now mclock.AbsTime) {
+	for k, b := range wt.idBounds {
+		if b.expired(now) {
+			delete(wt.idBounds, k)
+		}
+	}
+	for k, b := range wt.ipBounds {
+		if b.expired(now) {
+			delete(wt.ipBounds, k)
+		}
 	}
 }
 
