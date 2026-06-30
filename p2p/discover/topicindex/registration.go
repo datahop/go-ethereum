@@ -95,12 +95,10 @@ type RegAttempt struct {
 	// reqCount tracks the number of registration requests sent.
 	reqCount int
 
-	// filledBuckets records the bucket indexes that this registrar, acting as a
-	// source of nodes, has already contributed an entry to. It enforces the
-	// 'one-per-source-per-bucket' rule across multiple responses. Because it
-	// lives on the attempt, it is freed when the registrar is evicted — so the
-	// per-source accounting is tied to the registrar's lifetime rather than
-	// accumulating forever in the buckets.
+	// filledBuckets records the bucket indexes that this registrar has already contributed
+	// an entry to. It enforces the 'one-per-source-per-bucket' rule across
+	// multiple responses. Because it lives on the attempt, it is freed when the
+	// registrar is evicted.
 	filledBuckets map[int]struct{}
 
 	index  int // index in regHeap
@@ -157,10 +155,7 @@ func (r *Registration) BucketsWithFreeSpace(dists []uint) []uint {
 // 'src' is the registrar that returned these nodes, or nil when they come from
 // our own routing table (bootstrap / the node feed).
 func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
-	// When the nodes come from a remote registrar, find that registrar's own
-	// attempt. The 'one-per-source-per-bucket' rule is tracked on it (in
-	// filledBuckets), so the accounting is freed when the registrar is evicted
-	// instead of accumulating forever.
+	// When the nodes come from a remote registrar, find that registrar's attempt.
 	var srcAtt *RegAttempt
 	if src != nil {
 		srcAtt = r.buckets[r.bucketIndex(src.ID())].att[src.ID()]
