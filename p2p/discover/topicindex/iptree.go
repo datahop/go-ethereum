@@ -52,9 +52,8 @@ func (it *ipTree) insert(ip net.IP) float64 {
 	it.root.counter++
 	effectiveDepth := byte(0)
 	for depth := byte(0); depth < it.bits; depth++ {
-		// Stop once the expected bucket occupancy drops below 1: beyond
-		// this point the tree has no statistical power to flag a bucket
-		// as overloaded, so further depth shouldn't dilute the score.
+		//beyond this point the tree has no statistical power to 
+		// flag a bucket as overloaded
 		balanced := rootCounter / math.Pow(2, float64(depth+1))
 		if balanced < 1 {
 			break
@@ -91,20 +90,11 @@ func (it *ipTree) score(ip net.IP) float64 {
 		if balanced < 1 {
 			break
 		}
-		// effectiveDepth is driven solely by `balanced`, exactly like
-		// insert(). It must NOT be gated on node existence: insert()
-		// creates missing nodes and keeps walking as long as balanced
-		// stays >= 1, so score() must count those same depths as
-		// effective even though it can't find an overloaded counter
-		// there (an unvisited branch has counter 0, never > balanced
-		// anyway, so `sum` is unaffected — only the depth bookkeeping
-		// needs to match).
+		
 		effectiveDepth++
-
+		// mimic the behaviour of insert() that creates new nodes when
+		// adding an address and keeps increasing effectiveDepth.
 		if hitNil {
-			// Already past the unexplored frontier: there is no data
-			// to inspect, but we still must advance effectiveDepth to
-			// mirror insert(). Skip node traversal, sum can't grow.
 			continue
 		}
 
@@ -114,9 +104,8 @@ func (it *ipTree) score(ip net.IP) float64 {
 			node = &(*node).right
 		}
 		if *node == nil {
-			// Frontier of explored tree. insert() would create a node
-			// here and continue; we have no node to inspect, so just
-			// remember this and keep advancing effectiveDepth above.
+			// insert() would create a node here and continue, so we do
+			// the same to make the score match.
 			hitNil = true
 			continue
 		}
@@ -160,11 +149,6 @@ func (it *ipTree) count() int {
 	return it.root.counter
 }
 
-// computeScore normalizes sum by the number of tree levels that were
-// actually evaluated (effectiveDepth), rather than the tree's fixed bit
-// width. This keeps IPv4 (32-bit) and IPv6 (128-bit) scores on a
-// comparable scale for the same population size and avoids diluting the
-// score with unpopulated, statistically meaningless depth.
 func (it *ipTree) computeScore(sum int, effectiveDepth byte) float64 {
 	c := it.count()
 	if c == 0 {
