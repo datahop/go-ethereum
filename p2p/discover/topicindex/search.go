@@ -85,7 +85,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 	return s
 }
 
-// IsDone reports whether the search table is saturated. When it returns true,
+// IsDone reports when the search table peers are all consumed. When it returns true,
 // this search state should be abandoned and a new search started using a
 // fresh Search instance.
 func (s *Search) IsDone() bool {
@@ -100,10 +100,7 @@ func (s *Search) IsDone() bool {
 		}
 	}
 	// No unasked nodes remain and no results are buffered: the search is
-	// saturated. There is no deeper "stalled but not yet done" state to wait
-	// for, because once every bucket's `new` set is empty, QueryTarget
-	// returns nil and no further queries (and thus no further AddNodes calls
-	// that could change this state) can occur.
+	// done. There is no more nodes to query.
 	return true
 }
 
@@ -159,10 +156,9 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 }
 
 // QueryTarget returns a random node to which a topic query should be sent.
-// The walk is gated by a warm-up frontier: only buckets with unasked nodes
-// that have received at least one response (plus the next unqueried bucket
-// with candidates) join the random pool. Empty buckets are invisible to
-// the frontier, so they do not block progress to closer buckets.
+// Random nodes are collected from buckets progressively: only buckets with unasked nodes
+// that have received at least one response, plus the next unqueried bucket
+// with candidates, join the random pool.
 func (s *Search) QueryTarget() *enode.Node {
 	// Collect buckets with new nodes.
 	withnew := make([]*searchBucket, 0, searchTableDepth)
@@ -170,9 +166,6 @@ func (s *Search) QueryTarget() *enode.Node {
 		if len(s.buckets[i].new) > 0 {
 			withnew = append(withnew, &s.buckets[i])
 			// Stop here if no request was ever sent in this bucket.
-			// This is to avoid spamming nodes close to the topic.
-			// (Empty unqueried buckets fall through: they have no
-			// candidate to warm up with, so the walk continues.)
 			if s.buckets[i].numRequests == 0 {
 				break
 			}
