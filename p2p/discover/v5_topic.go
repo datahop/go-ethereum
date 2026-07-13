@@ -577,10 +577,13 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				// erroring (e.g. a multi-packet response that timed out
 				// halfway) still counts as a response.
 				state.HandleErrorResponse(resp.src, resp.err)
-				// A timed-out node is dead: drop any ads it has stored with
-				// us too. Only timeouts are a liveness signal.
+				// A timed-out node is dead globally, not just for this search:
+				// evict it from the ad cache and from every registration table
+				// too, the same as a DHT removal. Registration attempts can sit
+				// unprobed for a long time, so this query failure may be the
+				// first liveness signal they get. Only timeouts count.
 				if resp.err == errTimeout {
-					sys.transport.evictTopicTableNode(resp.src.ID())
+					sys.evictNode(resp.src.ID())
 				}
 			default:
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
