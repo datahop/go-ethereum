@@ -155,13 +155,9 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
-// HandleErrorResponse should be called when a topic query to a node fails.
-// The node is dropped from the table, freeing its bucket slot and IP-limit
-// entry for replacements. Unlike AddQueryResults, the failure does not count
-// as a response: the bucket is not warmed, so QueryTarget keeps preferring the
-// bucket's remaining candidates. A bucket whose nodes all fail becomes empty
-// and no longer blocks the walk, and a search whose nodes all fail becomes
-// IsDone and rolls over.
+// HandleErrorResponse drops a failed node from the table, freeing its slot and
+// IP-limit entry. The failure is not counted as a response, so the bucket stays
+// unwarmed and QueryTarget keeps preferring its remaining candidates.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
 	s.removeNode(from.ID())

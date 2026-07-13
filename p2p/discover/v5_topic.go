@@ -72,13 +72,10 @@ func (sys *topicSystem) evictRemovedNodes() {
 	sub := sys.transport.tab.subscribeRemovedNodes(removed)
 	defer sub.Unsubscribe()
 
-	// The eviction work (a dispatch round-trip via evictTopicTableNode plus a
-	// fan-out to every registration) can block. The table sends on removedFeed
-	// while holding its lock, so this goroutine must keep draining `removed`
-	// regardless of how slow that work is: otherwise the feed backs up under the
-	// table lock and deadlocks against loops that call tab.allNodes(). Decouple
-	// the two — a worker drains the internal queue and does the blocking work,
-	// while this goroutine only forwards feed events into the queue.
+	// removedFeed is sent under the table lock, so `removed` must be drained
+	// even when the (blocking) eviction work stalls, or the feed backs up under
+	// the lock and deadlocks loops that call tab.allNodes(). A worker does the
+	// blocking work; this goroutine only forwards feed events to it.
 	var (
 		mu    sync.Mutex
 		queue []enode.ID
@@ -122,9 +119,8 @@ func (sys *topicSystem) evictRemovedNodes() {
 	}
 }
 
-// evictNode removes a DHT-dropped node from the local ad cache and from every
-// registration table. It may block on the dispatch goroutine and on each
-// registration loop, so it must not run on the goroutine draining removedFeed.
+// evictNode removes a dead node's ads and its parked attempts in every reg
+// table. It can block, so it must not run on the goroutine draining removedFeed.
 func (sys *topicSystem) evictNode(id enode.ID) {
 	sys.transport.evictTopicTableNode(id)
 	sys.mu.Lock()
@@ -375,17 +371,13 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 
 		case resp := <-reg.regResponse:
 			if resp.err == errClosed {
-				// We cancelled the call during shutdown; the registrar's
-				// liveness is unknown, so don't treat it as a failure.
-				continue
+				continue // shutdown cancel: liveness unknown, not a failure
 			}
 			if len(resp.nodes) > 0 {
 				reg.state.AddNodes(resp.att.Node, filterTopicDiscovery(resp.nodes))
 			}
 			if resp.err != nil {
 				reg.state.HandleErrorResponse(resp.att, resp.err)
-				// A timed-out registrar is dead: drop any ads it has stored
-				// with us too. Only timeouts are a liveness signal.
 				if resp.err == errTimeout {
 					sys.transport.evictTopicTableNode(resp.att.Node.ID())
 				}
@@ -569,19 +561,13 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		case resp := <-s.queryRespCh:
 			switch {
 			case resp.err == errClosed:
-				// We cancelled the query during shutdown; the node's
-				// liveness is unknown, so don't treat it as a failure.
+				// shutdown cancel: liveness unknown, not a failure.
 			case resp.err != nil && len(resp.topicNodes)+len(resp.auxNodes) == 0:
-				// The queried node did not respond at all: drop it from the
-				// search table. A response that delivered some nodes before
-				// erroring (e.g. a multi-packet response that timed out
-				// halfway) still counts as a response.
+				// No nodes at all: drop the node. A partial response (some nodes
+				// before an error) is treated as a response by the default case.
 				state.HandleErrorResponse(resp.src, resp.err)
-				// A timed-out node is dead globally, not just for this search:
-				// evict it from the ad cache and from every registration table
-				// too, the same as a DHT removal. Registration attempts can sit
-				// unprobed for a long time, so this query failure may be the
-				// first liveness signal they get. Only timeouts count.
+				// A timeout means the node is dead globally: evict its ads and
+				// its parked attempts in every reg table, as a DHT removal does.
 				if resp.err == errTimeout {
 					sys.evictNode(resp.src.ID())
 				}
