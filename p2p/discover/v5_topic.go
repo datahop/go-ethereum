@@ -72,48 +72,33 @@ func (sys *topicSystem) evictRemovedNodes() {
 	sub := sys.transport.tab.subscribeRemovedNodes(removed)
 	defer sub.Unsubscribe()
 
-	// removedFeed is sent under the table lock, so `removed` must be drained
-	// even when the (blocking) eviction work stalls, or the feed backs up under
-	// the lock and deadlocks loops that call tab.allNodes(). A worker does the
-	// blocking work; this goroutine only forwards feed events to it.
-	var (
-		mu    sync.Mutex
-		queue []enode.ID
-		wake  = make(chan struct{}, 1)
-		done  = make(chan struct{})
-	)
+	// removedFeed is sent under the table lock, so `removed` must be drained even
+	// while the blocking eviction work is busy, or the feed backs up under the
+	// lock and deadlocks loops that call tab.allNodes(). A worker does the work;
+	// forward to it and drop if it falls behind — eviction is best-effort.
+	work := make(chan enode.ID, 1024)
+	sys.wg.Add(1)
 	go func() {
-		defer close(done)
+		defer sys.wg.Done()
 		for {
-			mu.Lock()
-			if len(queue) == 0 {
-				mu.Unlock()
-				select {
-				case <-wake:
-					continue
-				case <-sys.quit:
-					return
-				}
+			select {
+			case <-sys.quit:
+				return
+			case id := <-work:
+				sys.evictNode(id)
 			}
-			id := queue[0]
-			queue = queue[1:]
-			mu.Unlock()
-			sys.evictNode(id)
 		}
 	}()
 
 	for {
 		select {
 		case <-sys.quit:
-			<-done
 			return
 		case id := <-removed:
-			mu.Lock()
-			queue = append(queue, id)
-			mu.Unlock()
 			select {
-			case wake <- struct{}{}:
+			case work <- id:
 			default:
+				sys.config.Log.Debug("Dropped topic eviction, worker behind", "id", id)
 			}
 		}
 	}
