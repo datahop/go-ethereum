@@ -33,6 +33,11 @@ import (
 // wait time computation constants.
 const (
 	occupancyExp = 10
+
+	// waitTimeG is the paper's §6 safety floor: a positive baseline in the wait
+	// modifiers so a fresh registrant still owes a seconds-order wait, not ~0
+	// (~4.5s empty-table at the default 15-min AdLifetime).
+	waitTimeG = 0.05
 )
 
 // If a node has less than this time to wait, they will be accepted anyway.
@@ -240,15 +245,12 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	// ipMod changes the waiting time based on IP address diversity.
 	ipMod := tab.wt.ipModifier(n)
 
-	neededTime := baseTime * math.Max(topicMod+ipMod, 0.000001)
+	neededTime := baseTime * (topicMod + ipMod + waitTimeG)
 	computed := time.Duration(math.Ceil(neededTime * float64(time.Second)))
 
-	// Enforce the paper's §6 anti-gaming lower bound: a wait time quoted at t2
-	// must not be smaller than the wait quoted at t1 by more than the elapsed
-	// time, i.e. w(t2) >= w(t1) - (t2 - t1). This stops an incumbent from
-	// resetting its accumulated wait to ~0 by re-requesting through a brief
-	// occupancy dip, which is what lets it permanently hold the registrars
-	// closest to a topic.
+	// Apply the §6 anti-gaming lower bound: a re-quote can't drop below the
+	// prior quote by more than the elapsed time, so an incumbent can't reset its
+	// accumulated wait through a brief occupancy dip.
 	return tab.wt.lowerBound(n, t, computed, tab.config.Clock.Now())
 }
 
@@ -291,11 +293,9 @@ type waitTimeState struct {
 	ipv4 *ipTree
 	ipv6 *ipTree
 
-	// Lower-bound anti-gaming state (paper §6 / spec §2.1.5). Each map holds, per
-	// active registrant key, the last wait time quoted and the clock time it was
-	// quoted at. idBounds is keyed by (topic, advertiser id); ipBounds by (topic,
-	// IP) so that an attacker cannot evade the bound by rotating advertiser IDs
-	// from the same address.
+	// Lower-bound anti-gaming state (§6 / spec §2.1.5): per active registrant, the
+	// last wait quoted and when. idBounds keys by (topic, id); ipBounds by
+	// (topic, IP prefix) so ID rotation from one address can't evade it.
 	idBounds map[idBoundKey]waitBound
 	ipBounds map[ipBoundKey]waitBound
 }
@@ -339,11 +339,9 @@ func newWaitTimeState() waitTimeState {
 	}
 }
 
-// lowerBound enforces the paper's §6 retry-protection invariant on a freshly
-// computed wait time. It raises 'computed' to the highest still-active lower
-// bound recorded for n's (topic, id) and (topic, IP) keys, then records the
-// result as the new bound at 'now' so a later re-quote cannot drop faster than
-// real elapsed time.
+// lowerBound raises 'computed' to the highest still-active bound for n's
+// (topic, id) and (topic, IP) keys, then records the result as the new bound so
+// a later re-quote can't drop faster than real elapsed time.
 func (wt *waitTimeState) lowerBound(n *enode.Node, t TopicID, computed time.Duration, now mclock.AbsTime) time.Duration {
 	result := computed
 
@@ -372,19 +370,17 @@ func (wt *waitTimeState) lowerBound(n *enode.Node, t TopicID, computed time.Dura
 	return result
 }
 
-// Prefix lengths at which the per-IP lower bound aggregates addresses, so it
-// can't be evaded by rotating addresses within one allocation. IPv4 uses /24
-// (matching regBucketSubnet); IPv6 uses /64, the smallest real subnet boundary,
-// per docs/disc-ng-ipv6-policy.md §3.2 (#53). Transition-address re-routing
-// (6to4/Teredo/NAT64) is deferred to the full policy in #54.
+// The per-IP bound aggregates by prefix so it can't be evaded by rotating
+// addresses within one allocation: /24 for v4 (matching regBucketSubnet), /64
+// for v6 per docs/disc-ng-ipv6-policy.md §3.2 (#53). Transition-address
+// re-routing is deferred to #54.
 const (
 	waitBoundPrefix4 = 24
 	waitBoundPrefix6 = 64
 )
 
-// ipBoundKeys returns the per-IP lower-bound keys for node n under topic t. A
-// dual-stack node contributes both its v4 and v6 key, each aggregated to its
-// family's prefix. LAN addresses are skipped, matching ipModifier.
+// ipBoundKeys returns the per-IP lower-bound keys for n, one per address family,
+// each aggregated to its prefix.
 func (wt *waitTimeState) ipBoundKeys(t TopicID, n *enode.Node) []ipBoundKey {
 	var (
 		ip4  enr.IPv4

@@ -225,6 +225,26 @@ func TestTopicTableWaitTimeBoundPrefix(t *testing.T) {
 		net.ParseIP("2001:db8:1:1::1"), net.ParseIP("2001:db8:1:1::9"), net.ParseIP("2001:db8:2:2::9"))
 }
 
+// TestTopicTableWaitTimeFloor checks the paper §6 safety floor G: a fresh
+// registrant on an empty table (both modifiers ~0) still owes a seconds-order
+// wait, above the admission slack, instead of the ~0 the modifiers alone give.
+func TestTopicTableWaitTimeFloor(t *testing.T) {
+	cfg := Config{
+		AdCacheSize: 100,
+		AdLifetime:  15 * time.Minute,
+		Clock:       new(mclock.Simulated),
+		Log:         testlog.Logger(t, log.LvlTrace),
+	}
+	tab := NewTopicTable(cfg)
+
+	n := nodeAtDistance(enode.ID(topic1), 100, net.IP{203, 0, 113, 1})
+	w := tab.WaitTime(n, topic1)
+	t.Log("floor wait", w)
+	if w <= topicTableWaitTimeFloor {
+		t.Fatalf("fresh registrant wait %v does not exceed the admission slack %v", w, topicTableWaitTimeFloor)
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	return Config{
 		AdCacheSize: 20,
