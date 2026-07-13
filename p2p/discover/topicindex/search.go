@@ -53,7 +53,7 @@ type Search struct {
 type searchBucket struct {
 	dist        int
 	new         map[enode.ID]*enode.Node
-	asked       map[enode.ID]struct{}
+	asked       map[enode.ID]*enode.Node
 	numRequests int
 
 	ips netutil.DistinctNetSet
@@ -74,7 +74,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		s.buckets[i] = searchBucket{
 			dist:  dist,
 			new:   make(map[enode.ID]*enode.Node, cfg.SearchBucketSize),
-			asked: make(map[enode.ID]struct{}, cfg.SearchBucketSize),
+			asked: make(map[enode.ID]*enode.Node, cfg.SearchBucketSize),
 			ips: netutil.DistinctNetSet{
 				Subnet: searchBucketSubnet,
 				Limit:  searchBucketIPLimit,
@@ -153,6 +153,32 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		// All checks passed, add the node.
 		b.new[id] = n
 	}
+}
+
+// HandleErrorResponse drops a failed node from the table, freeing its slot and
+// IP-limit entry. The failure is not counted as a response, so the bucket stays
+// unwarmed and QueryTarget keeps preferring its remaining candidates.
+func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
+	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
+	s.removeNode(from.ID())
+}
+
+// removeNode drops a node from the search table. The node is removed from both
+// the unasked ('new') and asked sets of its bucket, and its IP-limit entry is
+// released regardless of which set it was in.
+func (s *Search) removeNode(id enode.ID) {
+	b := s.bucket(id)
+	n, ok := b.new[id]
+	if !ok {
+		n, ok = b.asked[id]
+	}
+	if ok {
+		if ip := n.IP(); ip != nil && !netutil.IsLAN(ip) {
+			b.ips.Remove(ip)
+		}
+	}
+	delete(b.new, id)
+	delete(b.asked, id)
 }
 
 // QueryTarget returns a random node to which a topic query should be sent.
@@ -241,6 +267,6 @@ func (b *searchBucket) count() int {
 }
 
 func (b *searchBucket) setAsked(n *enode.Node) {
-	b.asked[n.ID()] = struct{}{}
+	b.asked[n.ID()] = n
 	delete(b.new, n.ID())
 }

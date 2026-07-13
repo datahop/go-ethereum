@@ -87,6 +87,7 @@ type Table struct {
 	closed          chan struct{}
 
 	nodeFeed        event.FeedOf[*enode.Node]
+	removedFeed     event.FeedOf[enode.ID]
 	nodeAddedHook   func(*bucket, *tableNode)
 	nodeRemovedHook func(*bucket, *tableNode)
 }
@@ -625,6 +626,7 @@ func (tab *Table) nodeAdded(b *bucket, n *tableNode) {
 
 func (tab *Table) nodeRemoved(b *bucket, n *tableNode) {
 	tab.revalidation.nodeRemoved(n)
+	tab.removedFeed.Send(n.ID())
 	if tab.nodeRemovedHook != nil {
 		tab.nodeRemovedHook(b, n)
 	}
@@ -747,6 +749,12 @@ func pushNode(list []*tableNode, n *tableNode, max int) ([]*tableNode, *tableNod
 // New nodes are sent on the given channel.
 func (tab *Table) subscribeNodes(ch chan *enode.Node) event.Subscription {
 	return tab.nodeFeed.Subscribe(ch)
+}
+
+// subscribeRemovedNodes subscribes to node removal events. The ID of each node
+// removed from the table (e.g. on failed revalidation) is sent on the channel.
+func (tab *Table) subscribeRemovedNodes(ch chan enode.ID) event.Subscription {
+	return tab.removedFeed.Subscribe(ch)
 }
 
 // allNodes returns all live nodes in the table.

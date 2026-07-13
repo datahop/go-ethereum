@@ -17,6 +17,7 @@
 package topicindex
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -166,6 +167,91 @@ func TestSearchAddNodesOnePerBucketRule(t *testing.T) {
 	bi := s.bucketIndex(sameBucket[0].ID())
 	if got := s.buckets[bi].count(); got != 1 {
 		t.Fatalf("expected 1 node in bucket[%d] under one-per-bucket-rule, got %d", bi, got)
+	}
+}
+
+// TestSearchHandleErrorResponse verifies that a failed topic query drops the
+// queried node from the table — freeing its bucket slot and IP-limit entry so
+// a replacement at the same /24 can be added — without counting as a response:
+// the bucket keeps gating the walk while it has candidates, is skipped once
+// they all fail, and a search whose nodes all fail becomes done.
+func TestSearchHandleErrorResponse(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	// Two nodes in bucket 0 (logdist 256), one in bucket 5 (logdist 251).
+	far := nodesAtDistanceFrom(enode.ID(topic1), 256, 2, 1)
+	mid := nodesAtDistanceFrom(enode.ID(topic1), 251, 1, 10)
+	s.AddNodes(nil, far)
+	s.AddNodes(nil, mid)
+
+	// The query to far[0] fails: the node must leave the table entirely.
+	s.HandleErrorResponse(far[0], errors.New("timeout"))
+	if s.buckets[0].contains(far[0].ID()) {
+		t.Fatal("failed node still present in its bucket")
+	}
+	if got := s.buckets[0].count(); got != 1 {
+		t.Fatalf("bucket[0] count is %d after eviction, want 1", got)
+	}
+
+	// The IP-limit slot is freed: a replacement in the same /24 is accepted.
+	replacement := nodeAtDistance(enode.ID(topic1), 256, far[0].IP())
+	s.AddNodes(nil, []*enode.Node{replacement})
+	if !s.buckets[0].contains(replacement.ID()) {
+		t.Fatal("replacement with the failed node's IP was not admitted")
+	}
+
+	// The failure did not count as a response: bucket 0 still has candidates
+	// and no response yet, so it keeps gating the walk.
+	if n := s.QueryTarget(); n == nil || !s.buckets[0].contains(n.ID()) {
+		t.Fatalf("QueryTarget should keep picking from unwarmed bucket[0], got %v", n)
+	}
+
+	// Failing all of bucket 0 empties it; the empty bucket no longer blocks
+	// the walk, so QueryTarget advances to bucket 5.
+	s.HandleErrorResponse(far[1], errors.New("timeout"))
+	s.HandleErrorResponse(replacement, errors.New("timeout"))
+	target := s.QueryTarget()
+	if target == nil {
+		t.Fatal("QueryTarget returned nil after bucket[0] failed out; want bucket[5] node")
+	}
+	if !s.buckets[5].contains(target.ID()) {
+		t.Fatalf("QueryTarget returned %v, want the bucket[5] node", target.ID())
+	}
+
+	// When every node has failed, the search is done and rolls over.
+	s.HandleErrorResponse(mid[0], errors.New("timeout"))
+	if !s.IsDone() {
+		t.Fatal("IsDone should report true once every node has failed out")
+	}
+}
+
+// TestSearchRemoveAskedNodeFreesIP verifies that removing a node that has moved
+// to the 'asked' set (it responded before being removed) still releases its
+// IP-limit entry, so a same-/24 replacement is admitted.
+func TestSearchRemoveAskedNodeFreesIP(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	nodes := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
+	n := nodes[0]
+	s.AddNodes(nil, nodes)
+
+	// Move n into the 'asked' set by recording a query response from it.
+	s.AddQueryResults(n, nil)
+	if _, inAsked := s.buckets[0].asked[n.ID()]; !inAsked {
+		t.Fatal("node was not moved to the asked set")
+	}
+
+	// Removing it now must free the IP-limit slot even though it is in 'asked'.
+	s.HandleErrorResponse(n, errors.New("timeout"))
+	if s.buckets[0].contains(n.ID()) {
+		t.Fatal("removed asked-node still present")
+	}
+	replacement := nodeAtDistance(enode.ID(topic1), 256, n.IP())
+	s.AddNodes(nil, []*enode.Node{replacement})
+	if !s.buckets[0].contains(replacement.ID()) {
+		t.Fatal("replacement with the asked node's IP was not admitted (IP slot leaked)")
 	}
 }
 

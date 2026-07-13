@@ -204,6 +204,21 @@ func (tab *TopicTable) add(n *enode.Node, topic TopicID) *topicTableEntry {
 	return reg
 }
 
+// RemoveNode removes all registrations advertised by the given node, across all
+// topics. It is used to evict ads pointing at a node that has become
+// unresponsive.
+func (tab *TopicTable) RemoveNode(id enode.ID) {
+	for e := tab.all.Front(); e != nil; {
+		next := e.Next()
+		reg := e.Value.(*topicTableEntry)
+		if reg.node.ID() == id {
+			tab.remove(reg)
+			tab.wt.removeReg(reg)
+		}
+		e = next
+	}
+}
+
 func (tab *TopicTable) remove(reg *topicTableEntry) {
 	tab.all.Remove(reg.allElem)
 	topicList := tab.reg[reg.topic]
