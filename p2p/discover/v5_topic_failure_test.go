@@ -17,11 +17,14 @@
 package discover
 
 import (
+	"crypto/ecdsa"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
+	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 )
 
 // waitForCond polls cond until it returns true or the deadline passes.
@@ -65,4 +68,48 @@ func TestTopicDHTEvictionEvictsAd(t *testing.T) {
 	waitForCond(t, "ad removed from cache after DHT eviction", func() bool {
 		return len(test.udp.LocalTopicNodes(topic)) == 0
 	})
+}
+
+// TestTopicEvictNodeRemovesRegistration checks that a global liveness signal
+// (evictNode, as raised by a failed TOPICQUERY in the search loop) removes the
+// node from a registration table, not just from the ad cache. Two nodes are
+// registered so that evicting one keeps the registration session running
+// (NodeCount stays > 0) rather than restarting and re-seeding from the table.
+func TestTopicEvictNodeRemovesRegistration(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	confirm := func(key *ecdsa.PrivateKey, addr netip.AddrPort) {
+		test.waitPacketOut(func(p *v5wire.Regtopic, gotAddr netip.AddrPort, _ v5wire.Nonce) {
+			test.packetInFrom(key, gotAddr, &v5wire.Regconfirmation{
+				ReqID:    p.ReqID,
+				WaitTime: 900000,
+			})
+		})
+	}
+
+	key1 := newkey()
+	addr1 := netip.MustParseAddrPort("10.0.1.101:30303")
+	ln1 := test.getNode(key1, addr1)
+	ln1.Set(topicindex.TopicDiscoveryVersion)
+
+	key2 := newkey()
+	addr2 := netip.MustParseAddrPort("10.0.1.102:30303")
+	ln2 := test.getNode(key2, addr2)
+	ln2.Set(topicindex.TopicDiscoveryVersion)
+
+	test.table.addFoundNode(ln1.Node(), true)
+	test.udp.RegisterTopic(testTopic1, 1)
+	confirm(key1, addr1)
+
+	test.table.addFoundNode(ln2.Node(), true)
+	confirm(key2, addr2)
+
+	reg := test.udp.topicSys.reg[testTopic1]
+	waitForCond(t, "both nodes registered", func() bool { return reg.nodeCount() == 2 })
+
+	// Evicting ln1 as a dead node must drop it from the registration table.
+	test.udp.topicSys.evictNode(ln1.Node().ID())
+	waitForCond(t, "evicted node removed from reg", func() bool { return reg.nodeCount() == 1 })
 }
