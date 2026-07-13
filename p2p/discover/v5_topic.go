@@ -71,22 +71,70 @@ func (sys *topicSystem) evictRemovedNodes() {
 	removed := make(chan enode.ID, 1024)
 	sub := sys.transport.tab.subscribeRemovedNodes(removed)
 	defer sub.Unsubscribe()
+
+	// The eviction work (a dispatch round-trip via evictTopicTableNode plus a
+	// fan-out to every registration) can block. The table sends on removedFeed
+	// while holding its lock, so this goroutine must keep draining `removed`
+	// regardless of how slow that work is: otherwise the feed backs up under the
+	// table lock and deadlocks against loops that call tab.allNodes(). Decouple
+	// the two — a worker drains the internal queue and does the blocking work,
+	// while this goroutine only forwards feed events into the queue.
+	var (
+		mu    sync.Mutex
+		queue []enode.ID
+		wake  = make(chan struct{}, 1)
+		done  = make(chan struct{})
+	)
+	go func() {
+		defer close(done)
+		for {
+			mu.Lock()
+			if len(queue) == 0 {
+				mu.Unlock()
+				select {
+				case <-wake:
+					continue
+				case <-sys.quit:
+					return
+				}
+			}
+			id := queue[0]
+			queue = queue[1:]
+			mu.Unlock()
+			sys.evictNode(id)
+		}
+	}()
+
 	for {
 		select {
 		case <-sys.quit:
+			<-done
 			return
 		case id := <-removed:
-			sys.transport.evictTopicTableNode(id)
-			sys.mu.Lock()
-			regs := make([]*topicReg, 0, len(sys.reg))
-			for _, r := range sys.reg {
-				regs = append(regs, r)
-			}
-			sys.mu.Unlock()
-			for _, r := range regs {
-				r.evict(id)
+			mu.Lock()
+			queue = append(queue, id)
+			mu.Unlock()
+			select {
+			case wake <- struct{}{}:
+			default:
 			}
 		}
+	}
+}
+
+// evictNode removes a DHT-dropped node from the local ad cache and from every
+// registration table. It may block on the dispatch goroutine and on each
+// registration loop, so it must not run on the goroutine draining removedFeed.
+func (sys *topicSystem) evictNode(id enode.ID) {
+	sys.transport.evictTopicTableNode(id)
+	sys.mu.Lock()
+	regs := make([]*topicReg, 0, len(sys.reg))
+	for _, r := range sys.reg {
+		regs = append(regs, r)
+	}
+	sys.mu.Unlock()
+	for _, r := range regs {
+		r.evict(id)
 	}
 }
 
