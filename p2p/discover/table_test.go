@@ -603,9 +603,9 @@ func TestTable_collectOnePerDist(t *testing.T) {
 
 	check := func(*enode.Node) bool { return true }
 
-	// Request all distances with a generous limit: expect exactly one node per
-	// requested distance, and each must be at that distance from target.
-	got := tab.collectOnePerDist(target, wantDists, 100, check)
+	// Request all distances: expect exactly one node per requested distance,
+	// and each must be at that distance from target.
+	got := tab.collectOnePerDist(target, wantDists, check)
 	if len(got) != len(wantDists) {
 		t.Fatalf("got %d nodes, want %d", len(got), len(wantDists))
 	}
@@ -624,11 +624,63 @@ func TestTable_collectOnePerDist(t *testing.T) {
 		}
 	}
 
-	// The limit must cap the number of returned nodes.
+	// At most one node is returned per requested distance, so callers bound the
+	// response by bounding the distance slice.
 	const limit = 2
-	capped := tab.collectOnePerDist(target, wantDists, limit, check)
+	capped := tab.collectOnePerDist(target, wantDists[:limit], check)
 	if len(capped) > limit {
-		t.Errorf("limit not honored: got %d nodes, want <= %d", len(capped), limit)
+		t.Errorf("got %d nodes, want <= %d", len(capped), limit)
+	}
+
+	// A distance whose nodes all fail the check yields nothing and does not
+	// affect the other requested distances.
+	const rejectDist = 250
+	rejectDistOnly := func(n *enode.Node) bool {
+		return uint(enode.LogDist(target, n.ID())) != rejectDist
+	}
+	got = tab.collectOnePerDist(target, wantDists, rejectDistOnly)
+	if len(got) != len(wantDists)-1 {
+		t.Errorf("got %d nodes, want %d (all distances but the rejected one)", len(got), len(wantDists)-1)
+	}
+	for _, n := range got {
+		if uint(enode.LogDist(target, n.ID())) == rejectDist {
+			t.Errorf("returned node at distance %d, which the check rejects", rejectDist)
+		}
+	}
+
+	// A rejected node does not consume its distance's single slot: another
+	// passing node at the same distance is used instead.
+	var multiDist uint
+	var rejectID enode.ID
+	for _, d := range wantDists {
+		if len(byDist[d]) >= 2 {
+			multiDist = d
+			for id := range byDist[d] {
+				rejectID = id
+				break
+			}
+			break
+		}
+	}
+	if multiDist == 0 {
+		t.Fatal("no distance has >= 2 nodes; cannot test slot reuse")
+	}
+	rejectOneNode := func(n *enode.Node) bool { return n.ID() != rejectID }
+	got = tab.collectOnePerDist(target, []uint{multiDist}, rejectOneNode)
+	if len(got) != 1 {
+		t.Fatalf("got %d nodes at distance %d, want 1", len(got), multiDist)
+	}
+	if got[0].ID() == rejectID {
+		t.Errorf("returned the rejected node at distance %d", multiDist)
+	}
+
+	// Distance 0 (the target itself) and out-of-range distances are skipped:
+	// they are not held in the table and must return nothing (in particular
+	// distance 0 must not return self).
+	for _, bad := range [][]uint{{0}, {257}, {512}} {
+		if r := tab.collectOnePerDist(target, bad, check); len(r) != 0 {
+			t.Errorf("collectOnePerDist(%v) returned %d nodes, want 0", bad, len(r))
+		}
 	}
 }
 

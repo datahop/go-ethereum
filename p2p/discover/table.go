@@ -763,44 +763,40 @@ func (tab *Table) allNodes() []*enode.Node {
 	return nodes
 }
 
-// collectOnePerDist collects one node per requested distance from the table.
-func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, limit int, check func(*enode.Node) bool) []*enode.Node {
+// collectOnePerDist collects one node per requested distance from the table,
+// where distance means logdist(target, n) — the distance to the topic/target,
+// not to the local node (#55). Callers must keep len(distances) within the
+// desired response node limit, since at most one node is returned per distance.
+func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check func(*enode.Node) bool) []*enode.Node {
 	tab.mutex.Lock()
 	defer tab.mutex.Unlock()
 
+	// Build the set of still-wanted distances. Each is dropped once filled.
+	want := make(map[uint]struct{}, len(distances))
 	var nodes []*enode.Node
-	processed := make(map[uint]struct{})
 	for _, dist := range distances {
-		if _, seen := processed[dist]; seen || dist > 256 {
+		if dist == 0 || dist > 256 {
 			continue
 		}
-		processed[dist] = struct{}{}
+		want[dist] = struct{}{}
+	}
 
-		if dist == 0 {
-			self := tab.net.Self()
-			if check(self) {
-				nodes = append(nodes, self)
-			}
-			continue
+	// Single pass over the table: take the first checked node at each wanted
+	// distance and drop that distance so it is filled only once.
+	for bi := range tab.buckets {
+		if len(want) == 0 {
+			break
 		}
-
-		// #55: pick one node at logdist(target, n) == dist (distance from the
-		// topic/target), scanning all buckets. bucketAtDistance keys off self.
-		for bi := range tab.buckets {
-			matched := false
-			for _, n := range tab.buckets[bi].entries {
-				if uint(enode.LogDist(target, n.ID())) == dist && check(n.Node) {
-					nodes = append(nodes, n.Node)
-					matched = true
-					break // one per distance
-				}
+		for _, n := range tab.buckets[bi].entries {
+			d := uint(enode.LogDist(target, n.ID()))
+			if _, ok := want[d]; !ok || !check(n.Node) {
+				continue
 			}
-			if matched {
+			nodes = append(nodes, n.Node)
+			delete(want, d)
+			if len(want) == 0 {
 				break
 			}
-		}
-		if len(nodes) >= limit {
-			break
 		}
 	}
 	return nodes
