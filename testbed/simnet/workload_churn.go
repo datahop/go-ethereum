@@ -110,9 +110,9 @@ func (cs *churnState) counts() (alive, killed, total int) {
 	return len(cs.alive), len(cs.killed), len(cs.all)
 }
 
-// sampleAliveBlacklist sums BlacklistLen() over up to max randomly-sampled alive
-// nodes, returning the sum and the sample size. Sampling bounds the cost so the
-// monitor stays responsive while 10k searchers contend on the topic systems.
+// sampleAliveBlacklist returns the alive sample size. The global blacklist it
+// used to sum was removed in PR #71 (failures are handled inline with no
+// persistent per-node blacklist), so the sum is always 0 on this branch.
 func (cs *churnState) sampleAliveBlacklist(max int, rng *rand.Rand) (sum, sampled int) {
 	cs.mu.Lock()
 	alive := append([]nodeRec(nil), cs.alive...)
@@ -121,10 +121,7 @@ func (cs *churnState) sampleAliveBlacklist(max int, rng *rand.Rand) (sum, sample
 		rng.Shuffle(len(alive), func(i, j int) { alive[i], alive[j] = alive[j], alive[i] })
 		alive = alive[:max]
 	}
-	for _, n := range alive {
-		sum += n.disc.BlacklistLen()
-	}
-	return sum, len(alive)
+	return 0, len(alive)
 }
 
 // runChurnWorkload runs the multi-topic register+search workload while churning
