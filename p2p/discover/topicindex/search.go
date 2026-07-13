@@ -53,7 +53,7 @@ type Search struct {
 type searchBucket struct {
 	dist        int
 	new         map[enode.ID]*enode.Node
-	asked       map[enode.ID]struct{}
+	asked       map[enode.ID]*enode.Node
 	numRequests int
 
 	ips netutil.DistinctNetSet
@@ -74,7 +74,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		s.buckets[i] = searchBucket{
 			dist:  dist,
 			new:   make(map[enode.ID]*enode.Node, cfg.SearchBucketSize),
-			asked: make(map[enode.ID]struct{}, cfg.SearchBucketSize),
+			asked: make(map[enode.ID]*enode.Node, cfg.SearchBucketSize),
 			ips: netutil.DistinctNetSet{
 				Subnet: searchBucketSubnet,
 				Limit:  searchBucketIPLimit,
@@ -168,15 +168,20 @@ func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 }
 
 // removeNode drops a node from the search table. The node is removed from both
-// the unasked ('new') and asked sets of its bucket.
+// the unasked ('new') and asked sets of its bucket, and its IP-limit entry is
+// released regardless of which set it was in.
 func (s *Search) removeNode(id enode.ID) {
 	b := s.bucket(id)
-	if n, ok := b.new[id]; ok {
+	n, ok := b.new[id]
+	if !ok {
+		n, ok = b.asked[id]
+	}
+	if ok {
 		if ip := n.IP(); ip != nil && !netutil.IsLAN(ip) {
 			b.ips.Remove(ip)
 		}
-		delete(b.new, id)
 	}
+	delete(b.new, id)
 	delete(b.asked, id)
 }
 
@@ -266,6 +271,6 @@ func (b *searchBucket) count() int {
 }
 
 func (b *searchBucket) setAsked(n *enode.Node) {
-	b.asked[n.ID()] = struct{}{}
+	b.asked[n.ID()] = n
 	delete(b.new, n.ID())
 }

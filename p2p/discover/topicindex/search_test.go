@@ -226,6 +226,35 @@ func TestSearchHandleErrorResponse(t *testing.T) {
 	}
 }
 
+// TestSearchRemoveAskedNodeFreesIP verifies that removing a node that has moved
+// to the 'asked' set (it responded before being removed) still releases its
+// IP-limit entry, so a same-/24 replacement is admitted.
+func TestSearchRemoveAskedNodeFreesIP(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	nodes := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
+	n := nodes[0]
+	s.AddNodes(nil, nodes)
+
+	// Move n into the 'asked' set by recording a query response from it.
+	s.AddQueryResults(n, nil)
+	if _, inAsked := s.buckets[0].asked[n.ID()]; !inAsked {
+		t.Fatal("node was not moved to the asked set")
+	}
+
+	// Removing it now must free the IP-limit slot even though it is in 'asked'.
+	s.HandleErrorResponse(n, errors.New("timeout"))
+	if s.buckets[0].contains(n.ID()) {
+		t.Fatal("removed asked-node still present")
+	}
+	replacement := nodeAtDistance(enode.ID(topic1), 256, n.IP())
+	s.AddNodes(nil, []*enode.Node{replacement})
+	if !s.buckets[0].contains(replacement.ID()) {
+		t.Fatal("replacement with the asked node's IP was not admitted (IP slot leaked)")
+	}
+}
+
 // This checks (de)queueing of topic search results: results come out of the
 // buffer in the order they were received.
 func TestSearchResultsTracking(t *testing.T) {
