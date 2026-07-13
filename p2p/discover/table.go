@@ -763,36 +763,37 @@ func (tab *Table) allNodes() []*enode.Node {
 	return nodes
 }
 
-// collectOnePerDist collects one node per requested distance from the table.
-func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, limit int, check func(*enode.Node) bool) []*enode.Node {
+// collectOnePerDist collects one node per requested distance for the target node id from the table.
+func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check func(*enode.Node) bool) []*enode.Node {
 	tab.mutex.Lock()
 	defer tab.mutex.Unlock()
 
+	// Build the set of still-wanted distances. Each is dropped once filled.
+	want := make(map[uint]struct{}, len(distances))
 	var nodes []*enode.Node
-	processed := make(map[uint]struct{})
 	for _, dist := range distances {
-		if _, seen := processed[dist]; seen || dist > 256 {
+		if dist == 0 || dist > 256 {
 			continue
 		}
-		processed[dist] = struct{}{}
+		want[dist] = struct{}{}
+	}
 
-		if dist == 0 {
-			self := tab.net.Self()
-			if check(self) {
-				nodes = append(nodes, self)
-			}
-			continue
-		}
-
-		b := tab.bucketAtDistance(int(dist))
-		for _, n := range b.entries {
-			if check(n.Node) {
-				nodes = append(nodes, n.Node)
-				break // one per distance
-			}
-		}
-		if len(nodes) >= limit {
+	// Single pass over the table: take the first checked node at each wanted
+	// distance and drop that distance so it is filled only once.
+	for bi := range tab.buckets {
+		if len(want) == 0 {
 			break
+		}
+		for _, n := range tab.buckets[bi].entries {
+			d := uint(enode.LogDist(target, n.ID()))
+			if _, ok := want[d]; !ok || !check(n.Node) {
+				continue
+			}
+			nodes = append(nodes, n.Node)
+			delete(want, d)
+			if len(want) == 0 {
+				break
+			}
 		}
 	}
 	return nodes
