@@ -21,6 +21,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -305,8 +306,8 @@ type idBoundKey struct {
 	id    enode.ID
 }
 
-// ipBoundKey keys the per-(topic, IP) lower bound. The IP is stored in its
-// canonical string form so v4 and v6 addresses share one map.
+// ipBoundKey keys the per-(topic, IP-prefix) lower bound. The prefix is stored
+// in its canonical string form so v4 and v6 addresses share one map.
 type ipBoundKey struct {
 	topic TopicID
 	ip    string
@@ -371,24 +372,58 @@ func (wt *waitTimeState) lowerBound(n *enode.Node, t TopicID, computed time.Dura
 	return result
 }
 
+// Prefix lengths at which the per-IP lower bound aggregates addresses, so it
+// can't be evaded by rotating addresses within one allocation. IPv4 uses /24
+// (matching regBucketSubnet); IPv6 uses /64, the smallest real subnet boundary,
+// per docs/disc-ng-ipv6-policy.md §3.2 (#53). Transition-address re-routing
+// (6to4/Teredo/NAT64) is deferred to the full policy in #54.
+const (
+	waitBoundPrefix4 = 24
+	waitBoundPrefix6 = 64
+)
+
 // ipBoundKeys returns the per-IP lower-bound keys for node n under topic t. A
-// dual-stack node contributes both its v4 and v6 key. LAN addresses are skipped,
-// matching ipModifier. The longest-prefix aggregation hinted at by the spec is
-// approximated here by the full address; an explicit IPv6 prefix policy is
-// tracked separately (see compliance doc §3.2 / Issue #54).
+// dual-stack node contributes both its v4 and v6 key, each aggregated to its
+// family's prefix. LAN addresses are skipped, matching ipModifier.
 func (wt *waitTimeState) ipBoundKeys(t TopicID, n *enode.Node) []ipBoundKey {
 	var (
 		ip4  enr.IPv4
 		ip6  enr.IPv6
 		keys []ipBoundKey
 	)
-	if n.Load(&ip4) == nil && !netutil.IsLAN(net.IP(ip4)) {
-		keys = append(keys, ipBoundKey{topic: t, ip: net.IP(ip4).String()})
+	if n.Load(&ip4) == nil {
+		if k, ok := ipBoundKeyFor(t, net.IP(ip4)); ok {
+			keys = append(keys, k)
+		}
 	}
-	if n.Load(&ip6) == nil && !netutil.IsLAN(net.IP(ip6)) {
-		keys = append(keys, ipBoundKey{topic: t, ip: net.IP(ip6).String()})
+	if n.Load(&ip6) == nil {
+		if k, ok := ipBoundKeyFor(t, net.IP(ip6)); ok {
+			keys = append(keys, k)
+		}
 	}
 	return keys
+}
+
+// ipBoundKeyFor builds the bound key for ip, aggregated to its family's prefix
+// (/24 for v4, /64 for v6). It reports ok=false for LAN or malformed addresses.
+func ipBoundKeyFor(t TopicID, ip net.IP) (ipBoundKey, bool) {
+	if ip == nil || netutil.IsLAN(ip) {
+		return ipBoundKey{}, false
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return ipBoundKey{}, false
+	}
+	addr = addr.Unmap()
+	bits := waitBoundPrefix6
+	if addr.Is4() {
+		bits = waitBoundPrefix4
+	}
+	prefix, err := addr.Prefix(bits)
+	if err != nil {
+		return ipBoundKey{}, false
+	}
+	return ipBoundKey{topic: t, ip: prefix.String()}, true
 }
 
 // expireBounds drops lower-bound tuples that have fully decayed at 'now'.

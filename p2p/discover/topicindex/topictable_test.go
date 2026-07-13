@@ -146,8 +146,10 @@ func TestTopicTableWaitTimeLowerBound(t *testing.T) {
 		t.Fatalf("expected empty table after expiry, got %d entries", tab.all.Len())
 	}
 
-	// A genuinely fresh outsider now gets a near-zero wait (nothing to lower-bound).
-	fresh := nodeAtDistance(enode.ID(topic1), 100, net.IP{203, 0, 113, 2})
+	// A genuinely fresh outsider now gets a near-zero wait (nothing to
+	// lower-bound). It must be in a different /24 than n, since the bound
+	// aggregates per /24.
+	fresh := nodeAtDistance(enode.ID(topic1), 100, net.IP{198, 51, 100, 2})
 	if wf := tab.WaitTime(fresh, topic1); wf > time.Second {
 		t.Fatalf("fresh node should see a tiny wait on an empty table, got %v", wf)
 	}
@@ -173,6 +175,54 @@ func TestTopicTableWaitTimeLowerBound(t *testing.T) {
 	if w3 := tab.WaitTime(n, topic1); w3 > time.Second {
 		t.Fatalf("expected tiny wait after the bound fully decayed, got %v", w3)
 	}
+}
+
+// TestTopicTableWaitTimeBoundPrefix verifies that the per-IP lower bound
+// aggregates by prefix — /24 for IPv4, /64 for IPv6 — so it can't be evaded by
+// rotating addresses within one allocation, while a different prefix stays
+// independent. Each node gets a distinct random id, so the only thing that can
+// carry the bound from one node to another is a shared IP prefix.
+func TestTopicTableWaitTimeBoundPrefix(t *testing.T) {
+	check := func(name string, first, samePrefix, otherPrefix net.IP) {
+		t.Run(name, func(t *testing.T) {
+			clock := new(mclock.Simulated)
+			cfg := Config{
+				AdCacheSize: 100,
+				AdLifetime:  30 * time.Second,
+				Clock:       clock,
+				Log:         testlog.Logger(t, log.LvlTrace),
+			}
+			tab := NewTopicTable(cfg)
+			for i := 0; i < 50; i++ {
+				if !tab.Add(nodeAtDistance(enode.ID(topic1), 200, intIP(i+1)), topic1) {
+					t.Fatalf("can't add filler %d", i)
+				}
+			}
+
+			// Quote `first` to record a bound for its prefix, then drain the table
+			// so the instantaneous computed wait collapses to ~0.
+			w1 := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, first), topic1)
+			if w1 <= cfg.AdLifetime {
+				t.Fatalf("setup: expected a large initial wait, got %v", w1)
+			}
+			clock.Run(cfg.AdLifetime)
+			tab.Expire()
+
+			// A node in the same prefix inherits the still-active bound.
+			if w := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, samePrefix), topic1); w <= time.Second {
+				t.Errorf("same-prefix node was not bounded: got %v", w)
+			}
+			// A node in a different prefix is unaffected.
+			if w := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, otherPrefix), topic1); w > time.Second {
+				t.Errorf("different-prefix node was bounded: got %v", w)
+			}
+		})
+	}
+
+	check("ipv4",
+		net.IP{203, 0, 113, 1}, net.IP{203, 0, 113, 9}, net.IP{198, 51, 100, 9})
+	check("ipv6",
+		net.ParseIP("2001:db8:1:1::1"), net.ParseIP("2001:db8:1:1::9"), net.ParseIP("2001:db8:2:2::9"))
 }
 
 func testConfig(t *testing.T) Config {
