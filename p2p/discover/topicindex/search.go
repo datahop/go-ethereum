@@ -18,6 +18,8 @@ package topicindex
 
 import (
 	"math/rand"
+	"sync"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -48,7 +50,14 @@ type Search struct {
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
 	resultSeen   map[enode.ID]struct{}
+
+	// Testbed instrumentation (see simnet harness); no effect on protocol.
+	origin map[enode.ID]bool // first-seen source: true=referral, false=DHT
+	cycle  int               // search-cycle index, set by runLoop each rollover
 }
+
+// SetCycle records which rollover this Search instance is (reach instrumentation).
+func (s *Search) SetCycle(c int) { s.cycle = c }
 
 type searchBucket struct {
 	dist        int
@@ -57,6 +66,119 @@ type searchBucket struct {
 	numRequests int
 
 	ips netutil.DistinctNetSet
+}
+
+// Search-table provenance counters (process-global; aggregated across all
+// concurrent searches). They distinguish nodes/ads that entered a search table
+// via the DHT routing table (seed, src==nil) versus referrals from other
+// registrars' TOPICQUERY responses (src!=nil). Testbed instrumentation only.
+var (
+	provAddedDHT           atomic.Int64
+	provAddedReferral      atomic.Int64
+	provQueriedDHT         atomic.Int64
+	provQueriedReferral    atomic.Int64
+	provAdsDHT             atomic.Int64
+	provAdsReferral        atomic.Int64
+	provRejectFull         atomic.Int64
+	provRejectOnePerBucket atomic.Int64
+	provRejectIP           atomic.Int64
+	provBucketOcc          [searchTableDepth]atomic.Int64
+	provBucketSamples      atomic.Int64
+)
+
+// SearchProvenance returns cumulative provenance counts.
+func SearchProvenance() map[string]int64 {
+	return map[string]int64{
+		"addedDHT": provAddedDHT.Load(), "addedReferral": provAddedReferral.Load(),
+		"queriedDHT": provQueriedDHT.Load(), "queriedReferral": provQueriedReferral.Load(),
+		"adsDHT": provAdsDHT.Load(), "adsReferral": provAdsReferral.Load(),
+	}
+}
+
+// SearchBucketStats returns mean occupancy per search-table bucket (0 = farthest
+// from topic, last = closest), sampled when a search saturates, plus AddNodes
+// rejection counts.
+func SearchBucketStats() ([]float64, map[string]int64) {
+	n := provBucketSamples.Load()
+	occ := make([]float64, len(provBucketOcc))
+	for i := range provBucketOcc {
+		if n > 0 {
+			occ[i] = float64(provBucketOcc[i].Load()) / float64(n)
+		}
+	}
+	return occ, map[string]int64{
+		"full": provRejectFull.Load(), "onePerBucket": provRejectOnePerBucket.Load(),
+		"ip": provRejectIP.Load(), "samples": n,
+	}
+}
+
+// Per-searcher reach sampling (testbed bottleneck analysis).
+type regStat struct {
+	firstCycle int
+	nQueries   int
+	ads        map[enode.ID]struct{}
+}
+
+type reachSet struct {
+	mu   sync.Mutex
+	regs map[enode.ID]*regStat
+}
+
+var (
+	reachData    sync.Map // self enode.ID -> *reachSet
+	reachEnabled bool
+)
+
+// EnableReach turns on per-searcher reach sampling.
+func EnableReach() { reachEnabled = true }
+
+func reachSampled(id enode.ID) bool { return id[0] < 3 } // ~1% of nodes
+
+func recordReach(self, reg enode.ID, cycle int, results []*enode.Node) {
+	if !reachEnabled || !reachSampled(self) {
+		return
+	}
+	v, ok := reachData.Load(self)
+	if !ok {
+		v, _ = reachData.LoadOrStore(self, &reachSet{regs: make(map[enode.ID]*regStat)})
+	}
+	rs := v.(*reachSet)
+	rs.mu.Lock()
+	st := rs.regs[reg]
+	if st == nil {
+		st = &regStat{firstCycle: cycle, ads: make(map[enode.ID]struct{})}
+		rs.regs[reg] = st
+	}
+	st.nQueries++
+	for _, n := range results {
+		st.ads[n.ID()] = struct{}{}
+	}
+	rs.mu.Unlock()
+}
+
+// ReachRec is one searcher's reach record for a single registrar.
+type ReachRec struct {
+	Reg        enode.ID
+	FirstCycle int
+	NQueries   int
+	NDistinct  int
+}
+
+// ReachData returns the sampled per-searcher per-registrar reach stats.
+func ReachData() map[enode.ID][]ReachRec {
+	out := make(map[enode.ID][]ReachRec)
+	reachData.Range(func(k, v any) bool {
+		rs := v.(*reachSet)
+		rs.mu.Lock()
+		l := make([]ReachRec, 0, len(rs.regs))
+		for reg, st := range rs.regs {
+			l = append(l, ReachRec{reg, st.firstCycle, st.nQueries, len(st.ads)})
+		}
+		rs.mu.Unlock()
+		out[k.(enode.ID)] = l
+		return true
+	})
+	return out
 }
 
 // NewSearch creates a new topic search state.
@@ -68,6 +190,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		topic:       topic,
 		resultSeen:  make(map[enode.ID]struct{}),
 		bucketCheck: make(map[int]struct{}, searchTableDepth),
+		origin:      make(map[enode.ID]bool),
 	}
 	dist := 256
 	for i := range s.buckets {
@@ -100,7 +223,11 @@ func (s *Search) IsDone() bool {
 		}
 	}
 	// No unasked nodes remain and no results are buffered: the search is
-	// done. There is no more nodes to query.
+	// done. There is no more nodes to query. Sample per-bucket occupancy.
+	for i := range s.buckets {
+		provBucketOcc[i].Add(int64(s.buckets[i].count()))
+	}
+	provBucketSamples.Add(1)
 	return true
 }
 
@@ -132,12 +259,17 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
 
-		if b.contains(id) || b.count() >= s.cfg.SearchBucketSize {
+		if b.contains(id) {
+			continue
+		}
+		if b.count() >= s.cfg.SearchBucketSize {
+			provRejectFull.Add(1)
 			continue
 		}
 		// Apply one-per-bucket rule.
 		if src != nil {
 			if _, ok := s.bucketCheck[bi]; ok {
+				provRejectOnePerBucket.Add(1)
 				s.cfg.Log.Debug("Ignoring search node", "id", n.ID(), "reason", "one-per-bucket-rule")
 				continue
 			}
@@ -146,12 +278,24 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		// Apply IP restriction.
 		ip := n.IP()
 		if ip != nil && !netutil.IsLAN(ip) && !b.ips.Add(n.IP()) {
+			provRejectIP.Add(1)
 			s.cfg.Log.Debug("Ignoring search node", "id", n.ID(), "reason", "iplimit")
 			continue
 		}
 
 		// All checks passed, add the node.
 		b.new[id] = n
+		if src == nil {
+			provAddedDHT.Add(1)
+			if _, ok := s.origin[id]; !ok {
+				s.origin[id] = false
+			}
+		} else {
+			provAddedReferral.Add(1)
+			if _, ok := s.origin[id]; !ok {
+				s.origin[id] = true
+			}
+		}
 	}
 }
 
@@ -212,7 +356,10 @@ func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 	b := s.bucket(from.ID())
 	b.setAsked(from)
 	b.numRequests++
+	recordReach(s.cfg.Self, from.ID(), s.cycle, results)
 
+	referral := s.origin[from.ID()]
+	newAds := 0
 	for _, n := range results {
 		if n.ID() == s.cfg.Self {
 			continue
@@ -222,7 +369,15 @@ func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 		if !seen {
 			s.resultSeen[n.ID()] = struct{}{}
 			s.resultBuffer = append(s.resultBuffer, n)
+			newAds++
 		}
+	}
+	if referral {
+		provQueriedReferral.Add(1)
+		provAdsReferral.Add(int64(newAds))
+	} else {
+		provQueriedDHT.Add(1)
+		provAdsDHT.Add(int64(newAds))
 	}
 }
 

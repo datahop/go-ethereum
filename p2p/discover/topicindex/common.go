@@ -41,6 +41,11 @@ type Config struct {
 	// Search settings.
 	SearchBucketSize int // number of nodes in search buckets
 
+	// Testbed/simnet knobs. Inert at their defaults (protocol behaves as
+	// without them); exposed so the simnet harness can set them.
+	MaxNodesPerSourcePerBucket int  // max nodes accepted from one source into one bucket (0/1 == the #50 cap)
+	RemoveOnExpiry             bool // on ad expiry, remove the registration instead of renewing
+
 	// These settings are exposed for testing purposes.
 	Clock mclock.Clock
 	Log   log.Logger

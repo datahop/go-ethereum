@@ -1292,7 +1292,36 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 }
 
 // handleTopicQuery serves TOPICQUERY messages.
+// topicQueryRcv counts TOPICQUERY messages received per node (keyed by the
+// receiving node's ID). Testbed per-registrar query-load instrumentation; off
+// by default to avoid global-mutex contention on the hot query path.
+var (
+	topicQueryRcvMu sync.Mutex
+	topicQueryRcv   = make(map[enode.ID]int64)
+	tqRcvOn         bool
+)
+
+// EnableTQRcv turns on per-node TOPICQUERY-received counting.
+func EnableTQRcv() { tqRcvOn = true }
+
+func bumpTopicQueryRcv(id enode.ID) {
+	if !tqRcvOn {
+		return
+	}
+	topicQueryRcvMu.Lock()
+	topicQueryRcv[id]++
+	topicQueryRcvMu.Unlock()
+}
+
+// TopicQueryRcvCount returns how many TOPICQUERY messages the node received.
+func TopicQueryRcvCount(id enode.ID) int64 {
+	topicQueryRcvMu.Lock()
+	defer topicQueryRcvMu.Unlock()
+	return topicQueryRcv[id]
+}
+
 func (t *UDPv5) handleTopicQuery(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.TopicQuery) {
+	bumpTopicQueryRcv(t.Self().ID())
 	// Collect closest nodes to topic hash.
 	auxNodes := t.collectTopicAuxNodes(p.Topic, p.Buckets, fromAddr.Addr())
 	auxResponses := packNodeRecords(auxNodes)
