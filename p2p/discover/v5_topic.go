@@ -326,14 +326,18 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			sendAttemptCh = nil
 
 		case resp := <-reg.regResponse:
+			if resp.err == errClosed {
+				// We cancelled the call during shutdown; the registrar's
+				// liveness is unknown, so don't treat it as a failure.
+				continue
+			}
 			if len(resp.nodes) > 0 {
 				reg.state.AddNodes(resp.att.Node, filterTopicDiscovery(resp.nodes))
 			}
 			if resp.err != nil {
 				reg.state.HandleErrorResponse(resp.att, resp.err)
 				// A timed-out registrar is dead: drop any ads it has stored
-				// with us too. Only timeouts are a liveness signal — errClosed
-				// means we cancelled the call ourselves.
+				// with us too. Only timeouts are a liveness signal.
 				if resp.err == errTimeout {
 					sys.transport.evictTopicTableNode(resp.att.Node.ID())
 				}
@@ -515,19 +519,22 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 
 		case queryCh <- nextQuery:
 		case resp := <-s.queryRespCh:
-			if resp.err != nil && len(resp.topicNodes)+len(resp.auxNodes) == 0 {
+			switch {
+			case resp.err == errClosed:
+				// We cancelled the query during shutdown; the node's
+				// liveness is unknown, so don't treat it as a failure.
+			case resp.err != nil && len(resp.topicNodes)+len(resp.auxNodes) == 0:
 				// The queried node did not respond at all: drop it from the
 				// search table. A response that delivered some nodes before
 				// erroring (e.g. a multi-packet response that timed out
-				// halfway) still counts as a response below.
+				// halfway) still counts as a response.
 				state.HandleErrorResponse(resp.src, resp.err)
 				// A timed-out node is dead: drop any ads it has stored with
-				// us too. Only timeouts are a liveness signal — errClosed
-				// means we cancelled the call ourselves.
+				// us too. Only timeouts are a liveness signal.
 				if resp.err == errTimeout {
 					sys.transport.evictTopicTableNode(resp.src.ID())
 				}
-			} else {
+			default:
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 				state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
 			}
