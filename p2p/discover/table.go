@@ -763,10 +763,7 @@ func (tab *Table) allNodes() []*enode.Node {
 	return nodes
 }
 
-// collectOnePerDist collects one node per requested distance from the table,
-// where distance means logdist(target, n) — the distance to the topic/target,
-// not to the local node (#55). Callers must keep len(distances) within the
-// desired response node limit, since at most one node is returned per distance.
+// collectOnePerDist collects one node per requested distance for the target node id from the table.
 func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check func(*enode.Node) bool) []*enode.Node {
 	tab.mutex.Lock()
 	defer tab.mutex.Unlock()
