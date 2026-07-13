@@ -41,6 +41,9 @@ type topicSystem struct {
 	quit chan struct{}
 }
 
+// EnableReach turns on topicindex reach sampling (testbed bottleneck analysis).
+func EnableReach() { topicindex.EnableReach() }
+
 func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 	sys := &topicSystem{
 		transport: transport,
@@ -463,6 +466,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 	defer s.closeDown()
 
 	time := mclock.AbsTime(-1)
+	searchCycle := 0
 	for {
 		if time >= 0 {
 			if exit := s.pause(time); exit {
@@ -472,6 +476,8 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		time = s.config.Clock.Now()
 
 		state := topicindex.NewSearch(s.topic, s.config)
+		state.SetCycle(searchCycle)
+		searchCycle++
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
