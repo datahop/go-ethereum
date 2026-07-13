@@ -70,11 +70,10 @@ func TestTopicDHTEvictionEvictsAd(t *testing.T) {
 	})
 }
 
-// TestTopicEvictNodeRemovesRegistration checks that a global liveness signal
-// (evictNode, as raised by a failed TOPICQUERY in the search loop) removes the
-// node from a registration table, not just from the ad cache. Two nodes are
-// registered so that evicting one keeps the registration session running
-// (NodeCount stays > 0) rather than restarting and re-seeding from the table.
+// TestTopicEvictNodeRemovesRegistration checks that evictNode (raised by a
+// failed TOPICQUERY) removes the node from a registration table, not just the
+// ad cache. Two nodes are registered so evicting one keeps NodeCount > 0 and
+// the session from restarting and re-seeding the evicted node from the table.
 func TestTopicEvictNodeRemovesRegistration(t *testing.T) {
 	t.Parallel()
 	test := newUDPV5Test(t)
