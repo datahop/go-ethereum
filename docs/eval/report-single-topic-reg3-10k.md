@@ -29,10 +29,6 @@ Registration is healthy and complete — **all 10,000 ads placed, well-replicate
 
 ![registrations per registrant](figures-reg3fix-single/reg1_A_replication.png)
 
-**B — registrar load (ads held per registrar).** Most registrars hold a modest number of ads; the registrars closest to the topic id hold the most.
-
-![registrar load](figures-reg3fix-single/reg1_B_load.png)
-
 **D — registrations per registrar across ID-space.** Load concentrates sharply at the topic id; the closest registrars carry the heaviest load.
 
 ![registrations across ID-space](figures-reg3fix-single/reg1_D_idspace.png)

@@ -28,10 +28,6 @@ Registration is healthy and complete — **all ads placed, well-replicated, none
 
 ![registrations per registrant, by topic](figures-5top-reg3-spread/reg5_A_replication.png)
 
-**B — registrar load (ads held per registrar), by topic.** Load scales with topic size; the closest registrars to each topic id hold the most.
-
-![registrar load, by topic](figures-5top-reg3-spread/reg5_B_load.png)
-
 **D — registrations per registrar across ID-space, by topic.** Each topic's load concentrates at its own id; with spread topic IDs the five funnels are separate.
 
 ![registrations across ID-space, by topic](figures-5top-reg3-spread/reg5_D_idspace.png)
