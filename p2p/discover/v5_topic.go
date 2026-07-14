@@ -53,9 +53,8 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 	return sys
 }
 
-// evictRemovedNodes evicts nodes dropped by the DHT routing table (#21) from the
-// ad cache and registration tables, which have no timely liveness probe of their
-// own. Search tables are excluded: they are short-lived and self-cleaning.
+// evictRemovedNodes evicts nodes dropped by the DHT routing table from the
+// ad cache and registration tables.
 func (sys *topicSystem) evictRemovedNodes() {
 	defer sys.wg.Done()
 	removed := make(chan enode.ID, 1024)
