@@ -22,7 +22,21 @@
 
 ## Registration
 
-Registration is healthy and complete — **all ads placed, none unplaced, neverFound = 0** across all five topics. With spread topic IDs, each topic occupies its own keyspace region, so there is no inter-topic registrar contention.
+Registration is healthy and complete — **all ads placed, well-replicated, none unplaced, neverFound = 0** across all five topics. With spread topic IDs, each topic occupies its own keyspace region, so there is no inter-topic registrar contention.
+
+**A — registrations per registrant (fan-out), by topic.** Every ad is placed and well-replicated on each topic.
+
+![registrations per registrant, by topic](figures-5top-reg3-spread/reg5_A_replication.png)
+
+**B — registrar load (ads held per registrar), by topic.** Load scales with topic size; the closest registrars to each topic id hold the most.
+
+![registrar load, by topic](figures-5top-reg3-spread/reg5_B_load.png)
+
+**D — registrations per registrar across ID-space, by topic.** Each topic's load concentrates at its own id; with spread topic IDs the five funnels are separate.
+
+![registrations across ID-space, by topic](figures-5top-reg3-spread/reg5_D_idspace.png)
+
+Registration is complete and healthy across all topics — it was never the bottleneck.
 
 ## Search results
 
@@ -51,7 +65,9 @@ node mapped to *its own* topic via the registrant manifest (all 10,000 mapped), 
 an instrumented re-run (`-overhead-out`, integration build = `topdisc` +
 #71/#81/#83/#84). This is the follow-up the prior version promised (the earlier
 run's dump exceeded the teardown watchdog before writing `overhead.json`; the grace
-is now 90 min and the metrics compacted). Four per-node inbound/traffic views:
+is now 90 min and the metrics compacted). Figures are shown as per-node **rates**
+(cumulative counters ÷ the ~68-min active run); the summary table is cumulative.
+Four per-node inbound/traffic views:
 
 ### 1. Queries received (TOPICQUERY)
 

@@ -23,19 +23,21 @@ Every one of the 10,000 registrants is discovered by at least one searcher, and 
 
 ## Registration
 
-Registration is healthy and complete — **all 10,000 ads placed, none unplaced, neverFound = 0**. Every registrant is discovered by at least one searcher. With `reg-bucket-size=3` the fan-out (distinct registrars holding each ad) is a lean **median 13** (min 3, max 39) — fewer active slots per bucket than reg-10's ~46, by design.
+Registration is healthy and complete — **all 10,000 ads placed, well-replicated, no ad unplaced, neverFound = 0**. Every registrant is discovered by at least one searcher.
 
-**Fan-out and per-host load.** (a) how many registrars hold each ad; (b) how many ads each registrar holds for the topic.
+**A — registrations per registrant (fan-out).** Every ad is placed and well-replicated across distinct registrars.
 
-![fan-out and per-host load](figures-reg3fix-single/06_fanout_both_views.png)
+![registrations per registrant](figures-reg3fix-single/reg1_A_replication.png)
 
-**Registrants across ID-space.** Admitted registrars concentrate around the topic id.
+**B — registrar load (ads held per registrar).** Most registrars hold a modest number of ads; the registrars closest to the topic id hold the most.
 
-![registrants across ID-space](figures-reg3fix-single/04_id_space_registrants.png)
+![registrar load](figures-reg3fix-single/reg1_B_load.png)
 
-**Registration latency.** Mean ± 1σ time to first remote admission (~310 s).
+**D — registrations per registrar across ID-space.** Load concentrates sharply at the topic id; the closest registrars carry the heaviest load.
 
-![registration latency](figures-reg3fix-single/07_registration_latency_bar.png)
+![registrations across ID-space](figures-reg3fix-single/reg1_D_idspace.png)
+
+Registration is complete and healthy — it was never the bottleneck.
 
 ## Search results
 
@@ -81,8 +83,9 @@ Within logdist 250 of the topic there are only ~80 registrars; beyond it, thousa
 Per-node traffic across the ID space (`logdist(topic, node)`; lower = closer to the
 topic, ~half the nodes at logdist 256 at the far end), from an instrumented re-run
 of this config (`-overhead-out`, integration build = `topdisc` + #71/#81/#83/#84).
-It **measures the topic-center funnel directly**. Four per-node inbound/traffic
-views:
+It **measures the topic-center funnel directly**. Figures are shown as per-node
+**rates** (cumulative counters ÷ the ~68-min active run = bootstrap + register +
+search); the summary table is cumulative. Four per-node inbound/traffic views:
 
 ### 1. Queries received (TOPICQUERY)
 
