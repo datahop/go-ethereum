@@ -23,7 +23,19 @@ Every one of the 10,000 registrants is discovered by at least one searcher, and 
 
 ## Registration
 
-Registration is healthy and complete — **all 10,000 ads placed, none unplaced, neverFound = 0**. Every registrant is discovered by at least one searcher.
+Registration is healthy and complete — **all 10,000 ads placed, none unplaced, neverFound = 0**. Every registrant is discovered by at least one searcher. With `reg-bucket-size=3` the fan-out (distinct registrars holding each ad) is a lean **median 13** (min 3, max 39) — fewer active slots per bucket than reg-10's ~46, by design.
+
+**Fan-out and per-host load.** (a) how many registrars hold each ad; (b) how many ads each registrar holds for the topic.
+
+![fan-out and per-host load](figures-reg3fix-single/06_fanout_both_views.png)
+
+**Registrants across ID-space.** Admitted registrars concentrate around the topic id.
+
+![registrants across ID-space](figures-reg3fix-single/04_id_space_registrants.png)
+
+**Registration latency.** Mean ± 1σ time to first remote admission (~310 s).
+
+![registration latency](figures-reg3fix-single/07_registration_latency_bar.png)
 
 ## Search results
 
@@ -64,25 +76,57 @@ The dip at the topic ID is a **structural funnel**, not a coverage failure. Reac
 
 Within logdist 250 of the topic there are only ~80 registrars; beyond it, thousands. Every searcher queries the ~5 closest registrars, but each exposes only ~10 distinct ads — their tables are admission-capped (`WaitTime` grows as `AdLifetime / occupancy¹⁰`, plus `AdCacheSize` / `RegBucketSize` limits). A registrant at the topic center therefore depends on this thin, capacity-limited funnel and is replicated/surfaced far less than one served by the vast far region. **No node is ever down or unresponsive** — it is pure capacity concentration at the topic ID.
 
-## Overhead across the ID space
+## Overhead
 
-Per-node traffic was captured in an instrumented re-run of this exact config (`-overhead-out`, integration build = `topdisc` + #71/#81/#83/#84), binned by `logdist(topic, node)` (lower logdist = closer to the topic; ~half the nodes sit at logdist 256, the far end). It **measures the topic-center funnel directly**:
+Per-node traffic across the ID space (`logdist(topic, node)`; lower = closer to the
+topic, ~half the nodes at logdist 256 at the far end), from an instrumented re-run
+of this config (`-overhead-out`, integration build = `topdisc` + #71/#81/#83/#84).
+It **measures the topic-center funnel directly**. Four per-node inbound/traffic
+views:
+
+### 1. Queries received (TOPICQUERY)
+
+![queries received across ID space](figures-overhead/1top_queries_received.png)
+
+TOPICQUERYs received peak in the logdist 250–251 band (~24k per node) and then *ease*
+toward the very closest nodes — the one-per-source-per-bucket rule caps how many
+searchers query the single nearest registrar, spreading query load into a band.
+
+### 2. Registrations received (REGTOPIC)
+
+> ⚠️ **Not yet captured.** Needs a per-node REGTOPIC-received counter; re-instrumentation
+> + re-run pending.
+
+### 3. Ads received
+
+> ⚠️ **Not yet captured.** Ads stored per registrar is derivable from `metrics.json`
+> (`byHost`), and ad records received on the wire needs a counter; pending.
+
+### 4. Total bytes sent / received
+
+![bytes sent/received across ID space](figures-overhead/1top_bytes_sent_received.png)
+
+Byte load rises monotonically toward the topic: the near-topic registrars (logdist
+246–250) **send ~80–170 MB** each versus ~3.7 MB for the far majority — a **~45×
+skew** driven purely by ID-space proximity. Received bytes rise similarly (to
+~90–100 MB at the closest). The closest nodes are the biggest referral hubs, so
+byte volume keeps climbing even where query *count* eases.
+
+**Summary table:**
 
 | logdist | nNodes | tx MB | rx MB | TQ rcv |
 |---:|---:|---:|---:|---:|
 | 256 (far) | 5087 | 3.7 | 6.9 | 394 |
-| 254 | 1249 | 7.7 | 7.5 | 1,612 |
 | 252 | 320 | 23.3 | 9.7 | 6,329 |
 | 250 | 65 | 82.9 | 17.8 | 23,591 |
-| 248 | 24 | 68.8 | 16.4 | 19,141 |
 | 247 | 14 | 86.5 | 31.0 | 16,516 |
 | 246 | 3 | 167.8 | 97.8 | 11,384 |
 | 242 (closest) | 1 | 129.8 | 95.8 | 6,613 |
 | **ALL** | **10000** | **7.6** | **7.5** | **1,500** |
 
-![overhead across ID space (blue = this single-topic run)](figures-overhead/overhead_idspace_1top_5top.png)
-
-The near-topic registrars (logdist 246–250) send **~80–170 MB** and field **~12k–24k TOPICQUERYs** each, versus ~3.7 MB / ~400 for the far majority — a **~45× byte skew** driven purely by ID-space proximity. TOPICQUERYs-received peak in the 250–251 band and then ease at the very closest nodes (the one-per-source-per-bucket rule spreads queries off the single nearest node), while byte volume keeps climbing (the closest nodes are the biggest referral hubs). This is the *same* thin, capacity-capped funnel the recall dip exposes, now measured in bytes: the ~80 registrars within logdist 250 of the topic are both the **recall bottleneck** and the **traffic hotspot**.
+This is the *same* thin, capacity-capped funnel the recall dip exposes, now measured
+in traffic: the ~80 registrars within logdist 250 of the topic are both the **recall
+bottleneck** and the **traffic hotspot**.
 
 ## Conclusion
 

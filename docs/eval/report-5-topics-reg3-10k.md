@@ -44,25 +44,55 @@ The only visible residual is on **t0**, the largest topic (4,544 members), confi
 
 The `meanDup` gradient across topics confirms the picture: t0 has the lowest duplicate rate (6.6) and the smaller topics the highest (t4 = 34.5) — the small topics are fully drained/over-searched, while t0 is the only one with any reach headroom left.
 
-## Overhead across the ID space
+## Overhead
 
-Per-node traffic was captured in an instrumented re-run of this exact config (`-overhead-out`, integration build = `topdisc` + #71/#81/#83/#84), binned by `logdist(own-topic, node)` — each node mapped to *its own* topic via the registrant manifest (all 10,000 mapped). This is the follow-up the prior version promised (the earlier run's dump exceeded the teardown watchdog before writing `overhead.json`; the grace has since been raised to 90 min and the metrics compacted):
+Per-node traffic across the ID space, binned by `logdist(own-topic, node)` — each
+node mapped to *its own* topic via the registrant manifest (all 10,000 mapped), from
+an instrumented re-run (`-overhead-out`, integration build = `topdisc` +
+#71/#81/#83/#84). This is the follow-up the prior version promised (the earlier
+run's dump exceeded the teardown watchdog before writing `overhead.json`; the grace
+is now 90 min and the metrics compacted). Four per-node inbound/traffic views:
+
+### 1. Queries received (TOPICQUERY)
+
+![queries received across ID space](figures-overhead/5top_queries_received.png)
+
+TOPICQUERYs received rise toward the topic (~22k at the closest), staying high — no
+fall-off at the very closest bin (the funnels are shallower with spread IDs).
+
+### 2. Registrations received (REGTOPIC)
+
+> ⚠️ **Not yet captured.** Needs a per-node REGTOPIC-received counter; re-instrumentation
+> + re-run pending.
+
+### 3. Ads received
+
+> ⚠️ **Not yet captured.** Ads stored per registrar is derivable from `metrics.json`
+> (`byHost`), and ad records received on the wire needs a counter; pending.
+
+### 4. Total bytes sent / received
+
+![bytes sent/received across ID space](figures-overhead/5top_bytes_sent_received.png)
+
+Far-from-own-topic nodes send ~10 MB (vs ~3.7 MB single-topic) because they are close
+to — and register for — *other* topics; the near-topic peak is lower (~94 MB vs
+~170 MB). The far/near byte skew flattens from ~45× to **~9×**.
+
+**Summary table:**
 
 | logdist | nNodes | tx MB | rx MB | TQ rcv |
 |---:|---:|---:|---:|---:|
 | 256 (far) | 4990 | 10.3 | 10.0 | 2,929 |
-| 254 | 1222 | 7.2 | 9.7 | 1,870 |
 | 252 | 284 | 11.3 | 10.1 | 3,225 |
 | 250 | 100 | 25.6 | 11.2 | 8,031 |
 | 249 | 40 | 53.3 | 15.1 | 17,151 |
 | 247 | 13 | 71.5 | 18.5 | 20,412 |
-| 246 | 9 | 61.4 | 21.6 | 16,430 |
 | 242 (closest) | 1 | 94.3 | 22.2 | 21,621 |
 | **ALL** | **10000** | **10.1** | **10.0** | **2,867** |
 
-![overhead across ID space (orange = this 5-topic run, own-topic distance)](figures-overhead/overhead_idspace_1top_5top.png)
-
-**Multi-topic spreads the load.** A node far from its own topic is still close to some *other* topic, so the periphery is not idle: far-from-own-topic nodes send ~10 MB (vs ~3.7 MB in the single-topic run) and the near-topic peak is lower (~94 MB vs ~170 MB). The far/near byte skew flattens from ~45× (single topic) to **~9×**, at a ~35% higher average per-node load (10.1 vs 7.6 MB). This is the traffic-side view of the recall result: because topic IDs are spread, each topic's funnel is separate and shallower, so no single node is as hot as in the single-topic case — consistent with the shallower recall dip (t0 = 98.6% vs single-topic 96%).
+**Multi-topic spreads the load** — because topic IDs are spread, each topic's funnel
+is separate and shallower, so no single node is as hot as single-topic (consistent
+with the shallower recall dip, t0 = 98.6% vs single-topic 96%):
 
 | | far node (ld 256) tx | closest node tx | mean tx / node | skew |
 |---|---:|---:|---:|---:|
