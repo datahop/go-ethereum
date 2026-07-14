@@ -214,10 +214,8 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
-// RemoveNode drops a dead node's registration attempt. Attempts can sit
-// unprobed for a long time (Standby never contacted, Registered only at ad
-// expiry), so an external liveness signal is needed to evict them. An in-flight
-// attempt (index == -2) is left for its pending response (or timeout) to remove.
+// RemoveNode drops a dead node's registration attempt. An in-flight attempt
+// (index == -2) is left for its pending response to remove.
 func (r *Registration) RemoveNode(id enode.ID) {
 	b := &r.buckets[r.bucketIndex(id)]
 	att, ok := b.att[id]
@@ -227,7 +225,7 @@ func (r *Registration) RemoveNode(id enode.ID) {
 	if att.index == -2 {
 		return
 	}
-	r.removeAttempt(att, "dht-eviction")
+	r.removeAttempt(att, "evicted")
 	r.refillAttempts(b)
 }
 
