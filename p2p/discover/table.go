@@ -770,7 +770,6 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check fun
 
 	// Build the set of still-wanted distances. Each is dropped once filled.
 	want := make(map[uint]struct{}, len(distances))
-	var nodes []*enode.Node
 	for _, dist := range distances {
 		if dist == 0 || dist > 256 {
 			continue
@@ -780,20 +779,19 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check fun
 
 	// Single pass over the table: take the first checked node at each wanted
 	// distance and drop that distance so it is filled only once.
-	for bi := range tab.buckets {
-		if len(want) == 0 {
-			break
-		}
+	var nodes []*enode.Node
+loop:
+	for bi := 0; bi < len(tab.buckets) && len(want) > 0; bi++ {
 		for _, n := range tab.buckets[bi].entries {
+			if len(want) == 0 {
+				break loop
+			}
 			d := uint(enode.LogDist(target, n.ID()))
 			if _, ok := want[d]; !ok || !check(n.Node) {
 				continue
 			}
 			nodes = append(nodes, n.Node)
 			delete(want, d)
-			if len(want) == 0 {
-				break
-			}
 		}
 	}
 	return nodes
