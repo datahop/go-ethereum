@@ -40,10 +40,10 @@ func waitForCond(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for: %s", what)
 }
 
-// TestTopicDHTEvictionEvictsAd checks the #21 hook: when the DHT routing table
-// evicts a node, that node's ads are removed from the local ad cache too. The
-// ad cache needs this signal because advertisers are never the target of topic
-// RPCs, so it cannot observe their liveness itself.
+// TestTopicDHTEvictionEvictsAd checks that when the DHT routing table evicts a
+// node, that node's ads are removed from the local ad cache too. The ad cache
+// needs this signal because advertisers are never the target of topic RPCs, so
+// it cannot observe their liveness itself.
 func TestTopicDHTEvictionEvictsAd(t *testing.T) {
 	test := newUDPV5Test(t)
 	defer test.close()
