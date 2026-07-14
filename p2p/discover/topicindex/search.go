@@ -156,8 +156,7 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 }
 
 // HandleErrorResponse drops a failed node from the table, freeing its slot and
-// IP-limit entry. The failure is not counted as a response, so the bucket stays
-// unwarmed and QueryTarget keeps preferring its remaining candidates.
+// IP-limit entry.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
 	s.removeNode(from.ID())
