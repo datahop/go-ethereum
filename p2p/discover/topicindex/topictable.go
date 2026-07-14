@@ -34,10 +34,17 @@ import (
 const (
 	occupancyExp = 10
 
-	// waitTimeG is the paper's §6 safety floor: a positive baseline in the wait
-	// modifiers so a fresh registrant still owes a seconds-order wait, not ~0
-	// (~4.5s empty-table at the default 15-min AdLifetime).
-	waitTimeG = 0.05
+	// waitBaseModifier scales the occupancy-driven base wait (paper's E factor,
+	// tuned down 10x for the testbed).
+	waitBaseModifier = 0.1
+
+	// waitTimeFloor is the paper's §6 safety floor G, expressed as a real
+	// duration: the minimum wait a fresh registrant owes at an empty table (both
+	// modifiers ~0). G is derived from it as waitTimeFloor / (waitBaseModifier *
+	// AdLifetime) so the floor is this duration regardless of AdLifetime. Set
+	// above topicTableWaitTimeFloor (the 1s admission slack) so it actually
+	// applies; ~1s effective wait after that slack. Scales up with occupancy.
+	waitTimeFloor = 2 * time.Second
 )
 
 // If a node has less than this time to wait, they will be accepted anyway.
@@ -235,8 +242,7 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	// baseTime is the required wait-time, purely based on occupancy. When occupancy is
 	// near 1.0 (i.e. the table is empty), baseTime is AdLifetime/10. As the table gets
 	// fuller, baseTime goes up and will eventually exceed AdLifetime.
-	baseModifier := 0.1
-	baseTime := baseModifier * tab.config.AdLifetime.Seconds() / math.Pow(occupancy, occupancyExp)
+	baseTime := waitBaseModifier * tab.config.AdLifetime.Seconds() / math.Pow(occupancy, occupancyExp)
 
 	// topicMod changes the waiting time based on the ratio of registrations in the
 	// requested topic vs. all topics.
@@ -245,7 +251,10 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	// ipMod changes the waiting time based on IP address diversity.
 	ipMod := tab.wt.ipModifier(n)
 
-	neededTime := baseTime * (topicMod + ipMod + waitTimeG)
+	// g is the §6 safety floor, derived so the empty-table floor equals
+	// waitTimeFloor independent of AdLifetime (AdLifetime cancels baseTime).
+	g := waitTimeFloor.Seconds() / (waitBaseModifier * tab.config.AdLifetime.Seconds())
+	neededTime := baseTime * (topicMod + ipMod + g)
 	computed := time.Duration(math.Ceil(neededTime * float64(time.Second)))
 
 	// Apply the §6 anti-gaming lower bound: a re-quote can't drop below the
