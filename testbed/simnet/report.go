@@ -77,8 +77,9 @@ func writeMetrics(path string, results []searchResult, target int, regCoverage r
 		return
 	}
 	defer f.Close()
+	// Compact (no indent): the 10k per-searcher found sets make this file
+	// multi-GB; pretty-printing ~doubles size and write time.
 	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
 	if err := enc.Encode(out); err != nil {
 		fmt.Fprintf(os.Stderr, "metrics: encode: %v\n", err)
 	}
