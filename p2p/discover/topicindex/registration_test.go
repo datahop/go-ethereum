@@ -317,10 +317,8 @@ func TestRegistrationExpiry(t *testing.T) {
 	}
 }
 
-// TestRegistrationRemoveNode verifies the DHT-eviction hook: RemoveNode drops
-// a parked attempt (Waiting or Registered, before its ad expires) and frees
-// the slot for a standby replacement, is a no-op for unknown nodes, and
-// leaves an attempt with an in-flight request untouched.
+// TestRegistrationRemoveNode checks that RemoveNode drops a parked attempt but
+// leaves an in-flight one for its pending response.
 func TestRegistrationRemoveNode(t *testing.T) {
 	cfg := testConfig(t)
 	r := NewRegistration(topic1, cfg)
