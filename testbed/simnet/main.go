@@ -81,7 +81,9 @@ func main() {
 	// are minutes at 10k), plus bootstrap-wait, register-wait and the full
 	// search-timeout — then an 8-minute grace for teardown.
 	n := time.Duration(*nodes)
-	hardCap := n*(*spawnDelay) + *bootstrapWait + n*(*registerStagger) + *registerWait + *searchTimeout + 20*time.Minute
+	// 90-min teardown grace: at 10k the metrics.json write (per-searcher found
+	// sets) can take many minutes; 20 min was too tight and truncated it.
+	hardCap := n*(*spawnDelay) + *bootstrapWait + n*(*registerStagger) + *registerWait + *searchTimeout + 90*time.Minute
 	go func() {
 		time.Sleep(hardCap)
 		fmt.Printf("absolute watchdog (%s) expired; force-exiting\n", hardCap)
