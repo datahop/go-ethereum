@@ -34,8 +34,9 @@ type topicSystem struct {
 	transport *UDPv5
 	config    topicindex.Config
 
-	mu  sync.Mutex
-	reg map[topicindex.TopicID]*topicReg
+	mu     sync.Mutex
+	reg    map[topicindex.TopicID]*topicReg
+	search map[*topicSearch]struct{}
 }
 
 func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
@@ -43,6 +44,7 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 		transport: transport,
 		config:    config,
 		reg:       make(map[topicindex.TopicID]*topicReg),
+		search:    make(map[*topicSearch]struct{}),
 	}
 }
 
@@ -68,11 +70,22 @@ func (sys *topicSystem) stopRegister(topic topicindex.TopicID) {
 
 func (sys *topicSystem) stop() {
 	sys.mu.Lock()
-	defer sys.mu.Unlock()
-
 	for topic, reg := range sys.reg {
 		reg.stop()
 		delete(sys.reg, topic)
+	}
+	// Snapshot the live searches and drop them from the map, then stop them
+	// outside the lock: topicSearch.stop waits for goroutines to exit, and a
+	// concurrent iterator Close takes sys.mu via removeSearch.
+	searches := make([]*topicSearch, 0, len(sys.search))
+	for s := range sys.search {
+		searches = append(searches, s)
+		delete(sys.search, s)
+	}
+	sys.mu.Unlock()
+
+	for _, s := range searches {
+		s.stop()
 	}
 }
 
@@ -82,7 +95,17 @@ func (sys *topicSystem) newSearchIterator(topic topicindex.TopicID, opid uint64)
 
 	resultCh := make(chan *enode.Node, 200)
 	s := newTopicSearch(sys, topic, resultCh, opid)
+	sys.search[s] = struct{}{}
 	return newTopicSearchIterator(sys, s, resultCh)
+}
+
+// removeSearch drops a search from the tracked set. It is called when a search
+// iterator is closed by its consumer, so a search that is already finished is
+// not stopped a second time on shutdown.
+func (sys *topicSystem) removeSearch(s *topicSearch) {
+	sys.mu.Lock()
+	delete(sys.search, s)
+	sys.mu.Unlock()
 }
 
 // topicReg handles registering for a single topic.
@@ -291,8 +314,9 @@ type topicSearch struct {
 	opid   uint64
 	config topicindex.Config
 
-	wg   sync.WaitGroup
-	quit chan struct{}
+	wg       sync.WaitGroup
+	quit     chan struct{}
+	stopOnce sync.Once
 
 	queryCh     chan topicQueryJob
 	queryRespCh chan topicQueryResult
@@ -323,8 +347,11 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 	return s
 }
 
+// stop signals the search goroutines to exit and waits for them. It is safe to
+// call more than once and from multiple goroutines: the iterator's Close and
+// topicSystem.stop can both reach it during shutdown.
 func (s *topicSearch) stop() {
-	close(s.quit)
+	s.stopOnce.Do(func() { close(s.quit) })
 	s.wg.Wait()
 }
 
@@ -486,7 +513,10 @@ func (tsi *topicSearchIterator) Node() *enode.Node {
 }
 
 func (tsi *topicSearchIterator) Close() {
-	tsi.closing.Do(tsi.search.stop)
+	tsi.closing.Do(func() {
+		tsi.search.stop()
+		tsi.sys.removeSearch(tsi.search)
+	})
 }
 
 // filterTopicDiscovery returns only the nodes that advertise a supported
