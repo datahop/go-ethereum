@@ -28,6 +28,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"math"
@@ -114,6 +115,10 @@ type UDPv5 struct {
 	activeCallByNode map[enode.ID]*callV5
 	activeCallByAuth map[v5wire.Nonce]*callV5
 	callQueue        map[enode.ID][]*callV5
+
+	// traffic breakdown (testbed instrumentation); accessed on dispatch goroutine
+	sendCat trafCat
+	traffic trafficCounters
 
 	// shutdown stuff
 	closeOnce      sync.Once
@@ -902,6 +907,11 @@ func (t *UDPv5) send(toID enode.ID, toAddr netip.AddrPort, packet v5wire.Packet,
 	}
 
 	_, err = t.conn.WriteToUDPAddrPort(enc, toAddr)
+	if trafficOn {
+		dc := t.catSend(packet)
+		dc.outB.Add(int64(len(enc)))
+		dc.outP.Add(1)
+	}
 	t.log.Trace(">> "+packet.Name(), t.logcontext...)
 	return nonce, err
 }
@@ -961,6 +971,11 @@ func (t *UDPv5) handlePacket(rawpacket []byte, fromAddr netip.AddrPort) error {
 	if fromNode != nil {
 		// Handshake succeeded, add to table.
 		t.tab.addInboundNode(fromNode)
+	}
+	if trafficOn {
+		dc := t.catRecv(packet, fromID)
+		dc.inB.Add(int64(len(rawpacket)))
+		dc.inP.Add(1)
 	}
 	if packet.Kind() != v5wire.WhoareyouPacket {
 		// WHOAREYOU logged separately to report errors.
@@ -1225,6 +1240,8 @@ func packNodeRecords(nodes []*enode.Node) [][]*enr.Record {
 
 // handleRegtopic serves REGTOPIC messages.
 func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.Regtopic) {
+	t.sendCat = catReg
+	defer func() { t.sendCat = catOther }()
 	ticket, err := t.ticketSealer.Unpack(p.Topic, p.Ticket)
 	if err != nil {
 		t.log.Debug("Invalid ticket in REGTOPIC/v5", "id", fromID, "addr", fromAddr, "err", err)
@@ -1320,8 +1337,126 @@ func TopicQueryRcvCount(id enode.ID) int64 {
 	return topicQueryRcv[id]
 }
 
+// ── Per-node, per-message-type traffic breakdown (testbed instrumentation) ──
+//
+// Counts bytes/packets sent and received per message type, so registration and
+// search traffic (each incl. their aux NODES packets) can be separated across
+// the ID space. NODES packets are attributed by context: on send, the topic
+// handler sets sendCat; on receive, by the pending call's request type. Off by
+// default (hot path); enabled via EnableTraffic.
+
+var trafficOn bool
+
+// EnableTraffic turns on the per-message-type traffic breakdown.
+func EnableTraffic() { trafficOn = true }
+
+type trafCat int
+
+const (
+	catOther trafCat = iota
+	catReg
+	catSearch
+)
+
+type dirCounter struct{ inB, outB, inP, outP atomic.Int64 }
+
+type trafficCounters struct {
+	regtopic, regconfirm, regaux      dirCounter // registration
+	topicquery, topicnodes, searchaux dirCounter // search
+	findnode, nodes, ping, pong, misc dirCounter // rest
+}
+
+// catSend returns the counter for an outgoing packet. NODES use sendCat (set by
+// the topic handlers) to separate reg-aux / search-aux / plain findnode NODES.
+func (t *UDPv5) catSend(p v5wire.Packet) *dirCounter {
+	switch p.(type) {
+	case *v5wire.Regtopic:
+		return &t.traffic.regtopic
+	case *v5wire.Regconfirmation:
+		return &t.traffic.regconfirm
+	case *v5wire.TopicQuery:
+		return &t.traffic.topicquery
+	case *v5wire.TopicNodes:
+		return &t.traffic.topicnodes
+	case *v5wire.Findnode:
+		return &t.traffic.findnode
+	case *v5wire.Ping:
+		return &t.traffic.ping
+	case *v5wire.Pong:
+		return &t.traffic.pong
+	case *v5wire.Nodes:
+		switch t.sendCat {
+		case catReg:
+			return &t.traffic.regaux
+		case catSearch:
+			return &t.traffic.searchaux
+		}
+		return &t.traffic.nodes
+	default:
+		return &t.traffic.misc
+	}
+}
+
+// catRecv returns the counter for an incoming packet. NODES are attributed to
+// the pending call's request type (REGTOPIC→reg-aux, TOPICQUERY→search-aux).
+func (t *UDPv5) catRecv(p v5wire.Packet, fromID enode.ID) *dirCounter {
+	switch p.(type) {
+	case *v5wire.Regtopic:
+		return &t.traffic.regtopic
+	case *v5wire.Regconfirmation:
+		return &t.traffic.regconfirm
+	case *v5wire.TopicQuery:
+		return &t.traffic.topicquery
+	case *v5wire.TopicNodes:
+		return &t.traffic.topicnodes
+	case *v5wire.Findnode:
+		return &t.traffic.findnode
+	case *v5wire.Ping:
+		return &t.traffic.ping
+	case *v5wire.Pong:
+		return &t.traffic.pong
+	case *v5wire.Nodes:
+		if ac := t.activeCallByNode[fromID]; ac != nil {
+			switch ac.packet.(type) {
+			case *v5wire.Regtopic:
+				return &t.traffic.regaux
+			case *v5wire.TopicQuery:
+				return &t.traffic.searchaux
+			}
+		}
+		return &t.traffic.nodes
+	default:
+		return &t.traffic.misc
+	}
+}
+
+// TrafficBreakdown returns this node's per-message-type in/out bytes+packets.
+func (t *UDPv5) TrafficBreakdown() map[string]int64 {
+	out := map[string]int64{}
+	add := func(name string, c *dirCounter) {
+		out[name+"_inB"] = c.inB.Load()
+		out[name+"_outB"] = c.outB.Load()
+		out[name+"_inP"] = c.inP.Load()
+		out[name+"_outP"] = c.outP.Load()
+	}
+	add("regtopic", &t.traffic.regtopic)
+	add("regconfirm", &t.traffic.regconfirm)
+	add("regaux", &t.traffic.regaux)
+	add("topicquery", &t.traffic.topicquery)
+	add("topicnodes", &t.traffic.topicnodes)
+	add("searchaux", &t.traffic.searchaux)
+	add("findnode", &t.traffic.findnode)
+	add("nodes", &t.traffic.nodes)
+	add("ping", &t.traffic.ping)
+	add("pong", &t.traffic.pong)
+	add("misc", &t.traffic.misc)
+	return out
+}
+
 func (t *UDPv5) handleTopicQuery(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.TopicQuery) {
 	bumpTopicQueryRcv(t.Self().ID())
+	t.sendCat = catSearch
+	defer func() { t.sendCat = catOther }()
 	// Collect closest nodes to topic hash.
 	auxNodes := t.collectTopicAuxNodes(p.Topic, p.Buckets, fromAddr.Addr())
 	auxResponses := packNodeRecords(auxNodes)

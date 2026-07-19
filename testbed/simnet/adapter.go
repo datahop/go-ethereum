@@ -37,20 +37,21 @@ func registerConn(c *simUDPConn) {
 }
 
 // dumpOverhead writes per-node sent/received packet and byte counts to path.
-func dumpOverhead(path string, tqByIdx map[int]int64, idByIdx map[int]string) {
+func dumpOverhead(path string, tqByIdx map[int]int64, idByIdx map[int]string, trafByIdx map[int]map[string]int64) {
 	type rec struct {
-		Idx     int    `json:"idx"`
-		ID      string `json:"id"`
-		TxPkts  int64  `json:"txPkts"`
-		TxBytes int64  `json:"txBytes"`
-		RxPkts  int64  `json:"rxPkts"`
-		RxBytes int64  `json:"rxBytes"`
-		TQRcv   int64  `json:"tqRcv"`
+		Idx     int              `json:"idx"`
+		ID      string           `json:"id"`
+		TxPkts  int64            `json:"txPkts"`
+		TxBytes int64            `json:"txBytes"`
+		RxPkts  int64            `json:"rxPkts"`
+		RxBytes int64            `json:"rxBytes"`
+		TQRcv   int64            `json:"tqRcv"`
+		Traffic map[string]int64 `json:"traffic,omitempty"` // per-message-type in/out bytes+pkts
 	}
 	connRegistryMu.Lock()
 	recs := make([]rec, 0, len(connRegistry))
 	for _, c := range connRegistry {
-		recs = append(recs, rec{c.idx, idByIdx[c.idx], c.txPkts.Load(), c.txBytes.Load(), c.rxPkts.Load(), c.rxBytes.Load(), tqByIdx[c.idx]})
+		recs = append(recs, rec{c.idx, idByIdx[c.idx], c.txPkts.Load(), c.txBytes.Load(), c.rxPkts.Load(), c.rxBytes.Load(), tqByIdx[c.idx], trafByIdx[c.idx]})
 	}
 	connRegistryMu.Unlock()
 	f, err := os.Create(path)

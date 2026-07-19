@@ -64,6 +64,7 @@ func main() {
 	}
 	if *overheadOutFlag != "" {
 		discover.EnableTQRcv()
+		discover.EnableTraffic()
 	}
 	snapshotDir = *snapshotDirFlag
 	nodeSearchBucketSize = *searchBucketSize
@@ -194,11 +195,15 @@ func main() {
 	if *overheadOutFlag != "" {
 		tqByIdx := make(map[int]int64, len(all))
 		idByIdx := make(map[int]string, len(all))
+		trafByIdx := make(map[int]map[string]int64, len(all))
 		for _, nr := range all {
 			tqByIdx[nr.idx] = discover.TopicQueryRcvCount(nr.ln.ID())
 			idByIdx[nr.idx] = nr.ln.ID().String()
+			if nr.disc != nil {
+				trafByIdx[nr.idx] = nr.disc.TrafficBreakdown()
+			}
 		}
-		dumpOverhead(*overheadOutFlag, tqByIdx, idByIdx)
+		dumpOverhead(*overheadOutFlag, tqByIdx, idByIdx, trafByIdx)
 		fmt.Printf("overhead written to: %s\n", *overheadOutFlag)
 	}
 	fmt.Println("teardown complete")
