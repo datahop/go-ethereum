@@ -56,29 +56,17 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 	return sys
 }
 
-// evictRemovedNodes evicts nodes dropped by the DHT routing table (#21) from
-// the topic state that cannot find out on its own in reasonable time:
-//
-//   - the local ad cache, which has no liveness probe at all — advertisers are
-//     never the target of topic RPCs. (Its other cleanup signal is a topic RPC
-//     timeout observed by a registration or search loop, which evicts the
-//     failed node's ads directly.)
-//   - the registration tables, whose attempts can sit unprobed for a long time
-//     (Standby nodes are never contacted, Registered ones only at ad expiry).
-//
-// The search tables are left out: search state is short-lived and every node
-// in it is queried within seconds, so its own failure handling
-// (Search.HandleErrorResponse) is fast enough.
+// evictRemovedNodes evicts nodes dropped by the DHT routing table from the
+// ad cache and registration tables.
 func (sys *topicSystem) evictRemovedNodes() {
 	defer sys.wg.Done()
 	removed := make(chan enode.ID, 1024)
 	sub := sys.transport.tab.subscribeRemovedNodes(removed)
 	defer sub.Unsubscribe()
 
-	// removedFeed is sent under the table lock, so `removed` must be drained even
-	// while the blocking eviction work is busy, or the feed backs up under the
-	// lock and deadlocks loops that call tab.allNodes(). A worker does the work;
-	// forward to it and drop if it falls behind — eviction is best-effort.
+	// removedFeed is sent under the table lock, so `removed` must keep draining
+	// while eviction runs, or the feed backs up under the lock. Do the blocking
+	// work on a separate worker; drop if it falls behind (best-effort).
 	work := make(chan enode.ID, 1024)
 	sys.wg.Add(1)
 	go func() {
@@ -108,7 +96,7 @@ func (sys *topicSystem) evictRemovedNodes() {
 }
 
 // evictNode removes a dead node's ads and its parked attempts in every reg
-// table. It can block, so it must not run on the goroutine draining removedFeed.
+// table. It can block, so it must not run on the feed-draining goroutine.
 func (sys *topicSystem) evictNode(id enode.ID) {
 	sys.transport.evictTopicTableNode(id)
 	sys.mu.Lock()

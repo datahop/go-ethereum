@@ -170,11 +170,8 @@ func TestSearchAddNodesOnePerBucketRule(t *testing.T) {
 	}
 }
 
-// TestSearchHandleErrorResponse verifies that a failed topic query drops the
-// queried node from the table — freeing its bucket slot and IP-limit entry so
-// a replacement at the same /24 can be added — without counting as a response:
-// the bucket keeps gating the walk while it has candidates, is skipped once
-// they all fail, and a search whose nodes all fail becomes done.
+// TestSearchHandleErrorResponse checks that a failed topic query drops the
+// queried node from the table and frees its bucket slot and IP-limit entry.
 func TestSearchHandleErrorResponse(t *testing.T) {
 	config := testConfig(t)
 	s := NewSearch(topic1, config)
