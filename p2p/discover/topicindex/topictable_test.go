@@ -146,34 +146,34 @@ func TestTopicTableWaitTimeLowerBound(t *testing.T) {
 		t.Fatalf("expected empty table after expiry, got %d entries", tab.all.Len())
 	}
 
-	// A genuinely fresh outsider now gets a near-zero wait (nothing to
+	// A genuinely fresh outsider now gets only the small G floor (nothing to
 	// lower-bound). It must be in a different /24 than n, since the bound
 	// aggregates per /24.
 	fresh := nodeAtDistance(enode.ID(topic1), 100, net.IP{198, 51, 100, 2})
-	if wf := tab.WaitTime(fresh, topic1); wf > time.Second {
-		t.Fatalf("fresh node should see a tiny wait on an empty table, got %v", wf)
+	if wf := tab.WaitTime(fresh, topic1); wf > 5*time.Second {
+		t.Fatalf("fresh node should see only the small floor on an empty table, got %v", wf)
 	}
 
-	// The previously-quoted node must NOT be reset to that tiny wait. Its quote
-	// may only have decayed by the elapsed time (AdLifetime).
+	// The previously-quoted node must NOT be reset to the floor. Its quote may
+	// only have decayed by the elapsed time (AdLifetime).
 	w2 := tab.WaitTime(n, topic1)
 	t.Log("re-quoted wait after dip", w2)
 	if lb := w1 - cfg.AdLifetime; w2 < lb {
 		t.Fatalf("lower bound violated: w2=%v < w1-elapsed=%v", w2, lb)
 	}
-	if w2 <= time.Second {
-		t.Fatalf("incumbent reset to a tiny wait through the occupancy dip: %v", w2)
+	if w2 <= 5*time.Second {
+		t.Fatalf("incumbent reset to the floor through the occupancy dip: %v", w2)
 	}
 
 	// Decay to completion: once timestamp+value has passed, the bound is dropped
-	// and the node is quoted the (now tiny) instantaneous wait again.
+	// and the node is quoted only the small floor again.
 	clock.Run(w2 + time.Second)
 	tab.Expire()
 	if got := len(tab.wt.idBounds) + len(tab.wt.ipBounds); got != 0 {
 		t.Fatalf("expected all lower-bound tuples expired, got %d", got)
 	}
-	if w3 := tab.WaitTime(n, topic1); w3 > time.Second {
-		t.Fatalf("expected tiny wait after the bound fully decayed, got %v", w3)
+	if w3 := tab.WaitTime(n, topic1); w3 > 5*time.Second {
+		t.Fatalf("expected only the small floor after the bound fully decayed, got %v", w3)
 	}
 }
 
@@ -209,11 +209,11 @@ func TestTopicTableWaitTimeBoundPrefix(t *testing.T) {
 			tab.Expire()
 
 			// A node in the same prefix inherits the still-active bound.
-			if w := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, samePrefix), topic1); w <= time.Second {
+			if w := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, samePrefix), topic1); w <= 5*time.Second {
 				t.Errorf("same-prefix node was not bounded: got %v", w)
 			}
-			// A node in a different prefix is unaffected.
-			if w := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, otherPrefix), topic1); w > time.Second {
+			// A node in a different prefix is unaffected (only the small floor).
+			if w := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, otherPrefix), topic1); w > 5*time.Second {
 				t.Errorf("different-prefix node was bounded: got %v", w)
 			}
 		})
@@ -226,22 +226,30 @@ func TestTopicTableWaitTimeBoundPrefix(t *testing.T) {
 }
 
 // TestTopicTableWaitTimeFloor checks the paper §6 safety floor G: a fresh
-// registrant on an empty table (both modifiers ~0) still owes a seconds-order
-// wait, above the admission slack, instead of the ~0 the modifiers alone give.
+// registrant on an empty table (both modifiers ~0) owes ~waitTimeFloor, above
+// the admission slack, and — since G is derived as waitTimeFloor/(baseMod*
+// AdLifetime) — the floor is that duration independent of AdLifetime.
 func TestTopicTableWaitTimeFloor(t *testing.T) {
-	cfg := Config{
-		AdCacheSize: 100,
-		AdLifetime:  15 * time.Minute,
-		Clock:       new(mclock.Simulated),
-		Log:         testlog.Logger(t, log.LvlTrace),
-	}
-	tab := NewTopicTable(cfg)
+	for _, adLifetime := range []time.Duration{15 * time.Minute, time.Hour, 30 * time.Second} {
+		cfg := Config{
+			AdCacheSize: 100,
+			AdLifetime:  adLifetime,
+			Clock:       new(mclock.Simulated),
+			Log:         testlog.Logger(t, log.LvlTrace),
+		}
+		tab := NewTopicTable(cfg)
 
-	n := nodeAtDistance(enode.ID(topic1), 100, net.IP{203, 0, 113, 1})
-	w := tab.WaitTime(n, topic1)
-	t.Log("floor wait", w)
-	if w <= topicTableWaitTimeFloor {
-		t.Fatalf("fresh registrant wait %v does not exceed the admission slack %v", w, topicTableWaitTimeFloor)
+		n := nodeAtDistance(enode.ID(topic1), 100, net.IP{203, 0, 113, 1})
+		w := tab.WaitTime(n, topic1)
+		t.Logf("adLifetime=%v floor wait=%v", adLifetime, w)
+		if w <= topicTableWaitTimeFloor {
+			t.Fatalf("adLifetime=%v: fresh registrant wait %v does not exceed the admission slack %v",
+				adLifetime, w, topicTableWaitTimeFloor)
+		}
+		// AdLifetime-independent: the empty-table floor is ~waitTimeFloor.
+		if w < waitTimeFloor || w > waitTimeFloor+time.Second {
+			t.Fatalf("adLifetime=%v: floor %v not ~waitTimeFloor %v", adLifetime, w, waitTimeFloor)
+		}
 	}
 }
 
