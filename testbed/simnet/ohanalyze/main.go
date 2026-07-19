@@ -84,7 +84,7 @@ func writeTrafficCSV(path string, bins map[int]*agg, tot *agg) {
 		return
 	}
 	defer f.Close()
-	fmt.Fprint(f, "logdist,nNodes,txB,rxB")
+	fmt.Fprint(f, "logdist,nNodes,txB,rxB,txP,rxP")
 	for _, k := range keys {
 		fmt.Fprint(f, ","+k)
 	}
@@ -97,7 +97,7 @@ func writeTrafficCSV(path string, bins map[int]*agg, tot *agg) {
 	for _, d := range lds {
 		a := bins[d]
 		n := float64(a.n)
-		fmt.Fprintf(f, "%d,%d,%.1f,%.1f", d, a.n, float64(a.txb)/n, float64(a.rxb)/n)
+		fmt.Fprintf(f, "%d,%d,%.1f,%.1f,%.2f,%.2f", d, a.n, float64(a.txb)/n, float64(a.rxb)/n, float64(a.txp)/n, float64(a.rxp)/n)
 		for _, k := range keys {
 			fmt.Fprintf(f, ",%.1f", float64(a.traf[k])/n)
 		}
