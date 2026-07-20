@@ -21,6 +21,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -32,6 +33,18 @@ import (
 // wait time computation constants.
 const (
 	occupancyExp = 10
+
+	// waitBaseModifier scales the occupancy-driven base wait (paper's E factor,
+	// tuned down 10x for the testbed).
+	waitBaseModifier = 0.1
+
+	// waitTimeFloor is the paper's §6 safety floor G, expressed as a real
+	// duration: the minimum wait a fresh registrant owes at an empty table (both
+	// modifiers ~0). G is derived from it as waitTimeFloor / (waitBaseModifier *
+	// AdLifetime) so the floor is this duration regardless of AdLifetime. Set
+	// above topicTableWaitTimeFloor (the 1s admission slack) so it actually
+	// applies; ~1s effective wait after that slack. Scales up with occupancy.
+	waitTimeFloor = 2 * time.Second
 )
 
 // If a node has less than this time to wait, they will be accepted anyway.
@@ -154,6 +167,10 @@ func (tab *TopicTable) Expire() {
 		tab.wt.removeReg(reg)
 		e = next
 	}
+	// Drop lower-bound tuples that have fully decayed. They only matter while a
+	// registrant is actively waiting, so this keeps the maps from growing
+	// unboundedly with churn.
+	tab.wt.expireBounds(now)
 }
 
 // isRegistered reports whether n is currently registered for topic t.
@@ -240,8 +257,7 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	// baseTime is the required wait-time, purely based on occupancy. When occupancy is
 	// near 1.0 (i.e. the table is empty), baseTime is AdLifetime/10. As the table gets
 	// fuller, baseTime goes up and will eventually exceed AdLifetime.
-	baseModifier := 0.1
-	baseTime := baseModifier * tab.config.AdLifetime.Seconds() / math.Pow(occupancy, occupancyExp)
+	baseTime := waitBaseModifier * tab.config.AdLifetime.Seconds() / math.Pow(occupancy, occupancyExp)
 
 	// topicMod changes the waiting time based on the ratio of registrations in the
 	// requested topic vs. all topics.
@@ -250,8 +266,16 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	// ipMod changes the waiting time based on IP address diversity.
 	ipMod := tab.wt.ipModifier(n)
 
-	neededTime := baseTime * math.Max(topicMod+ipMod, 0.000001)
-	return time.Duration(math.Ceil(neededTime * float64(time.Second)))
+	// g is the §6 safety floor, derived so the empty-table floor equals
+	// waitTimeFloor independent of AdLifetime (AdLifetime cancels baseTime).
+	g := waitTimeFloor.Seconds() / (waitBaseModifier * tab.config.AdLifetime.Seconds())
+	neededTime := baseTime * (topicMod + ipMod + g)
+	computed := time.Duration(math.Ceil(neededTime * float64(time.Second)))
+
+	// Apply the §6 anti-gaming lower bound: a re-quote can't drop below the
+	// prior quote by more than the elapsed time, so an incumbent can't reset its
+	// accumulated wait through a brief occupancy dip.
+	return tab.wt.lowerBound(n, t, computed, tab.config.Clock.Now())
 }
 
 // Register adds node n for topic t if it has waited long enough.
@@ -292,12 +316,147 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 type waitTimeState struct {
 	ipv4 *ipTree
 	ipv6 *ipTree
+
+	// Lower-bound anti-gaming state (§6 / spec §2.1.5): per active registrant, the
+	// last wait quoted and when. idBounds keys by (topic, id); ipBounds by
+	// (topic, IP prefix) so ID rotation from one address can't evade it.
+	idBounds map[idBoundKey]waitBound
+	ipBounds map[ipBoundKey]waitBound
+}
+
+// idBoundKey keys the per-(topic, advertiser id) lower bound.
+type idBoundKey struct {
+	topic TopicID
+	id    enode.ID
+}
+
+// ipBoundKey keys the per-(topic, IP-prefix) lower bound. The prefix is stored
+// in its canonical string form so v4 and v6 addresses share one map.
+type ipBoundKey struct {
+	topic TopicID
+	ip    string
+}
+
+// waitBound is a (value, timestamp) lower-bound tuple.
+type waitBound struct {
+	value time.Duration
+	time  mclock.AbsTime
+}
+
+// floor returns the lower bound on the wait time at 'now', decayed by the real
+// time elapsed since the bound was recorded: bound - (now - timestamp).
+func (b waitBound) floor(now mclock.AbsTime) time.Duration {
+	return b.value - time.Duration(now.Sub(b.time))
+}
+
+// expired reports whether the bound has fully decayed and can be dropped.
+func (b waitBound) expired(now mclock.AbsTime) bool {
+	return b.floor(now) <= 0
 }
 
 func newWaitTimeState() waitTimeState {
 	return waitTimeState{
-		ipv4: newIPTree(32),
-		ipv6: newIPTree(128),
+		ipv4:     newIPTree(32),
+		ipv6:     newIPTree(128),
+		idBounds: make(map[idBoundKey]waitBound),
+		ipBounds: make(map[ipBoundKey]waitBound),
+	}
+}
+
+// lowerBound raises 'computed' to the highest still-active bound for n's
+// (topic, id) and (topic, IP) keys, then records the result as the new bound so
+// a later re-quote can't drop faster than real elapsed time.
+func (wt *waitTimeState) lowerBound(n *enode.Node, t TopicID, computed time.Duration, now mclock.AbsTime) time.Duration {
+	result := computed
+
+	idKey := idBoundKey{topic: t, id: n.ID()}
+	if b, ok := wt.idBounds[idKey]; ok {
+		if f := b.floor(now); f > result {
+			result = f
+		}
+	}
+
+	ipKeys := wt.ipBoundKeys(t, n)
+	for _, k := range ipKeys {
+		if b, ok := wt.ipBounds[k]; ok {
+			if f := b.floor(now); f > result {
+				result = f
+			}
+		}
+	}
+
+	// Record the (possibly raised) result as the new bound.
+	nb := waitBound{value: result, time: now}
+	wt.idBounds[idKey] = nb
+	for _, k := range ipKeys {
+		wt.ipBounds[k] = nb
+	}
+	return result
+}
+
+// The per-IP bound aggregates by prefix so it can't be evaded by rotating
+// addresses within one allocation: /24 for v4 (matching regBucketSubnet), /64
+// for v6 per docs/disc-ng-ipv6-policy.md §3.2 (#53). Transition-address
+// re-routing is deferred to #54.
+const (
+	waitBoundPrefix4 = 24
+	waitBoundPrefix6 = 64
+)
+
+// ipBoundKeys returns the per-IP lower-bound keys for n, one per address family,
+// each aggregated to its prefix.
+func (wt *waitTimeState) ipBoundKeys(t TopicID, n *enode.Node) []ipBoundKey {
+	var (
+		ip4  enr.IPv4
+		ip6  enr.IPv6
+		keys []ipBoundKey
+	)
+	if n.Load(&ip4) == nil {
+		if k, ok := ipBoundKeyFor(t, net.IP(ip4)); ok {
+			keys = append(keys, k)
+		}
+	}
+	if n.Load(&ip6) == nil {
+		if k, ok := ipBoundKeyFor(t, net.IP(ip6)); ok {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+// ipBoundKeyFor builds the bound key for ip, aggregated to its family's prefix
+// (/24 for v4, /64 for v6). It reports ok=false for LAN or malformed addresses.
+func ipBoundKeyFor(t TopicID, ip net.IP) (ipBoundKey, bool) {
+	if ip == nil || netutil.IsLAN(ip) {
+		return ipBoundKey{}, false
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return ipBoundKey{}, false
+	}
+	addr = addr.Unmap()
+	bits := waitBoundPrefix6
+	if addr.Is4() {
+		bits = waitBoundPrefix4
+	}
+	prefix, err := addr.Prefix(bits)
+	if err != nil {
+		return ipBoundKey{}, false
+	}
+	return ipBoundKey{topic: t, ip: prefix.String()}, true
+}
+
+// expireBounds drops lower-bound tuples that have fully decayed at 'now'.
+func (wt *waitTimeState) expireBounds(now mclock.AbsTime) {
+	for k, b := range wt.idBounds {
+		if b.expired(now) {
+			delete(wt.idBounds, k)
+		}
+	}
+	for k, b := range wt.ipBounds {
+		if b.expired(now) {
+			delete(wt.ipBounds, k)
+		}
 	}
 }
 
