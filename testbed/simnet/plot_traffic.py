@@ -15,13 +15,14 @@ DUR = float(sys.argv[4]) if len(sys.argv) > 4 else 4080.0
 rows = list(csv.DictReader(open(path)))
 xs = [int(r["logdist"]) for r in rows]
 
-# internal key -> real protocol message name
+# internal key -> real protocol message name (topic messages only; the aux NODES
+# are labelled by the response they ride on).
 NAME = {
-    "regtopic": "REGTOPIC", "regconfirm": "REGCONFIRMATION", "regaux": "NODES (reg-aux)",
-    "topicquery": "TOPICQUERY", "topicnodes": "TOPICNODES", "searchaux": "NODES (search-aux)",
-    "findnode": "FINDNODE", "nodes": "NODES (findnode)", "ping": "PING", "pong": "PONG",
+    "regtopic": "REGTOPIC", "regconfirm": "REGCONFIRMATION", "regaux": "NODES (REGTOPIC resp)",
+    "topicquery": "TOPICQUERY", "topicnodes": "TOPICNODES", "searchaux": "NODES (TOPICQUERY resp)",
 }
 TYPES = list(NAME.keys())
+OTHER = ["findnode", "nodes", "ping", "pong"]  # DHT + liveness (uniform background)
 REG = ["regtopic", "regconfirm", "regaux"]
 SEA = ["topicquery", "topicnodes", "searchaux"]
 
@@ -52,6 +53,8 @@ for unit, ylabel, tag in (("B", "KB per node / s", "bytes"), ("P", "packets per 
     for ax, d, dtag in ((axes[0], "_in" + unit, "received"), (axes[1], "_out" + unit, "sent")):
         for i, t in enumerate(TYPES):
             ax.plot(xs, [val(r, t + d, unit) for r in rows], "o-", color=cmap(i % 10), ms=3, label=NAME[t])
+        ax.plot(xs, [sum(val(r, o + d, unit) for o in OTHER) for r in rows], "--", color="#999",
+                ms=0, label="other (DHT/liveness)")
         ax.set_title(dtag); base(ax, ylabel); ax.legend(fontsize=8, ncol=2)
     fig.suptitle(f"{label}: {tag} per node by message type vs ID-space distance", fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.94]); fig.savefig(f"{prefix}_types_{tag}.png", dpi=130); plt.close(fig)
