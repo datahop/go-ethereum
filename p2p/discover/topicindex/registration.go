@@ -214,16 +214,14 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
-// RemoveNode drops the parked registration attempt of a node evicted as dead —
-// attempts no active probe would otherwise clean (a Standby node is never
-// contacted, a Registered one only re-probed at ad expiry). An in-flight
-// attempt (index == -2) is left for its pending response to remove.
+// RemoveNode drops registration attempts of a node evicted as dead
 func (r *Registration) RemoveNode(id enode.ID) {
 	b := &r.buckets[r.bucketIndex(id)]
 	att, ok := b.att[id]
 	if !ok {
 		return
 	}
+	//An in-flight attempt (index == -2) is left for its pending response to remove.
 	if att.index == -2 {
 		return
 	}
