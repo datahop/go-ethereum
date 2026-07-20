@@ -53,47 +53,27 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 	return sys
 }
 
-// evictRemovedNodes evicts nodes dropped by the DHT routing table from the
-// ad cache and registration tables.
+// evictRemovedNodes evicts nodes dropped by the DHT routing table from the ad
+// cache and registration tables. The removal feed is sent under the table lock,
+// so the channel is sized to the table's capacity — it can hold every node the
+// table could evict, so the feed never blocks under the lock.
 func (sys *topicSystem) evictRemovedNodes() {
 	defer sys.wg.Done()
-	removed := make(chan enode.ID, 1024)
+	removed := make(chan enode.ID, bucketSize*nBuckets)
 	sub := sys.transport.tab.subscribeRemovedNodes(removed)
 	defer sub.Unsubscribe()
-
-	// removedFeed is sent under the table lock, so `removed` must keep draining
-	// while eviction runs, or the feed backs up under the lock. Do the blocking
-	// work on a separate worker; drop if it falls behind (best-effort).
-	work := make(chan enode.ID, 1024)
-	sys.wg.Add(1)
-	go func() {
-		defer sys.wg.Done()
-		for {
-			select {
-			case <-sys.quit:
-				return
-			case id := <-work:
-				sys.evictNode(id)
-			}
-		}
-	}()
 
 	for {
 		select {
 		case <-sys.quit:
 			return
 		case id := <-removed:
-			select {
-			case work <- id:
-			default:
-				sys.config.Log.Debug("Dropped topic eviction, worker behind", "id", id)
-			}
+			sys.evictNode(id)
 		}
 	}
 }
 
-// evictNode removes a dead node's ads and its parked attempts in every reg
-// table. It can block, so it must not run on the feed-draining goroutine.
+// evictNode removes a dead node's ads and its parked attempts in every reg table.
 func (sys *topicSystem) evictNode(id enode.ID) {
 	sys.transport.evictTopicTableNode(id)
 	sys.mu.Lock()
@@ -161,8 +141,8 @@ type topicReg struct {
 	regRequest  chan topicRegJob
 	regResponse chan topicRegResult
 
-	// evictCh delivers node IDs dropped by the DHT, to be removed from the
-	// registration table.
+	// evictCh delivers IDs of dead nodes (DHT routing-table removals and search
+	// query timeouts) to be removed from the registration table.
 	evictCh chan enode.ID
 
 	// controlCh runs a function on the registration loop goroutine, which owns
@@ -175,7 +155,8 @@ type topicReg struct {
 }
 
 // evict requests removal of a node from the registration table. It is called
-// from the topic system's DHT-removal goroutine (evictRemovedNodes).
+// from the topic system's eviction path (evictNode), fed by DHT removals and
+// search query timeouts.
 func (reg *topicReg) evict(id enode.ID) {
 	select {
 	case reg.evictCh <- id:
