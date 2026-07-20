@@ -54,9 +54,7 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 }
 
 // evictRemovedNodes evicts nodes dropped by the DHT routing table from the ad
-// cache and registration tables. The removal feed is sent under the table lock,
-// so the channel is sized to the table's capacity — it can hold every node the
-// table could evict, so the feed never blocks under the lock.
+// cache and registration tables.
 func (sys *topicSystem) evictRemovedNodes() {
 	defer sys.wg.Done()
 	removed := make(chan enode.ID, bucketSize*nBuckets)
@@ -73,7 +71,7 @@ func (sys *topicSystem) evictRemovedNodes() {
 	}
 }
 
-// evictNode removes a dead node's ads and its parked attempts in every reg table.
+// evictNode removes a dead node's ads and its reg attempts in every reg table.
 func (sys *topicSystem) evictNode(id enode.ID) {
 	sys.transport.evictTopicTableNode(id)
 	sys.mu.Lock()
