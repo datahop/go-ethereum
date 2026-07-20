@@ -545,6 +545,11 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 					sys.evictNode(resp.src.ID())
 				}
 			default:
+				if resp.err != nil {
+					// Partial response: nodes arrived before the error, so the
+					// node counts as responsive and is kept. Still log the error.
+					s.config.Log.Debug("TOPICQUERY/v5 failed", "topic", s.topic, "id", resp.src.ID(), "err", resp.err)
+				}
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 				state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
 			}
