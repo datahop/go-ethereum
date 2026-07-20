@@ -143,10 +143,6 @@ type topicReg struct {
 	// query timeouts) to be removed from the registration table.
 	evictCh chan enode.ID
 
-	// controlCh runs a function on the registration loop goroutine, which owns
-	// reg.state. Used for goroutine-safe introspection (testing).
-	controlCh chan func()
-
 	// nodes subscription
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -162,18 +158,6 @@ func (reg *topicReg) evict(id enode.ID) {
 	}
 }
 
-// nodeCount returns the number of nodes in the registration table. It runs on
-// the registration loop goroutine to avoid racing with state mutation.
-func (reg *topicReg) nodeCount() int {
-	res := make(chan int, 1)
-	select {
-	case reg.controlCh <- func() { res <- reg.state.NodeCount() }:
-		return <-res
-	case <-reg.quit:
-		return 0
-	}
-}
-
 func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topicReg {
 	reg := &topicReg{
 		state:       topicindex.NewRegistration(topic, sys.config),
@@ -183,7 +167,6 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 		regRequest:  make(chan topicRegJob),
 		regResponse: make(chan topicRegResult),
 		evictCh:     make(chan enode.ID, 64),
-		controlCh:   make(chan func()),
 	}
 
 	// Set up the subscription for new main table nodes.
@@ -253,8 +236,6 @@ func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
 				// Drain the channel to avoid blocking the Table's feed sender.
 			case id := <-reg.evictCh:
 				reg.state.RemoveNode(id)
-			case fn := <-reg.controlCh:
-				fn()
 			case <-reg.quit:
 				return true
 			}
@@ -301,9 +282,6 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			if sendAttemptCh != nil && nextAttempt.node.ID() == id {
 				sendAttemptCh = nil
 			}
-
-		case fn := <-reg.controlCh:
-			fn()
 
 		case <-updateCh:
 			attempt := reg.state.Update()
