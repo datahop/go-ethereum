@@ -214,6 +214,21 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
+// RemoveNode drops registration attempts of a node evicted as dead
+func (r *Registration) RemoveNode(id enode.ID) {
+	b := &r.buckets[r.bucketIndex(id)]
+	att, ok := b.att[id]
+	if !ok {
+		return
+	}
+	//An in-flight attempt (index == -2) is left for its pending response to remove.
+	if att.index == -2 {
+		return
+	}
+	r.removeAttempt(att, "evicted")
+	r.refillAttempts(b)
+}
+
 func (r *Registration) setAttemptState(att *RegAttempt, state RegAttemptState) {
 	att.bucket.count[att.State]--
 	att.bucket.count[state]++
