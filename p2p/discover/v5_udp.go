@@ -1231,6 +1231,13 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 		t.log.Debug("Node record in REGTOPIC/v5 does not match id", "id", fromID, "addr", fromAddr)
 		return
 	}
+	// The record's advertised endpoint must match the packet source. Otherwise a
+	// peer could register an ad pointing at a third party and redirect searchers
+	// there (amplification vector).
+	if n.IPAddr().Unmap() != fromAddr.Addr().Unmap() || n.UDP() != int(fromAddr.Port()) {
+		t.log.Debug("Node record in REGTOPIC/v5 endpoint does not match source", "id", fromID, "addr", fromAddr, "enrip", n.IPAddr(), "enrport", n.UDP())
+		return
+	}
 
 	// Compute total wait time.
 	now := t.clock.Now()
