@@ -229,6 +229,37 @@ func TestRegistrationIPCheck(t *testing.T) {
 	}
 }
 
+// TestRegistrationIPCheckOnRecordUpdate checks that when an already-known node
+// presents a newer record with a different endpoint, the per-bucket IP-limit
+// tracker is kept consistent, so the update can't be used to slip a second
+// address from the same subnet into the bucket.
+func TestRegistrationIPCheckOnRecordUpdate(t *testing.T) {
+	cfg := testConfig(t)
+	r := NewRegistration(topic1, cfg)
+
+	// node1 registers with an address in subnet A.
+	node1 := nodeAtDistance(enode.ID(topic1), 200, net.IP{192, 0, 2, 1})
+	r.AddNodes(nil, []*enode.Node{node1})
+	if r.NodeCount() != 1 {
+		t.Fatalf("expected 1 node after initial add, got %d", r.NodeCount())
+	}
+
+	// node1 presents a newer record that moves it to subnet B. The tracker must
+	// release subnet A and now count subnet B.
+	node1b := nodeWithSeq(node1.ID(), net.IP{198, 51, 100, 1}, node1.Seq()+1)
+	r.AddNodes(nil, []*enode.Node{node1b})
+
+	// A different node in subnet B must now be rejected: subnet B already holds
+	// node1's slot. Before the fix the tracker still counted subnet A, so this
+	// second subnet-B node was wrongly admitted.
+	node2 := nodeAtDistance(enode.ID(topic1), 200, net.IP{198, 51, 100, 2})
+	r.AddNodes(nil, []*enode.Node{node2})
+
+	if r.NodeCount() != 1 {
+		t.Fatalf("subnet limit bypassed on record update: got %d nodes, want 1", r.NodeCount())
+	}
+}
+
 // This test checks that registration attempts are created for found nodes.
 func TestRegistrationRequests(t *testing.T) {
 	cfg := testConfig(t)
@@ -412,6 +443,15 @@ func nodeAtDistance(base enode.ID, ld int, ip net.IP) *enode.Node {
 	var r enr.Record
 	r.Set(enr.IP(ip))
 	return enode.SignNull(&r, randomID(base, ld))
+}
+
+// nodeWithSeq creates a node with an explicit ID, IP and sequence number. It is
+// used to simulate a node re-advertising itself with a newer record.
+func nodeWithSeq(id enode.ID, ip net.IP, seq uint64) *enode.Node {
+	var r enr.Record
+	r.Set(enr.IP(ip))
+	r.SetSeq(seq)
+	return enode.SignNull(&r, id)
 }
 
 func intIP(i int) net.IP {

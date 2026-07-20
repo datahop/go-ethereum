@@ -174,6 +174,28 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			// There is already an attempt scheduled with this node.
 			// Update the record if newer.
 			if attempt.Node.Seq() < n.Seq() {
+				// If the newer record moves the node to a different endpoint,
+				// keep the bucket's IP-limit tracker consistent and re-check the
+				// new endpoint. Otherwise an update could smuggle a second
+				// address from the same subnet into the bucket, defeating the
+				// per-subnet cap and leaking the old IP's slot.
+				oldIP, newIP := attempt.Node.IP(), n.IP()
+				if !oldIP.Equal(newIP) {
+					oldTracked := oldIP != nil && !netutil.IsLAN(oldIP)
+					newTracked := newIP != nil && !netutil.IsLAN(newIP)
+					if oldTracked {
+						b.ips.Remove(oldIP)
+					}
+					if newTracked && !b.ips.Add(newIP) {
+						// New endpoint doesn't fit the bucket's subnet limit.
+						// Restore the old accounting and keep the existing record.
+						if oldTracked {
+							b.ips.Add(oldIP)
+						}
+						r.log.Debug("Ignoring registration record update", "id", n.ID(), "reason", "iplimit")
+						continue
+					}
+				}
 				attempt.Node = n
 			}
 			continue
