@@ -919,6 +919,40 @@ func (c *testCodec) decodeFrame(input []byte) (frame testCodecFrame, p v5wire.Pa
 	return frame, p, err
 }
 
+// TestUDPv5_regtopicEndpointMismatch checks that a REGTOPIC whose record
+// advertises an endpoint different from the packet source is dropped, so a peer
+// cannot register an ad that redirects searchers at a third party.
+func TestUDPv5_regtopicEndpointMismatch(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	var topic [32]byte
+
+	// Spoofed record: signed by the sender's key (so the id check passes) but
+	// advertising a victim IP instead of the real source address.
+	spoofdb, _ := enode.OpenDB("")
+	defer spoofdb.Close()
+	spoofln := enode.NewLocalNode(spoofdb, test.remotekey)
+	spoofln.SetStaticIP(net.IP{10, 0, 9, 9})
+	spoofln.Set(enr.UDP(test.remoteaddr.Port()))
+	spoofed := spoofln.Node().Record()
+
+	good := test.getNode(test.remotekey, test.remoteaddr).Node().Record()
+
+	// The spoofed REGTOPIC must be dropped; the legitimate one that follows must
+	// be answered. If the spoofed one were accepted, its REGCONFIRMATION would
+	// arrive first.
+	test.packetInFrom(test.remotekey, test.remoteaddr, &v5wire.Regtopic{ReqID: []byte{1}, Topic: topic, ENR: spoofed})
+	test.packetInFrom(test.remotekey, test.remoteaddr, &v5wire.Regtopic{ReqID: []byte{2}, Topic: topic, ENR: good})
+
+	test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {
+		if !bytes.Equal(p.ReqID, []byte{2}) {
+			t.Errorf("got REGCONFIRMATION for spoofed REGTOPIC (ReqID %x); endpoint mismatch not rejected", p.ReqID)
+		}
+	})
+}
+
 func newUDPV5Test(t *testing.T) *udpV5Test {
 	test := &udpV5Test{
 		t:          t,
