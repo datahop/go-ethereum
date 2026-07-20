@@ -156,6 +156,36 @@ func TestTopicSearchIteratorClose(t *testing.T) {
 	iter.Close()
 }
 
+// TestTopicSearchStoppedOnNodeClose verifies that a search whose iterator is
+// never closed by the consumer is still stopped when the node shuts down, so
+// its goroutines don't leak past UDPv5.Close.
+func TestTopicSearchStoppedOnNodeClose(t *testing.T) {
+	t.Parallel()
+
+	node := startLocalhostV5(t, Config{})
+	topic := makeTopic("test-search-onclose00")
+
+	// Start a search but deliberately never call iter.Close().
+	iter := node.TopicSearch(topic, 1)
+	time.Sleep(200 * time.Millisecond)
+
+	// Closing the node must stop the search goroutines. closeDown closes the
+	// result channel, so the iterator drains and then reports exhaustion.
+	node.Close()
+
+	done := make(chan struct{})
+	go func() {
+		for iter.Next() {
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("search not stopped after node.Close(): iterator still open")
+	}
+}
+
 // TestTopicLocalTopicNodes verifies that LocalTopicNodes returns the
 // correct nodes from the local topic table.
 func TestTopicLocalTopicNodes(t *testing.T) {
