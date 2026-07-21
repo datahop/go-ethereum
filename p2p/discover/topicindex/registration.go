@@ -181,8 +181,7 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 				continue
 			}
 			// Endpoint moved: keep the bucket's IP tracker in sync so the old
-			// subnet's slot is released and the new one is counted. Without this,
-			// a legitimate IP change strands the old /24 count forever.
+			// subnet's slot is released and the new one is counted.
 			if oldIP != nil && !netutil.IsLAN(oldIP) {
 				b.ips.Remove(oldIP)
 			}
