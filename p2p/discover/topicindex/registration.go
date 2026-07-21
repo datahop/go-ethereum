@@ -175,17 +175,19 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			if attempt.Node.Seq() >= n.Seq() {
 				continue
 			}
-			// If the endpoint moved, keep the bucket's IP tracker in sync so the
-			// old subnet's slot is released and the new one is counted. Without
-			// this, a legitimate IP change strands the old /24 count forever.
 			oldIP, newIP := attempt.Node.IP(), n.IP()
-			if !oldIP.Equal(newIP) {
-				if oldIP != nil && !netutil.IsLAN(oldIP) {
-					b.ips.Remove(oldIP)
-				}
-				if newIP != nil && !netutil.IsLAN(newIP) {
-					b.ips.Add(newIP)
-				}
+			if oldIP.Equal(newIP) {
+				attempt.Node = n
+				continue
+			}
+			// Endpoint moved: keep the bucket's IP tracker in sync so the old
+			// subnet's slot is released and the new one is counted. Without this,
+			// a legitimate IP change strands the old /24 count forever.
+			if oldIP != nil && !netutil.IsLAN(oldIP) {
+				b.ips.Remove(oldIP)
+			}
+			if newIP != nil && !netutil.IsLAN(newIP) {
+				b.ips.Add(newIP)
 			}
 			attempt.Node = n
 			continue
