@@ -258,6 +258,14 @@ func TestRegistrationIPCheckOnRecordUpdate(t *testing.T) {
 	if r.NodeCount() != 1 {
 		t.Fatalf("subnet limit bypassed on record update: got %d nodes, want 1", r.NodeCount())
 	}
+
+	// Subnet A must have been released by the move: a node in subnet A is now
+	// admitted. Before the fix its slot stayed counted forever (the leak).
+	node3 := nodeAtDistance(enode.ID(topic1), 200, net.IP{192, 0, 2, 2})
+	r.AddNodes(nil, []*enode.Node{node3})
+	if r.NodeCount() != 2 {
+		t.Fatalf("old subnet not released on record update: got %d nodes, want 2", r.NodeCount())
+	}
 }
 
 // This test checks that registration attempts are created for found nodes.

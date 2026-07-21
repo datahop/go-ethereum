@@ -175,25 +175,17 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			if attempt.Node.Seq() >= n.Seq() {
 				continue
 			}
+			// If the endpoint moved, keep the bucket's IP tracker in sync so the
+			// old subnet's slot is released and the new one is counted. Without
+			// this, a legitimate IP change strands the old /24 count forever.
 			oldIP, newIP := attempt.Node.IP(), n.IP()
-			if oldIP.Equal(newIP) {
-				attempt.Node = n
-				continue
-			}
-			// Endpoint changed: move the IP-limit accounting and re-check the
-			// per-subnet cap, so an update can't smuggle a second same-subnet
-			// address into the bucket.
-			oldTracked := oldIP != nil && !netutil.IsLAN(oldIP)
-			newTracked := newIP != nil && !netutil.IsLAN(newIP)
-			if oldTracked {
-				b.ips.Remove(oldIP)
-			}
-			if newTracked && !b.ips.Add(newIP) {
-				if oldTracked {
-					b.ips.Add(oldIP)
+			if !oldIP.Equal(newIP) {
+				if oldIP != nil && !netutil.IsLAN(oldIP) {
+					b.ips.Remove(oldIP)
 				}
-				r.log.Debug("Ignoring registration record update", "id", n.ID(), "reason", "iplimit")
-				continue
+				if newIP != nil && !netutil.IsLAN(newIP) {
+					b.ips.Add(newIP)
+				}
 			}
 			attempt.Node = n
 			continue
