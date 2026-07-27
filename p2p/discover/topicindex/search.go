@@ -48,8 +48,6 @@ type Search struct {
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
 	resultSeen   map[enode.ID]struct{}
-
-	queriesWithoutNewNodes int
 }
 
 type searchBucket struct {
@@ -87,32 +85,23 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 	return s
 }
 
-// IsDone reports whether the search table is saturated. When it returns true,
+// IsDone reports when the search table peers are all consumed. When it returns true,
 // this search state should be abandoned and a new search started using a
 // fresh Search instance.
 func (s *Search) IsDone() bool {
-	// TODO: what's the condition here?
-	//
-	// Ideas:
-	//
-	//   - n total results reached
-	//   - results from n sources received
-	//   - closest nodes reached (requires improved lookup tracking)
-	//   - buckets fuller than X
-
-	// The search cannot be done while there are unused results in the buffer,
-	// or while there are still nodes that could be asked.
+	// The search cannot be done while there are unused results in the buffer.
 	if len(s.resultBuffer) > 0 {
 		return false
 	}
+	// The search cannot be done while there are still nodes that could be asked.
 	for _, b := range s.buckets {
 		if len(b.new) > 0 {
 			return false
 		}
 	}
-	// No unasked nodes remain. Consider it done when the last
-	// two lookups didn't yield any new nodes.
-	return s.queriesWithoutNewNodes >= 4
+	// No unasked nodes remain and no results are buffered: the search is
+	// done. There is no more nodes to query.
+	return true
 }
 
 // BucketsWithFreeSpace gives n distances from the topic at which
@@ -134,7 +123,6 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		delete(s.bucketCheck, k)
 	}
 
-	var anyNewNode bool
 	for _, n := range nodes {
 		id := n.ID()
 		if id == s.cfg.Self {
@@ -163,29 +151,24 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 
 		// All checks passed, add the node.
-		anyNewNode = true
 		b.new[id] = n
-	}
-
-	if !anyNewNode {
-		s.queriesWithoutNewNodes++
-	} else {
-		s.queriesWithoutNewNodes = 0
 	}
 }
 
 // QueryTarget returns a random node to which a topic query should be sent.
+// Random nodes are collected from buckets progressively: only buckets with unasked nodes
+// that have received at least one response, plus the next unqueried bucket
+// with candidates, join the random pool.
 func (s *Search) QueryTarget() *enode.Node {
 	// Collect buckets with new nodes.
 	withnew := make([]*searchBucket, 0, searchTableDepth)
 	for i := range s.buckets {
 		if len(s.buckets[i].new) > 0 {
 			withnew = append(withnew, &s.buckets[i])
-		}
-		// Stop here if no request was ever sent in this bucket.
-		// This is to avoid spamming nodes close to the topic.
-		if s.buckets[i].numRequests == 0 {
-			break
+			// Stop here if no request was ever sent in this bucket.
+			if s.buckets[i].numRequests == 0 {
+				break
+			}
 		}
 	}
 
