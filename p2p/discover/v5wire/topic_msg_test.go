@@ -64,9 +64,42 @@ func TestTopicMessageRLP(t *testing.T) {
 	}
 }
 
+// raw mirror types let the test place malformed values where the real message
+// types (fixed-size arrays, uint8, *enr.Record) would otherwise prevent them.
+type rawTopicQuery struct {
+	ReqID, Topic []byte
+	Buckets      []uint
+}
+
+type rawTopicQueryExtra struct {
+	ReqID, Topic []byte
+	Buckets      []uint
+	Extra        []byte
+}
+
+type rawRegtopic struct {
+	ReqID, Topic, Ticket []byte
+	ENR                  rlp.RawValue
+	Buckets              []uint
+}
+
+type rawRegconfirmation struct {
+	ReqID     []byte
+	RespCount uint
+	Ticket    []byte
+	WaitTime  uint
+}
+
+type rawTopicNodes struct {
+	ReqID     []byte
+	RespCount uint
+	Nodes     []rlp.RawValue
+}
+
 // TestTopicMessageDecodeErrors checks that DecodeMessage rejects malformed topic
-// messages — unknown type, empty/non-list bodies, missing fields, extra trailing
-// data, and oversized request ids — with an error and never a panic.
+// messages — unknown type, empty/non-list bodies, missing/extra fields, wrong
+// fixed-array sizes, integer overflow, malformed embedded ENRs, trailing data,
+// and oversized request ids — with an error and never a panic.
 func TestTopicMessageDecodeErrors(t *testing.T) {
 	var rec enr.Record
 	rec.Set(enr.IPv4{127, 0, 0, 1})
@@ -114,6 +147,21 @@ func TestTopicMessageDecodeErrors(t *testing.T) {
 		{"regconfirmation-bigreqid", RegconfirmationMsg, enc(&Regconfirmation{ReqID: make([]byte, 9), RespCount: 1}), ErrInvalidReqID},
 		{"topicquery-bigreqid", TopicQueryMsg, enc(&TopicQuery{ReqID: make([]byte, 9), Topic: topic, Buckets: []uint{}}), ErrInvalidReqID},
 		{"topicnodes-bigreqid", TopicNodesMsg, enc(&TopicNodes{ReqID: make([]byte, 9), RespCount: 1}), ErrInvalidReqID},
+
+		// too many list elements (distinct from trailing bytes)
+		{"topicquery-too-many", TopicQueryMsg, enc(&rawTopicQueryExtra{ReqID: []byte{1}, Topic: make([]byte, 32), Buckets: []uint{}, Extra: []byte{2}}), nil},
+
+		// fixed-size Topic field with wrong length
+		{"topicquery-topic-short", TopicQueryMsg, enc(&rawTopicQuery{ReqID: []byte{1}, Topic: make([]byte, 31), Buckets: []uint{}}), nil},
+		{"topicquery-topic-long", TopicQueryMsg, enc(&rawTopicQuery{ReqID: []byte{1}, Topic: make([]byte, 33), Buckets: []uint{}}), nil},
+
+		// integer overflow into uint8 RespCount
+		{"regconfirmation-respcount-overflow", RegconfirmationMsg, enc(&rawRegconfirmation{ReqID: []byte{1}, RespCount: 256}), nil},
+		{"topicnodes-respcount-overflow", TopicNodesMsg, enc(&rawTopicNodes{ReqID: []byte{1}, RespCount: 256}), nil},
+
+		// malformed embedded ENR
+		{"regtopic-bad-enr", RegtopicMsg, enc(&rawRegtopic{ReqID: []byte{1}, Topic: make([]byte, 32), ENR: rlp.RawValue{0x01}, Buckets: []uint{}}), nil},
+		{"topicnodes-bad-enr", TopicNodesMsg, enc(&rawTopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []rlp.RawValue{{0x01}}}), nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -125,5 +173,19 @@ func TestTopicMessageDecodeErrors(t *testing.T) {
 				t.Fatalf("got error %q, want %q", err, c.want)
 			}
 		})
+	}
+}
+
+// TestTopicMessageReqIDBoundary checks that request ids up to the 8-byte limit
+// (and empty) are accepted — the rejection only kicks in above 8 bytes.
+func TestTopicMessageReqIDBoundary(t *testing.T) {
+	for _, n := range []int{0, 1, 8} {
+		body, err := rlp.EncodeToBytes(&TopicQuery{ReqID: make([]byte, n), Buckets: []uint{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeMessage(TopicQueryMsg, body); err != nil {
+			t.Errorf("request id length %d: unexpected error %v", n, err)
+		}
 	}
 }
