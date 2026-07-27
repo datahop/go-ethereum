@@ -22,7 +22,9 @@ import (
 	mrand "math/rand"
 	"sort"
 	"testing"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/internal/testlog"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -97,6 +99,109 @@ func TestTopicTableRandomNodes(t *testing.T) {
 	t.Run(fmt.Sprint(N), func(t *testing.T) { check(t, N, N) })
 	t.Run(fmt.Sprint(N-1), func(t *testing.T) { check(t, N-1, N-1) })
 	t.Run(fmt.Sprint(N+1), func(t *testing.T) { check(t, N+1, N) })
+}
+
+// TestLowerBoundDecay checks the decay and max-aggregation semantics of the
+// per-component lower bound (§6, "Lower Bound").
+func TestLowerBoundDecay(t *testing.T) {
+	var lb lowerBound
+	t0 := mclock.AbsTime(0)
+
+	if lb.remaining(t0) != 0 {
+		t.Fatal("zero-value bound should have no floor")
+	}
+	if got := lb.bump(10*time.Second, t0); got != 10*time.Second {
+		t.Fatalf("bump returned %v, want 10s", got)
+	}
+	// The floor decays 1:1 with elapsed time.
+	t1 := t0.Add(3 * time.Second)
+	if got := lb.remaining(t1); got != 7*time.Second {
+		t.Fatalf("remaining %v, want 7s", got)
+	}
+	// A smaller bump must not lower the floor.
+	if got := lb.bump(2*time.Second, t1); got != 7*time.Second {
+		t.Fatalf("smaller bump changed floor: %v", got)
+	}
+	// A larger bump raises it and resets the decay origin.
+	if got := lb.bump(20*time.Second, t1); got != 20*time.Second {
+		t.Fatalf("larger bump returned %v, want 20s", got)
+	}
+	if got := lb.remaining(t1.Add(5 * time.Second)); got != 15*time.Second {
+		t.Fatalf("remaining after raise %v, want 15s", got)
+	}
+	// Once fully elapsed, no floor remains.
+	if got := lb.remaining(t1.Add(30 * time.Second)); got != 0 {
+		t.Fatalf("expected fully decayed, got %v", got)
+	}
+}
+
+// TestTopicTableWaitLowerBound checks that WaitTime floors the service component
+// at the topic's recorded lower bound and that the floor decays over time.
+func TestTopicTableWaitLowerBound(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	n := newNode()
+	now := simclock.Now()
+
+	// Inject a service-component lower bound for topic1. With an otherwise-empty
+	// table the natural components are ~0, so the wait time must be floored here.
+	tab.wt.topicBounds[topic1] = lowerBound{value: 5 * time.Minute, since: now}
+
+	if wt := tab.WaitTime(n, topic1); wt < 5*time.Minute {
+		t.Fatalf("wait time %v below lower bound of 5m", wt)
+	}
+	// An unrelated topic is not affected by topic1's bound.
+	if wt := tab.WaitTime(n, topic2); wt > time.Second {
+		t.Fatalf("unrelated topic floored: %v", wt)
+	}
+
+	// The floor decays 1:1 with elapsed time.
+	simclock.Run(1 * time.Minute)
+	if wt := tab.WaitTime(n, topic1); wt < 4*time.Minute || wt > 4*time.Minute+time.Second {
+		t.Fatalf("decayed wait time %v, want ~4m", wt)
+	}
+
+	// After the bound has fully elapsed, no floor remains.
+	simclock.Run(5 * time.Minute)
+	if wt := tab.WaitTime(n, topic1); wt > time.Second {
+		t.Fatalf("bound did not decay away: %v", wt)
+	}
+}
+
+// TestTopicTableWaitBoundGC checks that a topic's lower bound is recorded when a
+// wait ticket is issued and dropped when the topic's last ad leaves the cache.
+func TestTopicTableWaitBoundGC(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	// Fill the cache with topic1 ads so the service component is large and
+	// Register issues a wait ticket instead of admitting immediately.
+	for i := 0; i < 16; i++ {
+		if !tab.Add(newNode(), topic1) {
+			t.Fatalf("could not add ad %d", i)
+		}
+	}
+
+	m := newNode()
+	if wt := tab.Register(m, topic1, 0); wt <= topicTableWaitTimeFloor {
+		t.Fatalf("expected a wait ticket, got %v", wt)
+	}
+	if _, ok := tab.wt.topicBounds[topic1]; !ok {
+		t.Fatal("no lower bound recorded for topic1 after issuing a wait ticket")
+	}
+
+	// When all topic1 ads expire, the bound must be GC'd. Note: testConfig leaves
+	// AdLifetime unset, so read the effective value from the table.
+	simclock.Run(tab.AdLifetime() + time.Second)
+	tab.Expire()
+	if _, ok := tab.wt.topicBounds[topic1]; ok {
+		t.Fatal("lower bound not dropped after topic emptied")
+	}
 }
 
 func testConfig(t *testing.T) Config {
