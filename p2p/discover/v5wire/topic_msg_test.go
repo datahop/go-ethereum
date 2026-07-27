@@ -99,7 +99,7 @@ type rawTopicNodes struct {
 // TestTopicMessageDecodeErrors checks that DecodeMessage rejects malformed topic
 // messages — unknown type, empty/non-list bodies, missing/extra fields, wrong
 // fixed-array sizes, integer overflow, malformed embedded ENRs, trailing data,
-// and oversized request ids — with an error and never a panic.
+// truncated bodies, and oversized request ids — with an error and never a panic.
 func TestTopicMessageDecodeErrors(t *testing.T) {
 	var rec enr.Record
 	rec.Set(enr.IPv4{127, 0, 0, 1})
@@ -118,6 +118,7 @@ func TestTopicMessageDecodeErrors(t *testing.T) {
 	}
 	tooFew := [][]byte{{0x01}} // one-element list: fewer fields than any topic message
 	trailing := func(b []byte) []byte { return append(append([]byte{}, b...), 0x00) }
+	truncated := func(b []byte) []byte { return b[:len(b)-1] } // drop the last byte of a valid encoding
 
 	cases := []struct {
 		name string
@@ -141,6 +142,11 @@ func TestTopicMessageDecodeErrors(t *testing.T) {
 		// extra trailing data after a valid message
 		{"topicquery-trailing", TopicQueryMsg, trailing(enc(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: []uint{}})), nil},
 		{"topicnodes-trailing", TopicNodesMsg, trailing(enc(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []*enr.Record{&rec}})), nil},
+
+		// truncated valid message (list header promises more bytes than are present)
+		{"regtopic-truncated", RegtopicMsg, truncated(enc(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: []byte{2}, ENR: &rec, Buckets: []uint{}})), nil},
+		{"topicquery-truncated", TopicQueryMsg, truncated(enc(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: []uint{}})), nil},
+		{"topicnodes-truncated", TopicNodesMsg, truncated(enc(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []*enr.Record{&rec}})), nil},
 
 		// oversized request id (> 8 bytes)
 		{"regtopic-bigreqid", RegtopicMsg, enc(&Regtopic{ReqID: make([]byte, 9), Topic: topic, ENR: &rec, Buckets: []uint{}}), ErrInvalidReqID},
