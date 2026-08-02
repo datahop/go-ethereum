@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	mrand "math/rand"
+	"net"
 	"sort"
 	"testing"
 	"time"
@@ -204,6 +205,85 @@ func TestTopicTableWaitBoundGC(t *testing.T) {
 	}
 }
 
+// TestTopicTableRegisterRecordsServiceBound checks that issuing a wait ticket
+// records the quoted wait as the topic's service-component lower bound (§6).
+func TestTopicTableRegisterRecordsServiceBound(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	// Contend topic1 so a fresh registrant is quoted a large service wait.
+	for i := 0; i < 8; i++ {
+		if !tab.Add(newNode(), topic1) {
+			t.Fatalf("could not add ad %d", i)
+		}
+	}
+	now := simclock.Now()
+
+	m := newNode()
+	wt := tab.Register(m, topic1, 0)
+	if wt <= topicTableWaitTimeFloor {
+		t.Fatalf("expected a wait ticket, got %v", wt)
+	}
+	lb, ok := tab.wt.topicBounds[topic1]
+	if !ok {
+		t.Fatal("service lower bound not recorded after issuing a wait ticket")
+	}
+	if got := lb.remaining(now); got != wt {
+		t.Fatalf("recorded bound %v, want quoted wait %v", got, wt)
+	}
+}
+
+// TestTopicTableServiceBoundGC checks that a topic's lower bound is dropped when
+// its last ad leaves the cache. The bound is injected directly so the test
+// isolates GC from the recording path.
+func TestTopicTableServiceBoundGC(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	tab.Add(newNode(), topic1)
+	tab.wt.topicBounds[topic1] = lowerBound{value: 5 * time.Minute, since: simclock.Now()}
+
+	simclock.Run(tab.AdLifetime() + time.Second)
+	tab.Expire()
+	if _, ok := tab.wt.topicBounds[topic1]; ok {
+		t.Fatal("service lower bound not dropped after the topic emptied")
+	}
+}
+
+// TestTopicTableRecordsIPBound checks that issuing a wait ticket driven by the
+// IP-diversity component records a lower bound on the registrant's
+// longest-prefix-match node in the IP tree.
+func TestTopicTableRecordsIPBound(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	// Cluster many registrants in one /24 so a same-prefix registrant scores a
+	// non-zero IP modifier.
+	for i := 0; i < 12; i++ {
+		tab.Add(newNodeWithIP(net.IPv4(8, 8, 8, byte(i))), topic2)
+	}
+	now := simclock.Now()
+
+	m := newNodeWithIP(net.IPv4(8, 8, 8, 200))
+	wt := tab.Register(m, topic1, 0)
+	if wt <= topicTableWaitTimeFloor {
+		t.Fatalf("expected a wait ticket driven by IP score, got %v", wt)
+	}
+	_, node := tab.wt.ipv4.scoreNode(net.IPv4(8, 8, 8, 200))
+	if node == nil {
+		t.Fatal("no longest-prefix-match node for the registrant IP")
+	}
+	if got := node.bound.remaining(now); got <= 0 {
+		t.Fatal("IP lower bound not recorded after issuing a wait ticket")
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	return Config{
 		AdCacheSize: 20,
@@ -213,6 +293,14 @@ func testConfig(t *testing.T) Config {
 
 func newNode() *enode.Node {
 	var r enr.Record
+	var id enode.ID
+	mrand.Read(id[:])
+	return enode.SignNull(&r, id)
+}
+
+func newNodeWithIP(ip net.IP) *enode.Node {
+	var r enr.Record
+	r.Set(enr.IPv4(ip.To4()))
 	var id enode.ID
 	mrand.Read(id[:])
 	return enode.SignNull(&r, id)
