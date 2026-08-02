@@ -217,6 +217,38 @@ func signedTestRecord(tb testing.TB) *enr.Record {
 	return &rec
 }
 
+// TestTopicMessageOversizedFields checks that DecodeMessage bounds the
+// variable-length fields of the topic messages (Buckets, Nodes, Ticket) rather
+// than relying solely on the packet MTU and downstream handlers.
+func TestTopicMessageOversizedFields(t *testing.T) {
+	rec := signedTestRecord(t)
+	var topic [32]byte
+	manyRecords := func(n int) []*enr.Record {
+		rs := make([]*enr.Record, n)
+		for i := range rs {
+			rs[i] = rec
+		}
+		return rs
+	}
+	cases := []struct {
+		name string
+		kind byte
+		body []byte
+	}{
+		{"regtopic-many-buckets", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: []byte{1}, ENR: rec, Buckets: make([]uint, 100000)})},
+		{"topicquery-many-buckets", TopicQueryMsg, rlpMust(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: make([]uint, 100000)})},
+		{"topicnodes-many-nodes", TopicNodesMsg, rlpMust(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: manyRecords(5000)})},
+		{"regtopic-huge-ticket", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: make([]byte, 1<<20), ENR: rec, Buckets: []uint{}})},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := DecodeMessage(c.kind, c.body); err == nil {
+				t.Fatal("decoded oversized message without error")
+			}
+		})
+	}
+}
+
 // FuzzTopicMessageDecode feeds arbitrary bytes to DecodeMessage for every topic
 // message type and asserts it never panics (returns an error instead).
 func FuzzTopicMessageDecode(f *testing.F) {
