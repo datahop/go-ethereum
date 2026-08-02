@@ -113,14 +113,6 @@ func newNode() *enode.Node {
 	return enode.SignNull(&r, id)
 }
 
-func randomNodes(n int) []*enode.Node {
-	nodes := make([]*enode.Node, n)
-	for i := range nodes {
-		nodes[i] = newNode()
-	}
-	return nodes
-}
-
 func uniqueNodeIDs(nodes []*enode.Node) []enode.ID {
 	byID := make(map[enode.ID]struct{}, len(nodes))
 	for _, n := range nodes {

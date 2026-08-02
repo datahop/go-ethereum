@@ -120,7 +120,6 @@ func (it *ipTree) remove(ip net.IP) {
 			*node = nil
 			return
 		}
-
 	}
 }
 
