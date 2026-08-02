@@ -22,7 +22,9 @@ import (
 	mrand "math/rand"
 	"sort"
 	"testing"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/internal/testlog"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -97,6 +99,37 @@ func TestTopicTableRandomNodes(t *testing.T) {
 	t.Run(fmt.Sprint(N), func(t *testing.T) { check(t, N, N) })
 	t.Run(fmt.Sprint(N-1), func(t *testing.T) { check(t, N-1, N-1) })
 	t.Run(fmt.Sprint(N+1), func(t *testing.T) { check(t, N+1, N) })
+}
+
+// TestTopicTableRollingExpiry checks that an expired ad is reclaimed even while
+// the table is full and newer ads are still live, so a fresh registrant can be
+// admitted. Ads are held in expiry order, so Expire must be able to drop the
+// oldest without being blocked by a newer entry.
+func TestTopicTableRollingExpiry(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.AdCacheSize = 3
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+	L := tab.AdLifetime()
+
+	// Fill the table with staggered expiry times: A < B < C.
+	tab.Add(newNode(), topic1) // A: exp = L
+	simclock.Run(time.Minute)
+	tab.Add(newNode(), topic1) // B: exp = L + 1m
+	simclock.Run(time.Minute)
+	tab.Add(newNode(), topic1) // C: exp = L + 2m  (table now full)
+
+	// Advance until only A has expired.
+	simclock.Run(L - 2*time.Minute + 30*time.Second) // now = L + 30s
+	tab.Expire()
+
+	if got := tab.all.Len(); got != 2 {
+		t.Fatalf("expired ad not reclaimed: Len=%d, want 2 (Expire blocked by a newer live ad)", got)
+	}
+	if !tab.Add(newNode(), topic1) {
+		t.Fatal("could not admit a new ad after an old one expired: table jammed")
+	}
 }
 
 func testConfig(t *testing.T) Config {
