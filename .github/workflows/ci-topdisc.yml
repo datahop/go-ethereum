@@ -1,9 +1,5 @@
 name: CI
 
-# Runs on GitHub-hosted runners. The upstream go.yml targets `master` and the
-# Ethereum Foundation's self-hosted runners, so it never fires for this fork.
-# Scoped to p2p/... (the active development area) for fast, green PR feedback;
-# broaden once stable.
 on:
   push:
     branches: [topdisc, master]
