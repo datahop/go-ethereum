@@ -56,6 +56,25 @@ const (
 	WhoareyouPacket = byte(254) // the WHOAREYOU packet
 )
 
+// Decode-time bounds on the variable-length fields of the topic-discovery
+// messages. These are defense-in-depth: the transport MTU and the message
+// handlers bound these fields further, but the decoder should reject clearly
+// oversized inputs on its own.
+const (
+	// Worst-case decode bounds on the variable-length topic-message fields. They
+	// are deliberately loose upper limits — chosen so they can never reject a
+	// valid message — that reject only absurd inputs; the authoritative limits
+	// are enforced downstream (handler truncation, ticket Unpack, packet MTU).
+
+	// maxTopicBucketCount: one entry per log-distance; distance 0 is the node
+	// itself, so valid distances are 1..256.
+	maxTopicBucketCount = 256
+	// maxTopicNodeCount: the discv5 per-response NODES limit.
+	maxTopicNodeCount = 16
+	// maxTicketSizeBytes: the sealed ticket is a fixed 90 bytes (Unpack enforces it).
+	maxTicketSizeBytes = 90
+)
+
 // Protocol messages.
 type (
 	// Unknown represents any packet that can't be decrypted.
@@ -203,6 +222,24 @@ func DecodeMessage(ptype byte, body []byte) (Packet, error) {
 	}
 	if dec.RequestID() != nil && len(dec.RequestID()) > 8 {
 		return nil, ErrInvalidReqID
+	}
+	switch m := dec.(type) {
+	case *Regtopic:
+		if len(m.Buckets) > maxTopicBucketCount || len(m.Ticket) > maxTicketSizeBytes {
+			return nil, ErrOversizedField
+		}
+	case *Regconfirmation:
+		if len(m.Ticket) > maxTicketSizeBytes {
+			return nil, ErrOversizedField
+		}
+	case *TopicQuery:
+		if len(m.Buckets) > maxTopicBucketCount {
+			return nil, ErrOversizedField
+		}
+	case *TopicNodes:
+		if len(m.Nodes) > maxTopicNodeCount {
+			return nil, ErrOversizedField
+		}
 	}
 	return dec, nil
 }
