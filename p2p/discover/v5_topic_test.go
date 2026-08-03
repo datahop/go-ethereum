@@ -257,16 +257,6 @@ func TestTopicDiscoveryFilterNodes(t *testing.T) {
 	}
 }
 
-func countRegistrants(found map[enode.ID]bool, registrants map[enode.ID]bool) int {
-	count := 0
-	for id := range found {
-		if registrants[id] {
-			count++
-		}
-	}
-	return count
-}
-
 // waitForCond polls cond until it returns true or the deadline passes.
 func waitForCond(t *testing.T, what string, cond func() bool) {
 	t.Helper()
