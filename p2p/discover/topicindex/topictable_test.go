@@ -101,11 +101,11 @@ func TestTopicTableRandomNodes(t *testing.T) {
 	t.Run(fmt.Sprint(N+1), func(t *testing.T) { check(t, N+1, N) })
 }
 
-// TestTopicTableRollingExpiry checks that an expired ad is reclaimed even while
-// the table is full and newer ads are still live, so a fresh registrant can be
+// TestTopicTableEviction checks that an expired ad is reclaimed even while the
+// table is full and newer ads are still live, so a fresh registrant can be
 // admitted. Ads are held in expiry order, so Expire must be able to drop the
 // oldest without being blocked by a newer entry.
-func TestTopicTableRollingExpiry(t *testing.T) {
+func TestTopicTableEviction(t *testing.T) {
 	simclock := new(mclock.Simulated)
 	cfg := testConfig(t)
 	cfg.AdCacheSize = 3
