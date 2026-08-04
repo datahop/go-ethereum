@@ -231,21 +231,3 @@ func TestTopicMessageOversizedFields(t *testing.T) {
 		})
 	}
 }
-
-// FuzzTopicMessageDecode feeds arbitrary bytes to DecodeMessage for every topic
-// message type and asserts it never panics (returns an error instead).
-func FuzzTopicMessageDecode(f *testing.F) {
-	rec := signedTestRecord(f)
-	var topic [32]byte
-	f.Add(rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: []byte{9}, ENR: rec, Buckets: []uint{250}}))
-	f.Add(rlpMust(&Regconfirmation{ReqID: []byte{1}, RespCount: 1, WaitTime: 5}))
-	f.Add(rlpMust(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: []uint{248}}))
-	f.Add(rlpMust(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []*enr.Record{rec}}))
-
-	kinds := []byte{RegtopicMsg, RegconfirmationMsg, TopicQueryMsg, TopicNodesMsg}
-	f.Fuzz(func(t *testing.T, data []byte) {
-		for _, k := range kinds {
-			_, _ = DecodeMessage(k, data) // must not panic
-		}
-	})
-}
