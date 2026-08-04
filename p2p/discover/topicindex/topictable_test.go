@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	mrand "math/rand"
+	"net"
 	"sort"
 	"testing"
 	"time"
@@ -204,6 +205,44 @@ func TestTopicTableWaitBoundGC(t *testing.T) {
 	}
 }
 
+// TestTopicTableRecordsIPBound checks that issuing a wait ticket records an
+// IP-component lower bound on the longest-prefix-match node in the IP tree.
+func TestTopicTableRecordsIPBound(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdCacheSize = 200
+	tab := NewTopicTable(cfg)
+
+	// Fill the cache with ads from a single /24 so that another address in that
+	// subnet receives a positive IP-similarity score (a non-zero IP component).
+	for i := 1; i <= 60; i++ {
+		ip := net.IPv4(203, 0, 113, byte(i))
+		if !tab.Add(nodeWithIP(ip), topic1) {
+			t.Fatalf("could not add clustered ad %d", i)
+		}
+	}
+
+	// A fresh node from the same subnet, registering for an *empty* topic so the
+	// service component is zero and only the IP component is exercised.
+	target := net.IPv4(203, 0, 113, 200)
+	score, node := tab.wt.ipv4.scoreNode(target.To4())
+	if score == 0 {
+		t.Fatal("expected a positive IP-similarity score for the clustered subnet")
+	}
+	if node == nil {
+		t.Fatal("scoreNode returned no longest-prefix-match node")
+	}
+
+	now := simclock.Now()
+	if wt := tab.Register(nodeWithIP(target), topic2, 0); wt <= topicTableWaitTimeFloor {
+		t.Fatalf("expected a wait ticket, got %v", wt)
+	}
+	if node.bound.remaining(now) <= 0 {
+		t.Fatal("Register did not record an IP-component lower bound")
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	return Config{
 		AdCacheSize: 20,
@@ -213,6 +252,14 @@ func testConfig(t *testing.T) Config {
 
 func newNode() *enode.Node {
 	var r enr.Record
+	var id enode.ID
+	mrand.Read(id[:])
+	return enode.SignNull(&r, id)
+}
+
+func nodeWithIP(ip net.IP) *enode.Node {
+	var r enr.Record
+	r.Set(enr.IP(ip))
 	var id enode.ID
 	mrand.Read(id[:])
 	return enode.SignNull(&r, id)
