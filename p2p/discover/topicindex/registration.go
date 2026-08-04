@@ -178,28 +178,29 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			oldIP, newIP := attempt.Node.IP(), n.IP()
 			oldTracked := oldIP != nil && !netutil.IsLAN(oldIP)
 			newTracked := newIP != nil && !netutil.IsLAN(newIP)
-			switch {
-			case oldTracked && newTracked && netutil.SameNet(regBucketSubnet, oldIP, newIP):
-				// Same tracked /24 (any host within it): the per-subnet count is
-				// unchanged, so just adopt the newer record.
+
+			// A move within the same tracked /24 leaves the per-subnet count
+			// unchanged, so just adopt the newer record.
+			if oldTracked && newTracked && netutil.SameNet(regBucketSubnet, oldIP, newIP) {
 				attempt.Node = n
-			case newTracked && !b.ips.Add(newIP):
-				// Moved to a different, already-full /24. We seat the new slot
-				// before releasing the old one, so on failure the old slot is
-				// still held and removeAttempt releases it exactly once (correct
-				// at any per-subnet limit). Give up on the node; a later AddNodes
-				// can re-admit it once the subnet frees up.
+				continue
+			}
+			// Seat the new endpoint (if tracked) before releasing the old one. If
+			// its /24 is full, give up on the node rather than exceed the limit or
+			// keep the stale address; the old slot is still held, so removeAttempt
+			// releases it exactly once (correct at any per-subnet limit). A later
+			// AddNodes can re-admit the node once the subnet frees up.
+			if newTracked && !b.ips.Add(newIP) {
 				r.log.Debug("Dropping registration node", "id", id, "reason", "iplimit-on-record-update")
 				r.removeAttempt(attempt, "iplimit-on-record-update")
 				r.refillAttempts(b)
-			default:
-				// New endpoint seated in a different /24, or untracked (LAN/nil):
-				// release the old /24's slot only if it was tracked.
-				if oldTracked {
-					b.ips.Remove(oldIP)
-				}
-				attempt.Node = n
+				continue
 			}
+			// New endpoint is now seated (or untracked); release the old /24 slot.
+			if oldTracked {
+				b.ips.Remove(oldIP)
+			}
+			attempt.Node = n
 			continue
 		}
 
