@@ -19,6 +19,7 @@ package topicindex
 import (
 	"container/heap"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -61,6 +62,30 @@ type regBucket struct {
 	count [nRegStates]int
 
 	ips netutil.DistinctNetSet
+}
+
+// updateIP moves the bucket's per-/24 IP accounting from old to new and reports
+// whether new is acceptable. It is the single IP-limit gate for both a fresh
+// registration (pass old = nil) and a record update:
+//
+//   - untracked endpoints (nil / LAN) are always accepted and not counted;
+//   - a new endpoint in old's /24 keeps the slot, leaving the count unchanged;
+//   - a tracked new endpoint in a full /24 is rejected, leaving the tracker
+//     unchanged (the old slot, if any, is retained);
+//   - otherwise the new slot is taken and the old one released.
+func (b *regBucket) updateIP(oldIP, newIP net.IP) bool {
+	oldTracked := oldIP != nil && !netutil.IsLAN(oldIP)
+	newTracked := newIP != nil && !netutil.IsLAN(newIP)
+	if oldTracked && newTracked && netutil.SameNet(regBucketSubnet, oldIP, newIP) {
+		return true
+	}
+	if newTracked && !b.ips.Add(newIP) {
+		return false
+	}
+	if oldTracked {
+		b.ips.Remove(oldIP)
+	}
+	return true
 }
 
 const (
@@ -175,30 +200,15 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			if attempt.Node.Seq() >= n.Seq() {
 				continue
 			}
-			oldIP, newIP := attempt.Node.IP(), n.IP()
-			oldTracked := oldIP != nil && !netutil.IsLAN(oldIP)
-			newTracked := newIP != nil && !netutil.IsLAN(newIP)
-
-			// A move within the same tracked /24 leaves the per-subnet count
-			// unchanged, so just adopt the newer record.
-			if oldTracked && newTracked && netutil.SameNet(regBucketSubnet, oldIP, newIP) {
-				attempt.Node = n
-				continue
-			}
-			// Seat the new endpoint (if tracked) before releasing the old one. If
-			// its /24 is full, give up on the node rather than exceed the limit or
-			// keep the stale address; the old slot is still held, so removeAttempt
-			// releases it exactly once (correct at any per-subnet limit). A later
-			// AddNodes can re-admit the node once the subnet frees up.
-			if newTracked && !b.ips.Add(newIP) {
+			// Keep the bucket's IP tracker consistent for the new endpoint. If its
+			// /24 is full, drop the attempt rather than exceed the limit or keep
+			// the stale address; a later AddNodes can re-admit the node once the
+			// subnet frees up.
+			if !b.updateIP(attempt.Node.IP(), n.IP()) {
 				r.log.Debug("Dropping registration node", "id", id, "reason", "iplimit-on-record-update")
 				r.removeAttempt(attempt, "iplimit-on-record-update")
 				r.refillAttempts(b)
 				continue
-			}
-			// New endpoint is now seated (or untracked); release the old /24 slot.
-			if oldTracked {
-				b.ips.Remove(oldIP)
 			}
 			attempt.Node = n
 			continue
@@ -219,8 +229,7 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			continue
 		}
 
-		ip := n.IP()
-		if ip != nil && !netutil.IsLAN(ip) && !b.ips.Add(n.IP()) {
+		if !b.updateIP(nil, n.IP()) {
 			// IP doesn't fit in bucket limit.
 			r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "iplimit")
 			continue
