@@ -417,3 +417,49 @@ func nodeWithSeq(id enode.ID, ip net.IP, seq uint64) *enode.Node {
 func intIP(i int) net.IP {
 	return net.IP{byte(i), 0, 2, byte(i)}
 }
+
+// TestRegistrationRecordUpdateIPLimit checks that when an already-scheduled node
+// advances its ENR to an IP in a subnet that is already full for the bucket, the
+// node is dropped rather than seated in violation of the per-/24 limit.
+func TestRegistrationRecordUpdateIPLimit(t *testing.T) {
+	cfg := testConfig(t)
+	r := NewRegistration(topic1, cfg)
+	base := enode.ID(topic1)
+
+	// Two nodes in the same bucket, in different /24s.
+	a := nodeAtDistance(base, 200, net.IP{3, 0, 2, 1})
+	b := nodeAtDistance(base, 200, net.IP{4, 0, 2, 1})
+	r.AddNodes(nil, []*enode.Node{a, b})
+
+	bi := r.bucketIndex(a.ID())
+	bucket := &r.buckets[bi]
+	if _, ok := bucket.att[a.ID()]; !ok {
+		t.Fatal("setup: node a not admitted")
+	}
+	if _, ok := bucket.att[b.ID()]; !ok {
+		t.Fatal("setup: node b not admitted")
+	}
+
+	// a advertises a newer ENR moving into b's (full) /24.
+	var rec enr.Record
+	rec.Set(enr.IP(net.IP{4, 0, 2, 99})) // same /24 as b, different host
+	rec.SetSeq(a.Seq() + 1)
+	aMoved := enode.SignNull(&rec, a.ID())
+	r.AddNodes(nil, []*enode.Node{aMoved})
+
+	// a must be dropped: it can neither keep its stale IP nor put a second node
+	// in b's /24.
+	if _, ok := bucket.att[a.ID()]; ok {
+		t.Fatal("node a should have been dropped after moving into a full /24")
+	}
+	if _, ok := bucket.att[b.ID()]; !ok {
+		t.Fatal("node b should still be present")
+	}
+
+	// The /24 limit must still hold: a fresh node in that /24 is rejected.
+	c := nodeAtDistance(base, 200, net.IP{4, 0, 2, 200})
+	r.AddNodes(nil, []*enode.Node{c})
+	if _, ok := bucket.att[c.ID()]; ok {
+		t.Fatal("third node in the full /24 should have been rejected")
+	}
+}
