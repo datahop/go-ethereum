@@ -28,19 +28,14 @@ import (
 // TestTopicMessageRLP checks that each topic-discovery message type survives an
 // RLP encode → decode → re-encode round-trip losslessly.
 func TestTopicMessageRLP(t *testing.T) {
-	var rec enr.Record
-	rec.Set(enr.IPv4{127, 0, 0, 1})
-	rec.Set(enr.UDP(30303))
-	if err := enode.SignV4(&rec, testKeyA); err != nil {
-		t.Fatal(err)
-	}
+	rec := signedTestRecord(t)
 	topic := [32]byte{1, 2, 3, 4, 5}
 
 	msgs := []Packet{
-		&Regtopic{ReqID: []byte{1, 2, 3}, Topic: topic, Ticket: []byte{9, 9}, ENR: &rec, Buckets: []uint{250, 251}},
+		&Regtopic{ReqID: []byte{1, 2, 3}, Topic: topic, Ticket: []byte{9, 9}, ENR: rec, Buckets: []uint{250, 251}},
 		&Regconfirmation{ReqID: []byte{4}, RespCount: 2, Ticket: []byte{7, 7}, WaitTime: 1500},
 		&TopicQuery{ReqID: []byte{5}, Topic: topic, Buckets: []uint{248}},
-		&TopicNodes{ReqID: []byte{6}, RespCount: 3, Nodes: []*enr.Record{&rec}},
+		&TopicNodes{ReqID: []byte{6}, RespCount: 3, Nodes: []*enr.Record{rec}},
 	}
 	for _, msg := range msgs {
 		enc, err := rlp.EncodeToBytes(msg)
@@ -101,21 +96,9 @@ type rawTopicNodes struct {
 // fixed-array sizes, integer overflow, malformed embedded ENRs, trailing data,
 // truncated bodies, and oversized request ids — with an error and never a panic.
 func TestTopicMessageDecodeErrors(t *testing.T) {
-	var rec enr.Record
-	rec.Set(enr.IPv4{127, 0, 0, 1})
-	rec.Set(enr.UDP(30303))
-	if err := enode.SignV4(&rec, testKeyA); err != nil {
-		t.Fatal(err)
-	}
+	rec := signedTestRecord(t)
 	var topic [32]byte
 
-	enc := func(v interface{}) []byte {
-		b, err := rlp.EncodeToBytes(v)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
-		return b
-	}
 	tooFew := [][]byte{{0x01}} // one-element list: fewer fields than any topic message
 	trailing := func(b []byte) []byte { return append(append([]byte{}, b...), 0x00) }
 	truncated := func(b []byte) []byte { return b[:len(b)-1] } // drop the last byte of a valid encoding
@@ -126,7 +109,7 @@ func TestTopicMessageDecodeErrors(t *testing.T) {
 		body []byte
 		want error // if non-nil, the exact error expected
 	}{
-		{"unknown-type", 0xEE, enc(tooFew), nil},
+		{"unknown-type", 0xEE, rlpMust(tooFew), nil},
 
 		// empty / not-a-list bodies
 		{"regtopic-empty", RegtopicMsg, nil, nil},
@@ -134,40 +117,40 @@ func TestTopicMessageDecodeErrors(t *testing.T) {
 		{"topicquery-not-list", TopicQueryMsg, []byte{0x01}, nil},
 
 		// missing fields (too few list elements)
-		{"regtopic-too-few", RegtopicMsg, enc(tooFew), nil},
-		{"regconfirmation-too-few", RegconfirmationMsg, enc(tooFew), nil},
-		{"topicquery-too-few", TopicQueryMsg, enc(tooFew), nil},
-		{"topicnodes-too-few", TopicNodesMsg, enc(tooFew), nil},
+		{"regtopic-too-few", RegtopicMsg, rlpMust(tooFew), nil},
+		{"regconfirmation-too-few", RegconfirmationMsg, rlpMust(tooFew), nil},
+		{"topicquery-too-few", TopicQueryMsg, rlpMust(tooFew), nil},
+		{"topicnodes-too-few", TopicNodesMsg, rlpMust(tooFew), nil},
 
 		// extra trailing data after a valid message
-		{"topicquery-trailing", TopicQueryMsg, trailing(enc(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: []uint{}})), nil},
-		{"topicnodes-trailing", TopicNodesMsg, trailing(enc(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []*enr.Record{&rec}})), nil},
+		{"topicquery-trailing", TopicQueryMsg, trailing(rlpMust(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: []uint{}})), nil},
+		{"topicnodes-trailing", TopicNodesMsg, trailing(rlpMust(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []*enr.Record{rec}})), nil},
 
 		// truncated valid message (list header promises more bytes than are present)
-		{"regtopic-truncated", RegtopicMsg, truncated(enc(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: []byte{2}, ENR: &rec, Buckets: []uint{}})), nil},
-		{"topicquery-truncated", TopicQueryMsg, truncated(enc(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: []uint{}})), nil},
-		{"topicnodes-truncated", TopicNodesMsg, truncated(enc(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []*enr.Record{&rec}})), nil},
+		{"regtopic-truncated", RegtopicMsg, truncated(rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: []byte{2}, ENR: rec, Buckets: []uint{}})), nil},
+		{"topicquery-truncated", TopicQueryMsg, truncated(rlpMust(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: []uint{}})), nil},
+		{"topicnodes-truncated", TopicNodesMsg, truncated(rlpMust(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []*enr.Record{rec}})), nil},
 
 		// oversized request id (> 8 bytes)
-		{"regtopic-bigreqid", RegtopicMsg, enc(&Regtopic{ReqID: make([]byte, 9), Topic: topic, ENR: &rec, Buckets: []uint{}}), ErrInvalidReqID},
-		{"regconfirmation-bigreqid", RegconfirmationMsg, enc(&Regconfirmation{ReqID: make([]byte, 9), RespCount: 1}), ErrInvalidReqID},
-		{"topicquery-bigreqid", TopicQueryMsg, enc(&TopicQuery{ReqID: make([]byte, 9), Topic: topic, Buckets: []uint{}}), ErrInvalidReqID},
-		{"topicnodes-bigreqid", TopicNodesMsg, enc(&TopicNodes{ReqID: make([]byte, 9), RespCount: 1}), ErrInvalidReqID},
+		{"regtopic-bigreqid", RegtopicMsg, rlpMust(&Regtopic{ReqID: make([]byte, 9), Topic: topic, ENR: rec, Buckets: []uint{}}), ErrInvalidReqID},
+		{"regconfirmation-bigreqid", RegconfirmationMsg, rlpMust(&Regconfirmation{ReqID: make([]byte, 9), RespCount: 1}), ErrInvalidReqID},
+		{"topicquery-bigreqid", TopicQueryMsg, rlpMust(&TopicQuery{ReqID: make([]byte, 9), Topic: topic, Buckets: []uint{}}), ErrInvalidReqID},
+		{"topicnodes-bigreqid", TopicNodesMsg, rlpMust(&TopicNodes{ReqID: make([]byte, 9), RespCount: 1}), ErrInvalidReqID},
 
 		// too many list elements (distinct from trailing bytes)
-		{"topicquery-too-many", TopicQueryMsg, enc(&rawTopicQueryExtra{ReqID: []byte{1}, Topic: make([]byte, 32), Buckets: []uint{}, Extra: []byte{2}}), nil},
+		{"topicquery-too-many", TopicQueryMsg, rlpMust(&rawTopicQueryExtra{ReqID: []byte{1}, Topic: make([]byte, 32), Buckets: []uint{}, Extra: []byte{2}}), nil},
 
 		// fixed-size Topic field with wrong length
-		{"topicquery-topic-short", TopicQueryMsg, enc(&rawTopicQuery{ReqID: []byte{1}, Topic: make([]byte, 31), Buckets: []uint{}}), nil},
-		{"topicquery-topic-long", TopicQueryMsg, enc(&rawTopicQuery{ReqID: []byte{1}, Topic: make([]byte, 33), Buckets: []uint{}}), nil},
+		{"topicquery-topic-short", TopicQueryMsg, rlpMust(&rawTopicQuery{ReqID: []byte{1}, Topic: make([]byte, 31), Buckets: []uint{}}), nil},
+		{"topicquery-topic-long", TopicQueryMsg, rlpMust(&rawTopicQuery{ReqID: []byte{1}, Topic: make([]byte, 33), Buckets: []uint{}}), nil},
 
 		// integer overflow into uint8 RespCount
-		{"regconfirmation-respcount-overflow", RegconfirmationMsg, enc(&rawRegconfirmation{ReqID: []byte{1}, RespCount: 256}), nil},
-		{"topicnodes-respcount-overflow", TopicNodesMsg, enc(&rawTopicNodes{ReqID: []byte{1}, RespCount: 256}), nil},
+		{"regconfirmation-respcount-overflow", RegconfirmationMsg, rlpMust(&rawRegconfirmation{ReqID: []byte{1}, RespCount: 256}), nil},
+		{"topicnodes-respcount-overflow", TopicNodesMsg, rlpMust(&rawTopicNodes{ReqID: []byte{1}, RespCount: 256}), nil},
 
 		// malformed embedded ENR
-		{"regtopic-bad-enr", RegtopicMsg, enc(&rawRegtopic{ReqID: []byte{1}, Topic: make([]byte, 32), ENR: rlp.RawValue{0x01}, Buckets: []uint{}}), nil},
-		{"topicnodes-bad-enr", TopicNodesMsg, enc(&rawTopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []rlp.RawValue{{0x01}}}), nil},
+		{"regtopic-bad-enr", RegtopicMsg, rlpMust(&rawRegtopic{ReqID: []byte{1}, Topic: make([]byte, 32), ENR: rlp.RawValue{0x01}, Buckets: []uint{}}), nil},
+		{"topicnodes-bad-enr", TopicNodesMsg, rlpMust(&rawTopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: []rlp.RawValue{{0x01}}}), nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
