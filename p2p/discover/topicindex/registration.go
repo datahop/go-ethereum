@@ -176,14 +176,15 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 				continue
 			}
 			oldIP, newIP := attempt.Node.IP(), n.IP()
+			oldTracked := oldIP != nil && !netutil.IsLAN(oldIP)
+			newTracked := newIP != nil && !netutil.IsLAN(newIP)
 			switch {
-			case oldIP.Equal(newIP),
-				oldIP != nil && newIP != nil && netutil.SameNet(regBucketSubnet, oldIP, newIP):
-				// Same endpoint, or a move within the same /24: the node keeps its
-				// slot, so just adopt the newer record.
+			case oldTracked && newTracked && netutil.SameNet(regBucketSubnet, oldIP, newIP):
+				// Same tracked /24 (any host within it): the per-subnet count is
+				// unchanged, so just adopt the newer record.
 				attempt.Node = n
-			case newIP != nil && !netutil.IsLAN(newIP) && !b.ips.Add(newIP):
-				// Moved to a different, already-full subnet. We seat the new slot
+			case newTracked && !b.ips.Add(newIP):
+				// Moved to a different, already-full /24. We seat the new slot
 				// before releasing the old one, so on failure the old slot is
 				// still held and removeAttempt releases it exactly once (correct
 				// at any per-subnet limit). Give up on the node; a later AddNodes
@@ -192,9 +193,9 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 				r.removeAttempt(attempt, "iplimit-on-record-update")
 				r.refillAttempts(b)
 			default:
-				// New endpoint seated (or LAN/empty and untracked): only now
-				// release the now-stale old slot.
-				if oldIP != nil && !netutil.IsLAN(oldIP) {
+				// New endpoint seated in a different /24, or untracked (LAN/nil):
+				// release the old /24's slot only if it was tracked.
+				if oldTracked {
 					b.ips.Remove(oldIP)
 				}
 				attempt.Node = n
