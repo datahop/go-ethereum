@@ -509,3 +509,29 @@ func TestRegistrationRecordUpdateIPLimitAboveOne(t *testing.T) {
 		t.Fatal("second extra node exceeds /24 limit — c's slot was undercounted")
 	}
 }
+
+// TestRegistrationRecordUpdateSameSubnet checks that a node refreshing its ENR
+// to a different host in the same /24 is kept (not evicted), even at IP limit 1.
+func TestRegistrationRecordUpdateSameSubnet(t *testing.T) {
+	cfg := testConfig(t)
+	r := NewRegistration(topic1, cfg)
+	base := enode.ID(topic1)
+
+	a := nodeAtDistance(base, 200, net.IP{3, 0, 2, 1})
+	r.AddNodes(nil, []*enode.Node{a})
+	bi := r.bucketIndex(a.ID())
+	bucket := &r.buckets[bi]
+
+	var rec enr.Record
+	rec.Set(enr.IP(net.IP{3, 0, 2, 250})) // same /24, different host
+	rec.SetSeq(a.Seq() + 1)
+	r.AddNodes(nil, []*enode.Node{enode.SignNull(&rec, a.ID())})
+
+	att, ok := bucket.att[a.ID()]
+	if !ok {
+		t.Fatal("node moving within its own /24 should be kept")
+	}
+	if got := att.Node.IP(); !got.Equal(net.IP{3, 0, 2, 250}) {
+		t.Fatalf("record not updated: IP=%v", got)
+	}
+}

@@ -176,33 +176,29 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 				continue
 			}
 			oldIP, newIP := attempt.Node.IP(), n.IP()
-			if oldIP.Equal(newIP) {
+			switch {
+			case oldIP.Equal(newIP),
+				oldIP != nil && newIP != nil && netutil.SameNet(regBucketSubnet, oldIP, newIP):
+				// Same endpoint, or a move within the same /24: the node keeps its
+				// slot, so just adopt the newer record.
 				attempt.Node = n
-				continue
-			}
-			// Endpoint moved to a new subnet. The old address is now stale, so
-			// release its slot and try to seat the new one.
-			if oldIP != nil && !netutil.IsLAN(oldIP) {
-				b.ips.Remove(oldIP)
-			}
-			if newIP != nil && !netutil.IsLAN(newIP) && !b.ips.Add(newIP) {
-				// The new subnet is full. We can neither keep the stale address
-				// nor exceed the per-subnet limit, so give up on the node; a
-				// later AddNodes can re-admit it once the subnet frees up.
-				//
-				// Restore the old slot first so removeAttempt (which releases
-				// attempt.Node's IP) decrements the right subnet exactly once.
-				// This keeps the tracker correct even if the per-bucket IP limit
-				// is ever raised above 1.
-				if oldIP != nil && !netutil.IsLAN(oldIP) {
-					b.ips.Add(oldIP)
-				}
+			case newIP != nil && !netutil.IsLAN(newIP) && !b.ips.Add(newIP):
+				// Moved to a different, already-full subnet. We seat the new slot
+				// before releasing the old one, so on failure the old slot is
+				// still held and removeAttempt releases it exactly once (correct
+				// at any per-subnet limit). Give up on the node; a later AddNodes
+				// can re-admit it once the subnet frees up.
 				r.log.Debug("Dropping registration node", "id", id, "reason", "iplimit-on-record-update")
 				r.removeAttempt(attempt, "iplimit-on-record-update")
 				r.refillAttempts(b)
-				continue
+			default:
+				// New endpoint seated (or LAN/empty and untracked): only now
+				// release the now-stale old slot.
+				if oldIP != nil && !netutil.IsLAN(oldIP) {
+					b.ips.Remove(oldIP)
+				}
+				attempt.Node = n
 			}
-			attempt.Node = n
 			continue
 		}
 
