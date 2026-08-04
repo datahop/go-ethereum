@@ -200,6 +200,10 @@ func (tab *TopicTable) remove(reg *topicTableEntry) {
 	topicList := tab.reg[reg.topic]
 	if topicList.Len() == 1 {
 		delete(tab.reg, reg.topic)
+		// The topic's last ad is leaving the cache, so its service component
+		// returns to zero and its lower-bound entry can be dropped. This keeps
+		// topicBounds bounded by the number of distinct topics in the cache.
+		delete(tab.wt.topicBounds, reg.topic)
 	} else {
 		topicList.Remove(reg.topicElem)
 	}
@@ -313,18 +317,23 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 		return 0
 	}
 
+	now := tab.config.Clock.Now()
+	requiredTime, comps := tab.waitTime(n, t, now)
+
 	// Check if the node has waited enough.
-	requiredTime := tab.WaitTime(n, t)
 	if waitTime < requiredTime {
 		remaining := requiredTime - waitTime
 		if remaining > topicTableWaitTimeFloor {
+			// A wait ticket is being issued: record the per-component lower bounds
+			// so the node can't obtain a cheaper quote by re-requesting.
+			tab.recordWaitTime(comps, now)
 			return remaining
 		}
 	}
 
 	// Check if there is space. If not, the node needs to come back when a slot opens.
 	if tab.all.Len() >= tab.config.AdCacheSize {
-		now := tab.config.Clock.Now()
+		tab.recordWaitTime(comps, now)
 		return tab.NextExpiryTime().Sub(now)
 	}
 
