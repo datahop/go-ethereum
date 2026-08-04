@@ -436,12 +436,13 @@ func TestRegistrationRecordUpdateIPLimit(t *testing.T) {
 		probes   []probe  // follow-up admissions checking the tracker count
 	}{
 		{
-			name:     "into-full-subnet",
+			name:     "into-empty-subnet",
 			limit:    1,
-			setup:    []net.IP{{3, 0, 2, 1}, {4, 0, 2, 1}},
-			moveIP:   net.IP{4, 0, 2, 99}, // /24-4 already full
-			wantKept: false,
-			probes:   []probe{{net.IP{4, 0, 2, 200}, false}}, // still full
+			setup:    []net.IP{{3, 0, 2, 1}},
+			moveIP:   net.IP{6, 0, 2, 1}, // different /24, has room
+			wantKept: true,
+			// Old /24-3 slot is freed (a fresh node fits); new /24-6 is now counted.
+			probes: []probe{{net.IP{3, 0, 2, 9}, true}, {net.IP{6, 0, 2, 9}, false}},
 		},
 		{
 			name:     "into-full-subnet-limit-2",
@@ -491,6 +492,12 @@ func TestRegistrationRecordUpdateIPLimit(t *testing.T) {
 			}
 			if c.wantKept && !att.Node.IP().Equal(c.moveIP) {
 				t.Fatalf("record not updated: got IP %v, want %v", att.Node.IP(), c.moveIP)
+			}
+			// The other setup nodes are untouched by node 0's update and must remain.
+			for i := 1; i < len(nodes); i++ {
+				if _, ok := bucket.att[nodes[i].ID()]; !ok {
+					t.Fatalf("node %d (%v) should still be present", i, c.setup[i])
+				}
 			}
 
 			for _, p := range c.probes {
