@@ -379,11 +379,12 @@ func intIP(i int) net.IP {
 	return net.IP{byte(i), 0, 2, byte(i)}
 }
 
-// TestRegistrationRecordUpdateIPLimit checks that the per-/24 IP tracker stays
-// consistent when an already-scheduled node advances its ENR to a new endpoint:
-// a move within the same /24 is kept, a move into a full /24 is dropped, and a
-// dropped node never releases a co-tenant's slot (even if the limit is > 1).
-func TestRegistrationRecordUpdateIPLimit(t *testing.T) {
+// TestRegistrationRecordUpdate checks how an already-scheduled node's newer ENR
+// is handled: a non-newer seq is ignored, and an endpoint change keeps the
+// per-/24 IP tracker consistent — a move within the same /24 is kept, a move to
+// a free /24 seats the new subnet and releases the old, a move into a full /24
+// is dropped, and a dropped node never releases a co-tenant's slot.
+func TestRegistrationRecordUpdate(t *testing.T) {
 	type probe struct {
 		ip    net.IP
 		admit bool
@@ -393,9 +394,20 @@ func TestRegistrationRecordUpdateIPLimit(t *testing.T) {
 		limit    int
 		setup    []net.IP // admitted up front; index 0's record is updated
 		moveIP   net.IP   // index 0's new endpoint
+		sameSeq  bool     // offer the update with a non-newer seq (must be ignored)
 		wantKept bool     // whether index 0 survives the update
 		probes   []probe  // follow-up admissions checking the tracker count
 	}{
+		{
+			name:     "stale-seq-ignored",
+			limit:    1,
+			setup:    []net.IP{{3, 0, 2, 1}},
+			moveIP:   net.IP{4, 0, 2, 1}, // offered with a non-newer seq
+			sameSeq:  true,
+			wantKept: true,
+			// Update ignored: /24-3 still held (rejected), /24-4 never counted (admitted).
+			probes: []probe{{net.IP{3, 0, 2, 9}, false}, {net.IP{4, 0, 2, 9}, true}},
+		},
 		{
 			name:     "into-empty-subnet",
 			limit:    1,
@@ -441,15 +453,26 @@ func TestRegistrationRecordUpdateIPLimit(t *testing.T) {
 				}
 			}
 
-			// Update node 0 to moveIP with a newer ENR.
-			r.AddNodes(nil, []*enode.Node{nodeWithSeq(nodes[0].ID(), c.moveIP, nodes[0].Seq()+1)})
+			// Offer node 0 a new record. A non-newer seq must be ignored.
+			seq := nodes[0].Seq() + 1
+			if c.sameSeq {
+				seq = nodes[0].Seq()
+			}
+			r.AddNodes(nil, []*enode.Node{nodeWithSeq(nodes[0].ID(), c.moveIP, seq)})
 
 			att, ok := bucket.att[nodes[0].ID()]
 			if ok != c.wantKept {
 				t.Fatalf("after update: kept=%v, want %v", ok, c.wantKept)
 			}
-			if c.wantKept && !att.Node.IP().Equal(c.moveIP) {
-				t.Fatalf("record not updated: got IP %v, want %v", att.Node.IP(), c.moveIP)
+			if c.wantKept {
+				// A stale update is ignored, so the endpoint stays as it was.
+				wantIP := c.moveIP
+				if c.sameSeq {
+					wantIP = c.setup[0]
+				}
+				if !att.Node.IP().Equal(wantIP) {
+					t.Fatalf("endpoint after update: got %v, want %v", att.Node.IP(), wantIP)
+				}
 			}
 			// The other setup nodes are untouched by node 0's update and must remain.
 			for i := 1; i < len(nodes); i++ {
