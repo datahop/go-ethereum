@@ -65,14 +65,7 @@ type regBucket struct {
 }
 
 // updateIP moves the bucket's per-/24 IP accounting from old to new and reports
-// whether new is acceptable. It is the single IP-limit gate for both a fresh
-// registration (pass old = nil) and a record update:
-//
-//   - untracked endpoints (nil / LAN) are always accepted and not counted;
-//   - a new endpoint in old's /24 keeps the slot, leaving the count unchanged;
-//   - a tracked new endpoint in a full /24 is rejected, leaving the tracker
-//     unchanged (the old slot, if any, is retained);
-//   - otherwise the new slot is taken and the old one released.
+// whether new is acceptable. untracked ips (nil / LAN) are always accepted and not counted
 func (b *regBucket) updateIP(oldIP, newIP net.IP) bool {
 	oldTracked := oldIP != nil && !netutil.IsLAN(oldIP)
 	newTracked := newIP != nil && !netutil.IsLAN(newIP)
@@ -200,10 +193,7 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			if attempt.Node.Seq() >= n.Seq() {
 				continue
 			}
-			// Keep the bucket's IP tracker consistent for the new endpoint. If its
-			// /24 is full, drop the attempt rather than exceed the limit or keep
-			// the stale address; a later AddNodes can re-admit the node once the
-			// subnet frees up.
+			// Keep the bucket's IP tracker consistent if its ip changes. Drop the attempt if its going over bucket thresholds.
 			if !b.updateIP(attempt.Node.IP(), n.IP()) {
 				r.log.Debug("Dropping registration node", "id", id, "reason", "iplimit-on-record-update")
 				r.removeAttempt(attempt, "iplimit-on-record-update")
@@ -330,13 +320,7 @@ func (r *Registration) validate(att *RegAttempt) {
 func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, waitTime time.Duration) {
 	r.validate(att)
 
-	// Drop the attempt when a single quote already exceeds the registrant's
-	// total budget for this (topic, registrar) pair. Waiting longer than
-	// RegAttemptTimeout on one response is strictly worse than picking
-	// another registrar — the §6 eq. 1 formula can legitimately produce
-	// values above AdLifetime under heavy contention, so AdLifetime is too
-	// aggressive a threshold here; the cumulative cap below is the real
-	// budget.
+	// Drop the attempt when a single quote already exceeds the registrant's total allowed waiting time for the registration.
 	if waitTime > r.cfg.RegAttemptTimeout {
 		r.removeAttempt(att, "wtime-above-budget")
 		return
