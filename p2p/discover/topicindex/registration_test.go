@@ -229,45 +229,6 @@ func TestRegistrationIPCheck(t *testing.T) {
 	}
 }
 
-// TestRegistrationIPCheckOnRecordUpdate checks that when an already-known node
-// presents a newer record with a different endpoint, the per-bucket IP-limit
-// tracker is kept consistent, so the update can't be used to slip a second
-// address from the same subnet into the bucket.
-func TestRegistrationIPCheckOnRecordUpdate(t *testing.T) {
-	cfg := testConfig(t)
-	r := NewRegistration(topic1, cfg)
-
-	// node1 registers with an address in subnet A.
-	node1 := nodeAtDistance(enode.ID(topic1), 200, net.IP{192, 0, 2, 1})
-	r.AddNodes(nil, []*enode.Node{node1})
-	if r.NodeCount() != 1 {
-		t.Fatalf("expected 1 node after initial add, got %d", r.NodeCount())
-	}
-
-	// node1 presents a newer record that moves it to subnet B. The tracker must
-	// release subnet A and now count subnet B.
-	node1b := nodeWithSeq(node1.ID(), net.IP{198, 51, 100, 1}, node1.Seq()+1)
-	r.AddNodes(nil, []*enode.Node{node1b})
-
-	// A different node in subnet B must now be rejected: subnet B already holds
-	// node1's slot. Before the fix the tracker still counted subnet A, so this
-	// second subnet-B node was wrongly admitted.
-	node2 := nodeAtDistance(enode.ID(topic1), 200, net.IP{198, 51, 100, 2})
-	r.AddNodes(nil, []*enode.Node{node2})
-
-	if r.NodeCount() != 1 {
-		t.Fatalf("subnet limit bypassed on record update: got %d nodes, want 1", r.NodeCount())
-	}
-
-	// Subnet A must have been released by the move: a node in subnet A is now
-	// admitted. Before the fix its slot stayed counted forever (the leak).
-	node3 := nodeAtDistance(enode.ID(topic1), 200, net.IP{192, 0, 2, 2})
-	r.AddNodes(nil, []*enode.Node{node3})
-	if r.NodeCount() != 2 {
-		t.Fatalf("old subnet not released on record update: got %d nodes, want 2", r.NodeCount())
-	}
-}
-
 // This test checks that registration attempts are created for found nodes.
 func TestRegistrationRequests(t *testing.T) {
 	cfg := testConfig(t)
@@ -481,10 +442,7 @@ func TestRegistrationRecordUpdateIPLimit(t *testing.T) {
 			}
 
 			// Update node 0 to moveIP with a newer ENR.
-			var rec enr.Record
-			rec.Set(enr.IP(c.moveIP))
-			rec.SetSeq(nodes[0].Seq() + 1)
-			r.AddNodes(nil, []*enode.Node{enode.SignNull(&rec, nodes[0].ID())})
+			r.AddNodes(nil, []*enode.Node{nodeWithSeq(nodes[0].ID(), c.moveIP, nodes[0].Seq()+1)})
 
 			att, ok := bucket.att[nodes[0].ID()]
 			if ok != c.wantKept {
