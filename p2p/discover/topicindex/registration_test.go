@@ -463,3 +463,49 @@ func TestRegistrationRecordUpdateIPLimit(t *testing.T) {
 		t.Fatal("third node in the full /24 should have been rejected")
 	}
 }
+
+// TestRegistrationRecordUpdateIPLimitAboveOne checks the record-update handling
+// stays correct when the per-bucket /24 limit is greater than 1: dropping a node
+// that moved into a full subnet must not release a co-tenant's slot in the node's
+// old subnet. (The constant is 1 today; this guards a future change.)
+func TestRegistrationRecordUpdateIPLimitAboveOne(t *testing.T) {
+	cfg := testConfig(t)
+	r := NewRegistration(topic1, cfg)
+	base := enode.ID(topic1)
+
+	bi := r.bucketIndex(nodeAtDistance(base, 200, net.IP{9, 0, 2, 9}).ID())
+	r.buckets[bi].ips.Limit = 2 // raise the per-bucket /24 limit
+	bucket := &r.buckets[bi]
+
+	// /24-X: a, c. /24-Y (full): d, e.
+	a := nodeAtDistance(base, 200, net.IP{3, 0, 2, 1})
+	c := nodeAtDistance(base, 200, net.IP{3, 0, 2, 2})
+	d := nodeAtDistance(base, 200, net.IP{4, 0, 2, 1})
+	e := nodeAtDistance(base, 200, net.IP{4, 0, 2, 2})
+	r.AddNodes(nil, []*enode.Node{a, c, d, e})
+	for _, n := range []*enode.Node{a, c, d, e} {
+		if _, ok := bucket.att[n.ID()]; !ok {
+			t.Fatal("setup: node not admitted")
+		}
+	}
+
+	// a moves into /24-Y (full) → a dropped, c must keep its /24-X slot.
+	var rec enr.Record
+	rec.Set(enr.IP(net.IP{4, 0, 2, 99}))
+	rec.SetSeq(a.Seq() + 1)
+	r.AddNodes(nil, []*enode.Node{enode.SignNull(&rec, a.ID())})
+	if _, ok := bucket.att[a.ID()]; ok {
+		t.Fatal("node a should have been dropped")
+	}
+
+	// /24-X now holds exactly 1 (c): exactly one more fits, a second is rejected.
+	f := nodeAtDistance(base, 200, net.IP{3, 0, 2, 3})
+	g := nodeAtDistance(base, 200, net.IP{3, 0, 2, 4})
+	r.AddNodes(nil, []*enode.Node{f, g})
+	if _, ok := bucket.att[f.ID()]; !ok {
+		t.Fatal("one more node should fit in /24-X (limit 2)")
+	}
+	if _, ok := bucket.att[g.ID()]; ok {
+		t.Fatal("second extra node exceeds /24 limit — c's slot was undercounted")
+	}
+}

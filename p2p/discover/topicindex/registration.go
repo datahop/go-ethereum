@@ -188,10 +188,15 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			if newIP != nil && !netutil.IsLAN(newIP) && !b.ips.Add(newIP) {
 				// The new subnet is full. We can neither keep the stale address
 				// nor exceed the per-subnet limit, so give up on the node; a
-				// later AddNodes can re-admit it once the subnet frees up. Leave
-				// attempt.Node at the old (already-released) endpoint so
-				// removeAttempt doesn't release the new subnet's slot, which
-				// belongs to a different node.
+				// later AddNodes can re-admit it once the subnet frees up.
+				//
+				// Restore the old slot first so removeAttempt (which releases
+				// attempt.Node's IP) decrements the right subnet exactly once.
+				// This keeps the tracker correct even if the per-bucket IP limit
+				// is ever raised above 1.
+				if oldIP != nil && !netutil.IsLAN(oldIP) {
+					b.ips.Add(oldIP)
+				}
 				r.log.Debug("Dropping registration node", "id", id, "reason", "iplimit-on-record-update")
 				r.removeAttempt(attempt, "iplimit-on-record-update")
 				r.refillAttempts(b)
