@@ -101,10 +101,6 @@ func TestTopicTableRandomNodes(t *testing.T) {
 	t.Run(fmt.Sprint(N+1), func(t *testing.T) { check(t, N+1, N) })
 }
 
-// TestTopicTableEviction checks that ads are evicted when they expire: at the
-// right time (not before), driven by expiry rather than by the table filling up,
-// dropping only the expired ad while newer ones stay — and that a full table can
-// then admit a fresh registrant once an expired ad is reclaimed.
 func TestTopicTableEviction(t *testing.T) {
 	simclock := new(mclock.Simulated)
 	cfg := testConfig(t)
