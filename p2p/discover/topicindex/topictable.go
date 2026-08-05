@@ -189,9 +189,6 @@ func (tab *TopicTable) add(n *enode.Node, topic TopicID) *topicTableEntry {
 		tab.reg[topic] = list.New()
 	}
 	reg.topicElem = tab.reg[topic].PushFront(reg)
-	// Append to the back so tab.all stays ordered by expiry (soonest at the
-	// front). Expire and NextExpiryTime rely on this: with a uniform ad
-	// lifetime, insertion order is expiry order.
 	reg.allElem = tab.all.PushBack(reg)
 	tab.wt.addReg(reg)
 	return reg
