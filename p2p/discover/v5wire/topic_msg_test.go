@@ -222,6 +222,7 @@ func TestTopicMessageOversizedFields(t *testing.T) {
 		{"topicquery-many-buckets", TopicQueryMsg, rlpMust(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: make([]uint, 100000)})},
 		{"topicnodes-many-nodes", TopicNodesMsg, rlpMust(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: manyRecords(5000)})},
 		{"regtopic-huge-ticket", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: make([]byte, 1<<20), ENR: rec, Buckets: []uint{}})},
+		{"regconfirmation-huge-ticket", RegconfirmationMsg, rlpMust(&Regconfirmation{ReqID: []byte{1}, RespCount: 1, Ticket: make([]byte, 1<<20)})},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
