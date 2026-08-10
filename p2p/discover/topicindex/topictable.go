@@ -35,9 +35,6 @@ const (
 
 	// scales the occupancy-based part of the waiting time
 	waitTimeBaseModifier = 0.1
-
-	// safety
-	waitTimeSafetyMod = 0.000001
 )
 
 // If a node has less than this time to wait, they will be accepted anyway.
@@ -266,11 +263,11 @@ func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (t
 		}
 	}
 
-	// The safety term keeps the total strictly positive. Applying it to the total
-	// (rather than adding it) matches the previous max(sum, G) behaviour exactly
-	// when no lower bound is active.
-	safety := baseTime * waitTimeSafetyMod
-	neededTime := math.Max(chargedService+chargedIP, safety)
+	// No occupancy-scaled safety floor: it was a baseTime multiplier, so it did
+	// nothing at light load (swamped by topicTableWaitTimeFloor) yet exploded at
+	// high occupancy, quoting empty-topic/diverse-IP registrants absurd waits.
+	// The wait is just the (lower-bounded) service and IP components.
+	neededTime := chargedService + chargedIP
 	return time.Duration(math.Ceil(neededTime * float64(time.Second))), comps
 }
 
