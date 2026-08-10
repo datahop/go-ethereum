@@ -272,13 +272,3 @@ func TestTopicDiscoveryFilterNodes(t *testing.T) {
 		t.Fatal("wrong node passed filter")
 	}
 }
-
-func countRegistrants(found map[enode.ID]bool, registrants map[enode.ID]bool) int {
-	count := 0
-	for id := range found {
-		if registrants[id] {
-			count++
-		}
-	}
-	return count
-}
