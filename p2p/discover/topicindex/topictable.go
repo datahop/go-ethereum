@@ -330,7 +330,6 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 
 	// Check if there is space. If not, the node needs to come back when a slot opens.
 	if tab.all.Len() >= tab.config.AdCacheSize {
-		tab.recordWaitTime(comps, now)
 		return tab.NextExpiryTime().Sub(now)
 	}
 
