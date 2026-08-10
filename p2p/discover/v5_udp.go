@@ -1411,7 +1411,12 @@ func (t *UDPv5) collectTopicAuxNodes(topic topicindex.TopicID, reqDist []uint, r
 	check := func(n *enode.Node) bool {
 		return topicindex.SupportsTopicDiscovery(n) && netutil.CheckRelayAddr(remoteIP, n.IPAddr()) == nil
 	}
-	return t.tab.collectOnePerDist(enode.ID(topic), reqDist, regtopicNodesLimit, check)
+	// One node is returned per distance, so cap the requested distances to keep
+	// the response (and the scan) within regtopicNodesLimit.
+	if len(reqDist) > regtopicNodesLimit {
+		reqDist = reqDist[:regtopicNodesLimit]
+	}
+	return t.tab.collectOnePerDist(enode.ID(topic), reqDist, check)
 }
 
 func waitTimeToMs(d time.Duration) uint {

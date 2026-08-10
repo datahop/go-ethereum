@@ -138,7 +138,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 	return s
 }
 
-// IsDone reports whether the search table is saturated. When it returns true,
+// IsDone reports when the search table peers are all consumed. When it returns true,
 // this search state should be abandoned and a new search started using a
 // fresh Search instance.
 func (s *Search) IsDone() bool {

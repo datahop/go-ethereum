@@ -296,3 +296,76 @@ func TestSearchResultsTracking(t *testing.T) {
 		s.PopResult()
 	}
 }
+
+// TestSearchBucketDistanceClamp verifies that nodes closer to the topic than
+// the table depth are clamped into the last (closest) bucket instead of being
+// dropped.
+func TestSearchBucketDistanceClamp(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	var (
+		close5  = nodesAtDistanceFrom(enode.ID(topic1), 5, 1, 20)
+		close20 = nodesAtDistanceFrom(enode.ID(topic1), 20, 1, 30)
+	)
+	s.AddNodes(nil, close5)
+	s.AddNodes(nil, close20)
+
+	last := len(s.buckets) - 1
+	if !sbContainsAll(s.buckets[last], close5) {
+		t.Fatalf("close5 nodes missing in bucket[%d]", last)
+	}
+	if !sbContainsAll(s.buckets[last], close20) {
+		t.Fatalf("close20 nodes missing in bucket[%d]", last)
+	}
+}
+
+// TestSearchBucketsWithFreeSpace verifies that BucketsWithFreeSpace reports
+// the topic distance of every bucket with room left, that a full bucket
+// drops out of the list, and that asked nodes keep occupying their slot.
+func TestSearchBucketsWithFreeSpace(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+
+	// On a fresh table, every bucket has free space, covering the full
+	// distance range 256 .. 256-searchTableDepth+1.
+	dists := s.BucketsWithFreeSpace(nil)
+	if len(dists) != searchTableDepth {
+		t.Fatalf("fresh table reports %d buckets with free space, want %d", len(dists), searchTableDepth)
+	}
+	seen := make(map[uint]bool, len(dists))
+	for _, d := range dists {
+		seen[d] = true
+	}
+	for d := uint(256); d > uint(256-searchTableDepth); d-- {
+		if !seen[d] {
+			t.Fatalf("distance %d missing from free-space list %v", d, dists)
+		}
+	}
+
+	// Fill bucket 0 (distance 256) to capacity: it must drop out of the
+	// list while all other buckets remain.
+	full := nodesAtDistanceFrom(enode.ID(topic1), 256, s.cfg.SearchBucketSize, 1)
+	s.AddNodes(nil, full)
+	if got := s.buckets[0].count(); got != s.cfg.SearchBucketSize {
+		t.Fatalf("setup: bucket[0] holds %d nodes, want %d", got, s.cfg.SearchBucketSize)
+	}
+	dists = s.BucketsWithFreeSpace(nil)
+	if len(dists) != searchTableDepth-1 {
+		t.Fatalf("got %d buckets with free space, want %d", len(dists), searchTableDepth-1)
+	}
+	for _, d := range dists {
+		if d == 256 {
+			t.Fatal("full bucket[0] (distance 256) still reported as having free space")
+		}
+	}
+
+	// Querying a node moves it from `new` to `asked`, but it keeps
+	// occupying its slot: the bucket must remain full.
+	s.AddQueryResults(full[0], nil)
+	for _, d := range s.BucketsWithFreeSpace(nil) {
+		if d == 256 {
+			t.Fatal("bucket[0] reported free after a response; asked nodes must keep their slot")
+		}
+	}
+}
