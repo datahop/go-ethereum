@@ -19,6 +19,7 @@ package topicindex
 import (
 	"container/heap"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -61,6 +62,23 @@ type regBucket struct {
 	count [nRegStates]int
 
 	ips netutil.DistinctNetSet
+}
+
+// updateIP moves the bucket's per-/24 IP accounting from old to new and reports
+// whether new is acceptable. untracked ips (nil / LAN) are always accepted and not counted
+func (b *regBucket) updateIP(oldIP, newIP net.IP) bool {
+	oldTracked := oldIP != nil && !netutil.IsLAN(oldIP)
+	newTracked := newIP != nil && !netutil.IsLAN(newIP)
+	if oldTracked && newTracked && netutil.SameNet(regBucketSubnet, oldIP, newIP) {
+		return true
+	}
+	if newTracked && !b.ips.Add(newIP) {
+		return false
+	}
+	if oldTracked {
+		b.ips.Remove(oldIP)
+	}
+	return true
 }
 
 const (
@@ -171,11 +189,18 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		b := &r.buckets[bi]
 		attempt, ok := b.att[id]
 		if ok {
-			// There is already an attempt scheduled with this node.
-			// Update the record if newer.
-			if attempt.Node.Seq() < n.Seq() {
-				attempt.Node = n
+			// Already scheduled: update the record if newer.
+			if attempt.Node.Seq() >= n.Seq() {
+				continue
 			}
+			// Keep the bucket's IP tracker consistent if its ip changes. Drop the attempt if its going over bucket thresholds.
+			if !b.updateIP(attempt.Node.IP(), n.IP()) {
+				r.log.Debug("Dropping registration node", "id", id, "reason", "iplimit-on-record-update")
+				r.removeAttempt(attempt, "iplimit-on-record-update")
+				r.refillAttempts(b)
+				continue
+			}
+			attempt.Node = n
 			continue
 		}
 
@@ -194,8 +219,7 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 			continue
 		}
 
-		ip := n.IP()
-		if ip != nil && !netutil.IsLAN(ip) && !b.ips.Add(n.IP()) {
+		if !b.updateIP(nil, n.IP()) {
 			// IP doesn't fit in bucket limit.
 			r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "iplimit")
 			continue
@@ -311,13 +335,7 @@ func (r *Registration) validate(att *RegAttempt) {
 func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, waitTime time.Duration) {
 	r.validate(att)
 
-	// Drop the attempt when a single quote already exceeds the registrant's
-	// total budget for this (topic, registrar) pair. Waiting longer than
-	// RegAttemptTimeout on one response is strictly worse than picking
-	// another registrar — the §6 eq. 1 formula can legitimately produce
-	// values above AdLifetime under heavy contention, so AdLifetime is too
-	// aggressive a threshold here; the cumulative cap below is the real
-	// budget.
+	// Drop the attempt when a single quote already exceeds the registrant's total allowed waiting time for the registration.
 	if waitTime > r.cfg.RegAttemptTimeout {
 		r.removeAttempt(att, "wtime-above-budget")
 		return
