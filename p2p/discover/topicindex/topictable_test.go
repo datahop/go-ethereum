@@ -253,6 +253,58 @@ func TestTopicTableWaitTimeFloor(t *testing.T) {
 	}
 }
 
+func TestTopicTableEviction(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.AdCacheSize = 3
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+	L := tab.AdLifetime()
+	t0 := simclock.Now()
+
+	// Two ads with staggered expiry. The table is not full, so any eviction here
+	// is driven by expiry time, not by capacity.
+	a, b := newNode(), newNode()
+	tab.Add(a, topic1) // A: exp = t0 + L
+	simclock.Run(time.Minute)
+	tab.Add(b, topic1) // B: exp = t0 + L + 1m
+
+	// The next expiry must be A's (the soonest), even with free space.
+	if got, want := tab.NextExpiryTime(), t0.Add(L); got != want {
+		t.Fatalf("NextExpiryTime = %v, want A's expiry %v", got, want)
+	}
+
+	// Just before A expires: nothing is evicted (not too early).
+	simclock.Run(L - time.Minute - time.Second) // now = t0 + L - 1s
+	tab.Expire()
+	if got := tab.all.Len(); got != 2 {
+		t.Fatalf("evicted before expiry: Len=%d, want 2", got)
+	}
+
+	// Just after A expires (B still live): only A is dropped.
+	simclock.Run(2 * time.Second) // now = t0 + L + 1s
+	tab.Expire()
+	if tab.isRegistered(a, topic1) {
+		t.Fatal("expired ad A was not evicted")
+	}
+	if !tab.isRegistered(b, topic1) {
+		t.Fatal("live ad B was wrongly evicted")
+	}
+
+	// Fill the table (B + two fresh ads), confirm it's full, then let B expire so
+	// exactly one slot frees and a new registrant can be admitted.
+	tab.Add(newNode(), topic1)
+	tab.Add(newNode(), topic1)
+	if tab.Add(newNode(), topic1) {
+		t.Fatal("table should be full")
+	}
+	simclock.Run(time.Minute) // now = t0 + L + 1m + 1s : B expired, the two fresh ads live
+	tab.Expire()
+	if !tab.Add(newNode(), topic1) {
+		t.Fatal("full table did not admit a new ad after eviction")
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	return Config{
 		AdCacheSize: 20,
