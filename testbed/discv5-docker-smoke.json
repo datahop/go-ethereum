@@ -1,0 +1,21 @@
+{
+    "nodes": 10,
+    "topic": 2,
+    "searchIterations": 3,
+    "returnedNodes": 8,
+
+    "pingInterval": 10,
+    "bucketRefreshInterval": 60,
+    "adCacheSize": 100,
+    "adLifetimeSeconds": 60,
+    "regBucketSize": 5,
+    "regBucketStandbySize": 10,
+    "searchBucketSize": 5,
+
+    "rpcSearchTimeoutSeconds": 60,
+
+    "minLatencyMs": 2,
+    "maxLatencyMs": 40,
+    "minBandwidthMbit": 100,
+    "maxBandwidthMbit": 1000
+}

@@ -6,8 +6,11 @@ replace github.com/ethereum/go-ethereum => ../..
 
 replace github.com/marcopolo/simnet => github.com/srene/simnet v0.0.8-0.20260514104505-b1b838a35825
 
+replace github.com/ethereum/go-ethereum-vanilla => /home/sergi/geth-vanilla
+
 require (
 	github.com/ethereum/go-ethereum v1.17.2
+	github.com/ethereum/go-ethereum-vanilla v1.17.3
 	github.com/marcopolo/simnet v0.0.7
 )
 

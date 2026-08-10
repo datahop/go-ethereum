@@ -792,11 +792,19 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, limit int
 			continue
 		}
 
-		b := tab.bucketAtDistance(int(dist))
-		for _, n := range b.entries {
-			if check(n.Node) {
-				nodes = append(nodes, n.Node)
-				break // one per distance
+		// #55 fix: pick one node at logdist(target, n) == dist (distance from the
+		// topic/target), scanning all buckets. bucketAtDistance keys off self.
+		for bi := range tab.buckets {
+			matched := false
+			for _, n := range tab.buckets[bi].entries {
+				if uint(enode.LogDist(target, n.ID())) == dist && check(n.Node) {
+					nodes = append(nodes, n.Node)
+					matched = true
+					break // one per distance
+				}
+			}
+			if matched {
+				break
 			}
 		}
 		if len(nodes) >= limit {

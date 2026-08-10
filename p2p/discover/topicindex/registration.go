@@ -101,7 +101,7 @@ type RegAttempt struct {
 	// lives on the attempt, it is freed when the registrar is evicted — so the
 	// per-source accounting is tied to the registrar's lifetime rather than
 	// accumulating forever in the buckets.
-	filledBuckets map[int]struct{}
+	filledBuckets map[int]int
 
 	index  int // index in regHeap
 	bucket *regBucket
@@ -192,8 +192,8 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		// entry to a given bucket, within a single response and across responses.
 		// This prevents a single registrar from dominating a bucket.
 		if srcAtt != nil {
-			if _, ok := srcAtt.filledBuckets[bi]; ok {
-				r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "source-already-in-bucket")
+			if srcAtt.filledBuckets[bi] >= r.cfg.MaxNodesPerSourcePerBucket {
+				r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "max-per-source-per-bucket")
 				continue
 			}
 		}
@@ -211,13 +211,13 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 
 		// Create a new attempt.
-		att := &RegAttempt{Node: n, bucket: b, index: -1, filledBuckets: make(map[int]struct{})}
+		att := &RegAttempt{Node: n, bucket: b, index: -1, filledBuckets: make(map[int]int)}
 		b.att[id] = att
 		b.count[att.State]++
 		// Record that the source has now filled this bucket, so a later
 		// response from the same registrar can't add another entry here.
 		if srcAtt != nil {
-			srcAtt.filledBuckets[bi] = struct{}{}
+			srcAtt.filledBuckets[bi]++
 		}
 		r.refillAttempts(att.bucket)
 	}
@@ -307,7 +307,7 @@ func (r *Registration) Update() *RegAttempt {
 			// drop this one instead and keep count[Standby] within
 			// RegBucketStandbyLimit. Either way the freed Registered slot
 			// is backfilled from standby by refillAttempts.
-			if att.bucket.count[Standby] >= r.cfg.RegBucketStandbyLimit {
+			if r.cfg.RemoveOnExpiry || att.bucket.count[Standby] >= r.cfg.RegBucketStandbyLimit {
 				r.removeAttempt(att, "expired")
 			} else {
 				heap.Remove(&r.heap, att.index)

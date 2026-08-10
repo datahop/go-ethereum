@@ -449,6 +449,8 @@ def main():
     ap.add_argument("--label", default=None)
     ap.add_argument("--params", nargs="*", default=[],
                     help="key=value pairs stamped into the report's parameters table")
+    ap.add_argument("--max-node-idx", type=int, default=0,
+                    help="if >0, drop searcher results with nodeIdx >= this (excludes mid-run churn joiners; keeps stable nodes)")
     args = ap.parse_args()
 
     label = args.label or os.path.splitext(os.path.basename(args.metrics_json))[0]
@@ -458,6 +460,8 @@ def main():
     data = load(args.metrics_json)
     per_topic = data["perTopic"]
     results = data["results"]
+    if args.max_node_idx > 0:
+        results = [r for r in results if r.get("nodeIdx", 0) < args.max_node_idx]
     cov_by_topic = data.get("registrationCoverage", {}).get("byTopic", {})
     reg_timing = data.get("registrationTimingNs", {})
 

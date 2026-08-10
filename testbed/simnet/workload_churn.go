@@ -6,27 +6,143 @@ import (
 	"sync"
 	"time"
 
+	"github.com/marcopolo/simnet"
+
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
 // churnParams configures node churn during the search phase.
 type churnParams struct {
-	Interval time.Duration // time between churn rounds (0 = no churn)
-	Frac     float64       // fraction of the active population killed each round
+	Interval    time.Duration // time between churn rounds (0 = no churn)
+	Frac        float64       // fraction of the active population churned each round
+	SteadyState bool          // if true, each churn action is 50/50 leave/join (stable population); else kill-only decay
 }
 
-// runChurnWorkload runs the multi-topic register+search workload, but kills a
-// fraction of the active (DISC-NG) nodes at a fixed cadence during the search
-// phase. It exercises the failure-driven blacklist/eviction path (#71): a
-// killed node stops answering discv5 RPCs, so peers' revalidation pings and
-// topic queries to it time out, and after MaxNodeFailures it is blacklisted and
-// evicted from registration/search tables and ad caches.
+// churnState tracks the live node population as it changes under steady-state
+// churn (nodes leaving and joining). It is the source of truth for which nodes
+// are alive (kill candidates and bootstrap sources) and which have been killed.
+type churnState struct {
+	mu       sync.Mutex
+	all      []nodeRec         // every node ever created (alive + dead); for monitor + teardown
+	alive    []nodeRec         // currently-alive active nodes (leave candidates / bootstrap pool)
+	aliveIdx map[enode.ID]int  // id -> index in alive, for swap-remove
+	killed   map[enode.ID]bool // ids that have left
+	nextIdx  int               // next node index (endpoint IP) for a joiner
+}
+
+func newChurnState(initial []nodeRec, activeIdx []int, nextIdx int) *churnState {
+	cs := &churnState{
+		all:      append([]nodeRec(nil), initial...),
+		aliveIdx: make(map[enode.ID]int, len(activeIdx)),
+		killed:   make(map[enode.ID]bool),
+		nextIdx:  nextIdx,
+	}
+	for _, i := range activeIdx {
+		cs.aliveIdx[initial[i].ln.ID()] = len(cs.alive)
+		cs.alive = append(cs.alive, initial[i])
+	}
+	return cs
+}
+
+// leaveRandom removes a random alive node, marks it killed, and returns it.
+func (cs *churnState) leaveRandom(rng *rand.Rand) (nodeRec, bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if len(cs.alive) == 0 {
+		return nodeRec{}, false
+	}
+	i := rng.Intn(len(cs.alive))
+	rec := cs.alive[i]
+	last := len(cs.alive) - 1
+	cs.alive[i] = cs.alive[last]
+	cs.aliveIdx[cs.alive[i].ln.ID()] = i
+	cs.alive = cs.alive[:last]
+	delete(cs.aliveIdx, rec.ln.ID())
+	cs.killed[rec.ln.ID()] = true
+	return rec, true
+}
+
+// join adds a newly-spawned node to the alive population.
+func (cs *churnState) join(rec nodeRec) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.all = append(cs.all, rec)
+	cs.aliveIdx[rec.ln.ID()] = len(cs.alive)
+	cs.alive = append(cs.alive, rec)
+}
+
+// nextIndex returns a fresh node index (and the endpoint IP it implies).
+func (cs *churnState) nextIndex() int {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	idx := cs.nextIdx
+	cs.nextIdx++
+	return idx
+}
+
+func (cs *churnState) aliveSample(max int, rng *rand.Rand) []*enode.Node {
+	cs.mu.Lock()
+	pool := append([]nodeRec(nil), cs.alive...)
+	cs.mu.Unlock()
+	return sampleBootnodes(pool, max, rng)
+}
+
+func (cs *churnState) snapshotAll() []nodeRec {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return append([]nodeRec(nil), cs.all...)
+}
+
+func (cs *churnState) snapshotKilled() map[enode.ID]bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	c := make(map[enode.ID]bool, len(cs.killed))
+	for id := range cs.killed {
+		c[id] = true
+	}
+	return c
+}
+
+func (cs *churnState) counts() (alive, killed, total int) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return len(cs.alive), len(cs.killed), len(cs.all)
+}
+
+// sampleAliveBlacklist sums BlacklistLen() over up to max randomly-sampled alive
+// nodes, returning the sum and the sample size. Sampling bounds the cost so the
+// monitor stays responsive while 10k searchers contend on the topic systems.
+func (cs *churnState) sampleAliveBlacklist(max int, rng *rand.Rand) (sum, sampled int) {
+	cs.mu.Lock()
+	alive := append([]nodeRec(nil), cs.alive...)
+	cs.mu.Unlock()
+	if max > 0 && len(alive) > max {
+		rng.Shuffle(len(alive), func(i, j int) { alive[i], alive[j] = alive[j], alive[i] })
+		alive = alive[:max]
+	}
+	for _, n := range alive {
+		sum += n.disc.BlacklistLen()
+	}
+	return sum, len(alive)
+}
+
+// runChurnWorkload runs the multi-topic register+search workload while churning
+// the active population during the search phase.
 //
-// It reports, over time and at the end: how many nodes are blacklisted across
-// the surviving network, and how many killed registrants are still visible in
-// any topic table (which should decay toward zero as eviction fires).
-func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, registerWait, searchTimeout, regProbePeriod, registerStagger time.Duration, churn churnParams, metricsOut string, pacing searchPacing) {
+// In steady-state mode (the default) each churn action is a coin flip: with
+// probability 0.5 a random live node leaves (is killed), and with probability
+// 0.5 a fresh node joins — it spawns, bootstraps off the live network, registers
+// its (Zipf-drawn) topic, and starts searching. The population therefore stays
+// roughly constant rather than draining to zero, so the network keeps
+// functioning and the dead-result metrics reflect steady-state churn instead of
+// collapse. In kill-only mode it only kills, as before.
+//
+// It reports, over time and at the end: alive/killed counts, blacklist growth
+// across the surviving network, how many killed registrants are still visible in
+// some topic table (should decay as eviction fires), and the dead-result metrics
+// (how often searches return already-dead registrants, and how stale they were).
+func runChurnWorkload(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, maxBootnodes int, refreshInterval time.Duration, all []nodeRec, numTopics int, zipfS float64, seed int64, registerWait, searchTimeout, regProbePeriod, registerStagger time.Duration, churn churnParams, metricsOut string, pacing searchPacing) {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
@@ -35,36 +151,39 @@ func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, r
 	if numTopics > 1 {
 		zipf = rand.NewZipf(rng, zipfS, 1.0, uint64(numTopics-1))
 	}
+	drawTopic := func() int {
+		if zipf == nil {
+			return 0
+		}
+		return int(zipf.Uint64())
+	}
 
 	topics := make([]topicindex.TopicID, numTopics)
 	for i := range topics {
 		topics[i] = makeTopic(i)
 	}
 
-	// Topic assignment: only DISC-NG-active (non-legacy) nodes get a topic.
+	// Topic assignment for the initial population. Only DISC-NG-active
+	// (non-legacy) nodes get a topic; legacy nodes stay passive substrate.
+	mem := newTopicMembership(numTopics)
 	nodeTopic := make([]int, len(all))
-	registrantsByTopic := make(map[int]map[enode.ID]struct{}, numTopics)
-	regTopicOf := make(map[enode.ID]int, len(all))
 	var activeIdx []int
 	for i := range all {
 		if all[i].legacy {
 			nodeTopic[i] = -1
 			continue
 		}
-		t := 0
-		if zipf != nil {
-			t = int(zipf.Uint64())
-		}
+		t := drawTopic()
 		nodeTopic[i] = t
-		if registrantsByTopic[t] == nil {
-			registrantsByTopic[t] = make(map[enode.ID]struct{})
-		}
-		registrantsByTopic[t][all[i].ln.ID()] = struct{}{}
-		regTopicOf[all[i].ln.ID()] = t
+		mem.add(all[i].ln.ID(), t)
 		activeIdx = append(activeIdx, i)
 	}
-	fmt.Printf("churn workload: %d nodes total, %d active across %d topics; churn frac=%.2f interval=%s\n",
-		len(all), len(activeIdx), numTopics, churn.Frac, churn.Interval)
+	mode := "kill-only"
+	if churn.SteadyState {
+		mode = "steady-state (50/50 leave/join)"
+	}
+	fmt.Printf("churn workload: %d nodes total, %d active across %d topics; mode=%s frac=%.2f interval=%s\n",
+		len(all), len(activeIdx), numTopics, mode, churn.Frac, churn.Interval)
 
 	// Phase 1: register (with optional stagger).
 	regStart := time.Now()
@@ -83,42 +202,55 @@ func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, r
 
 	probeStop := make(chan struct{})
 	probeDone := make(chan map[string]map[string]int64, 1)
+	probeNodeTopics := make([][]int, len(nodeTopic))
+	for i, t := range nodeTopic {
+		probeNodeTopics[i] = []int{t}
+	}
 	go func() {
-		probeDone <- runRegistrationProbe(all, topics, nodeTopic, regStart, probeStop, regProbePeriod)
+		probeDone <- runRegistrationProbe(all, topics, probeNodeTopics, regStart, probeStop, regProbePeriod)
 	}()
 	time.Sleep(registerWait)
 	close(probeStop)
 	regTimingNs := <-probeDone
 
 	// Baseline coverage snapshot (pre-churn).
-	allCov := snapshotMultiTopicCoverage(all, registrantsByTopic, topics)
-	printMultiTopicCoverage(allCov, registrantsByTopic, len(all))
+	baselineReg := mem.snapshot()
+	allCov := snapshotMultiTopicCoverage(all, baselineReg, topics)
+	printMultiTopicCoverage(allCov, baselineReg, len(all))
 
-	// Shared kill state.
-	var (
-		killMu    sync.Mutex
-		killedSet = make(map[enode.ID]bool)
-	)
-	// Tracks kill times to measure dead results returned in searches.
+	// Live population state + dead-result tracker.
+	cs := newChurnState(all, activeIdx, len(all))
 	deadTracker := newDeadResultTracker()
-	snapshotKilled := func() map[enode.ID]bool {
-		killMu.Lock()
-		defer killMu.Unlock()
-		c := make(map[enode.ID]bool, len(killedSet))
-		for id := range killedSet {
-			c[id] = true
-		}
-		return c
+
+	// Search phase: all searchers share one absolute deadline so late
+	// joiners stop with everyone else. Joiners are launched dynamically by
+	// the churn goroutine via sm.launch.
+	searchDeadline := time.Now().Add(searchTimeout)
+	sm := &searchManager{
+		deadline:    searchDeadline,
+		pacing:      pacing,
+		topics:      topics,
+		mem:         mem,
+		stats:       newLiveStats(numTopics, baselineReg),
+		deadTracker: deadTracker,
+	}
+	checkpointStop := make(chan struct{})
+	checkpointDone := make(chan struct{})
+	if pacing.Checkpoint > 0 {
+		go sm.stats.runCheckpoints(pacing.Checkpoint, checkpointStop, checkpointDone)
+	} else {
+		close(checkpointDone)
+	}
+	for i := range all {
+		sm.launch(all[i], nodeTopic[i])
 	}
 
-	// Pre-shuffled pool of active node records to kill from.
-	pool := make([]nodeRec, 0, len(activeIdx))
-	for _, i := range activeIdx {
-		pool = append(pool, all[i])
-	}
-	rng.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
-
-	// Churn goroutine: kill Frac of the active population each round.
+	// Churn goroutine: each round performs perRound actions. In steady-state
+	// mode each action is 50/50 leave/join; in kill-only mode each is a leave.
+	var (
+		churnMu sync.Mutex
+		joins   int
+	)
 	churnStop := make(chan struct{})
 	churnDone := make(chan struct{})
 	go func() {
@@ -132,33 +264,53 @@ func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, r
 		}
 		tick := time.NewTicker(churn.Interval)
 		defer tick.Stop()
-		next, round := 0, 0
+		round := 0
 		for {
 			select {
 			case <-churnStop:
 				return
 			case <-tick.C:
-				k := perRound
-				if rem := len(pool) - next; k > rem {
-					k = rem
-				}
-				if k <= 0 {
-					return // exhausted the pool
+				// Stop churning once the search deadline passes, so no
+				// searchers are launched after sm.wait begins draining.
+				if !time.Now().Before(searchDeadline) {
+					return
 				}
 				round++
-				killMu.Lock()
 				now := time.Now()
-				for c := 0; c < k; c++ {
-					rec := pool[next]
-					next++
-					killedSet[rec.ln.ID()] = true
+				leaves, roundJoins := 0, 0
+				for c := 0; c < perRound; c++ {
+					if churn.SteadyState && rng.Float64() < 0.5 {
+						// JOIN: spawn a fresh node, register, start searching.
+						idx := cs.nextIndex()
+						boot := cs.aliveSample(maxBootnodes, rng)
+						rec := spawnNode(sim, settings, idx, false, boot, refreshInterval)
+						t := drawTopic()
+						mem.add(rec.ln.ID(), t)
+						sm.stats.addAssigned(t)
+						cs.join(rec)
+						rec.disc.RegisterTopic(topics[t], uint64(rec.idx))
+						sm.launch(rec, t)
+						roundJoins++
+						continue
+					}
+					// LEAVE: kill a random live node.
+					rec, ok := cs.leaveRandom(rng)
+					if !ok {
+						if churn.SteadyState {
+							continue // nothing to kill; next action may join
+						}
+						return // kill-only: pool exhausted
+					}
 					deadTracker.markKilled(rec.ln.ID(), now)
 					go rec.disc.Close() // detached: Close can be slow at scale
+					leaves++
 				}
-				total := len(killedSet)
-				killMu.Unlock()
-				fmt.Printf("[churn round %d t=%ds] killed %d (total killed=%d/%d active)\n",
-					round, int(time.Since(regStart).Seconds()), k, total, len(activeIdx))
+				churnMu.Lock()
+				joins += roundJoins
+				churnMu.Unlock()
+				alive, killed, total := cs.counts()
+				fmt.Printf("[churn round %d t=%ds] leaves=%d joins=%d | alive=%d killed=%d total=%d\n",
+					round, int(time.Since(regStart).Seconds()), leaves, roundJoins, alive, killed, total)
 			}
 		}
 	}()
@@ -170,6 +322,7 @@ func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, r
 	}
 	monStop := make(chan struct{})
 	monDone := make(chan struct{})
+	monRng := rand.New(rand.NewSource(1))
 	go func() {
 		defer close(monDone)
 		tick := time.NewTicker(monInterval)
@@ -179,69 +332,87 @@ func runChurnWorkload(all []nodeRec, numTopics int, zipfS float64, seed int64, r
 			case <-monStop:
 				return
 			case <-tick.C:
-				killSnap := snapshotKilled()
-				totalBL, alive := 0, 0
-				for _, n := range all {
-					if killSnap[n.ln.ID()] {
-						continue
-					}
-					alive++
-					totalBL += n.disc.BlacklistLen()
-				}
-				visible := countKilledStillVisible(all, killSnap, topics, registrantsByTopic, regTopicOf)
-				fmt.Printf("[monitor t=%ds] alive=%d killed=%d blacklisted(sum)=%d killedRegistrantsStillVisible=%d\n",
-					int(time.Since(regStart).Seconds()), alive, len(killSnap), totalBL, visible)
+				// Keep each tick cheap: live counts are O(1) under the
+				// churnState lock, and the blacklist sum is sampled. The
+				// expensive full topic-table walk (countKilledStillVisible)
+				// is deferred to the final summary, when searches have
+				// stopped and lock contention is gone — doing it per-tick
+				// here stalls the monitor for minutes at 10k nodes.
+				alive, killed, total := cs.counts()
+				blSum, sampled := cs.sampleAliveBlacklist(2000, monRng)
+				fmt.Printf("[monitor t=%ds] alive=%d killed=%d total=%d blacklisted(sum over %d sampled)=%d\n",
+					int(time.Since(regStart).Seconds()), alive, killed, total, sampled, blSum)
 			}
 		}
 	}()
 
-	// Phase 2: searches run for the full search-timeout, concurrently with churn.
-	results := runMultiTopicSearches(all, nodeTopic, topics, registrantsByTopic, searchTimeout, pacing, deadTracker)
+	// Wait for searches (initial + joined) to finish, bounded so a wedged
+	// searcher cannot hang the run; the report is produced from whatever
+	// completed.
+	results := sm.wait(searchTimeout + 120*time.Second)
 
 	close(churnStop)
 	<-churnDone
 	close(monStop)
 	<-monDone
+	close(checkpointStop)
+	<-checkpointDone
 
-	// Final churn summary.
-	killSnap := snapshotKilled()
-	totalBL, alive := 0, 0
-	for _, n := range all {
-		if killSnap[n.ln.ID()] {
-			continue
-		}
-		alive++
-		totalBL += n.disc.BlacklistLen()
-	}
-	visible := countKilledStillVisible(all, killSnap, topics, registrantsByTopic, regTopicOf)
+	// Deliverables first. These are the point of the run and are cheap: they
+	// process already-collected results, not live per-node state. Emit them
+	// before any full-population scan so a slow (or watchdog-truncated) probe
+	// below can never prevent the metrics from being written.
+	alive, killed, total := cs.counts()
+	churnMu.Lock()
+	totalJoins := joins
+	churnMu.Unlock()
+	blSum, blSampled := cs.sampleAliveBlacklist(2000, rand.New(rand.NewSource(3)))
+	fmt.Println()
+	fmt.Println("=== churn summary ===")
+	fmt.Printf("  mode:                                              %s\n", mode)
+	fmt.Printf("  nodes that joined during run:                      %d\n", totalJoins)
+	fmt.Printf("  nodes killed during run:                           %d\n", killed)
+	fmt.Printf("  alive nodes at end:                                %d (of %d ever created)\n", alive, total)
+	fmt.Printf("  blacklist entries (sum over %d sampled alive):    %d\n", blSampled, blSum)
+	deadTracker.report()
+	reportMultiTopic(results, mem.snapshot(), topics, regTimingNs, metricsOut, allCov)
+
+	// Best-effort eviction-health probe LAST. The per-host topic-table walk is
+	// slow at 10k (every node is still running and contends on its topic
+	// system), so it is host-sampled and placed after the metrics above; if the
+	// watchdog truncates it, nothing important is lost.
+	nodes := cs.snapshotAll()
+	killSnap := cs.snapshotKilled()
 	killedRegistrants := 0
 	for id := range killSnap {
-		if _, ok := regTopicOf[id]; ok {
+		if _, ok := mem.topicFor(id); ok {
 			killedRegistrants++
 		}
 	}
-	fmt.Println()
-	fmt.Println("=== churn summary ===")
-	fmt.Printf("  nodes killed during run:                              %d\n", len(killSnap))
-	fmt.Printf("  alive nodes:                                          %d\n", alive)
-	fmt.Printf("  blacklist entries across alive nodes (sum):           %d\n", totalBL)
-	fmt.Printf("  killed registrants still visible in any topic table:  %d / %d  (lower = eviction working)\n",
-		visible, killedRegistrants)
-	deadTracker.report()
-
-	reportMultiTopic(results, registrantsByTopic, topics, regTimingNs, metricsOut, allCov)
+	visible, visibleHosts := countKilledStillVisible(nodes, killSnap, topics, 1000, rand.New(rand.NewSource(2)))
+	fmt.Printf("killed registrants still visible (sampled %d hosts): %d / %d  (lower = eviction working)\n",
+		visibleHosts, visible, killedRegistrants)
 }
 
-// countKilledStillVisible returns the number of distinct killed registrants
-// that are still present in at least one alive node's topic table. As the
-// blacklist/eviction path fires, this should decay toward zero.
-func countKilledStillVisible(all []nodeRec, killed map[enode.ID]bool, topics []topicindex.TopicID, registrantsByTopic map[int]map[enode.ID]struct{}, regTopicOf map[enode.ID]int) int {
+// countKilledStillVisible returns the number of distinct killed registrants that
+// are still present in at least one (sampled) alive host's topic table, plus the
+// number of hosts actually inspected. As the blacklist/eviction path fires this
+// should decay toward zero. Hosts are sampled to maxHosts because each host walk
+// copies that host's topic tables; an unbounded scan is too slow at 10k nodes.
+func countKilledStillVisible(nodes []nodeRec, killed map[enode.ID]bool, topics []topicindex.TopicID, maxHosts int, rng *rand.Rand) (visibleCount, hosts int) {
+	if maxHosts > 0 && len(nodes) > maxHosts {
+		nodes = append([]nodeRec(nil), nodes...)
+		rng.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+		nodes = nodes[:maxHosts]
+	}
 	visible := make(map[enode.ID]bool)
-	for _, host := range all {
+	inspected := 0
+	for _, host := range nodes {
 		if killed[host.ln.ID()] {
 			continue // skip dead hosts
 		}
-		for t := range registrantsByTopic {
+		inspected++
+		for t := range topics {
 			for _, n := range host.disc.LocalTopicNodes(topics[t]) {
 				id := n.ID()
 				if killed[id] {
@@ -250,5 +421,5 @@ func countKilledStillVisible(all []nodeRec, killed map[enode.ID]bool, topics []t
 			}
 		}
 	}
-	return len(visible)
+	return len(visible), inspected
 }

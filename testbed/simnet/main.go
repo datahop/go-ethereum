@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/marcopolo/simnet"
 )
 
@@ -40,8 +41,50 @@ func main() {
 	checkpointInterval := flag.Duration("checkpoint-interval", 0, "if > 0, print per-topic coverage snapshot at this cadence during the search phase; useful for long continuous runs to see progress without waiting for the final report")
 	refreshInterval := flag.Duration("refresh-interval", 0, "discv5 routing table refresh interval (0 = use discv5 default of 30 min). Lower values run more background random lookups; useful for long-running simnets where coverage plateaus if routing tables freeze")
 	churnInterval := flag.Duration("churn-interval", 0, "if > 0, run the churn workload: kill -churn-frac of the active nodes every interval during the search phase, exercising failure-driven blacklist/eviction (#71)")
-	churnFrac := flag.Float64("churn-frac", 0.1, "fraction of the active population killed each churn round (only used when -churn-interval > 0)")
+	churnFrac := flag.Float64("churn-frac", 0.1, "fraction of the active population churned each round (only used when -churn-interval > 0)")
+	churnMode := flag.String("churn-mode", "steadystate", "churn model when -churn-interval > 0: 'steadystate' (each action is 50/50 leave/join, keeping population ~constant) or 'killonly' (kill -churn-frac each round; population decays to zero)")
+	vanillaFrac := flag.Float64("vanilla-frac", 0, "if > 0, run the mixed-binary interop workload: this fraction of nodes run stock upstream geth v1.17.3 discv5 as routing substrate (real separate stack), the rest run TopDisc; measures whether TopDisc discovery interoperates with real upstream geth. TopDisc penetration = 1 - vanilla-frac")
+	adLifetime := flag.Duration("ad-lifetime", 0, "topic ad lifetime (0 = discv5 default of 15m); also drives RegAttemptTimeout = 1.5x this")
+	allRegister := flag.Bool("all-register", false, "single shared topic where every node both registers and searches it (uniform membership, no Zipf); routes through the multi-topic engine with 1 topic")
+	snapshotDirFlag := flag.String("snapshot-dir", "", "if set, write periodic per-registrant find-count snapshots + registrant manifest (id+logdist) here for offline spatial analysis")
+	searchBucketSize := flag.Int("search-bucket-size", 0, "topic search bucket size per distance bucket (0 = default 8); raises the 18*size per-search registrar ceiling")
+	nodesPerSourceBucket := flag.Int("nodes-per-source-bucket", 0, "max nodes accepted per source per bucket in search+registration tables (0 = default 1)")
+	regAttemptTimeout := flag.Duration("reg-attempt-timeout", 0, "max time a registrant waits on one registrar before giving up (0 = default 1.5x ad-lifetime)")
+	overheadOutFlag := flag.String("overhead-out", "", "if set, write per-node sent/received packet+byte counts to this JSON file")
+	reachOutFlag := flag.String("reach-out", "", "if set, write per-searcher queried-registrar sets + every registrar's topic-table contents here (bottleneck analysis)")
+	removeOnExpiryFlag := flag.Bool("remove-on-expiry", false, "on ad expiry, remove the registration instead of renewing (rotation experiment)")
+	commonTopicFlag := flag.Bool("common-topic", false, "with -topics N>1: every node registers+searches universal topic 0 plus one Zipf-drawn topic from 1..N-1")
 	flag.Parse()
+	commonTopicMode = *commonTopicFlag
+	nodeRemoveOnExpiry = *removeOnExpiryFlag
+	reachOut = *reachOutFlag
+	if reachOut != "" {
+		discover.EnableReach()
+	}
+	if *overheadOutFlag != "" {
+		discover.EnableTQRcv()
+	}
+	snapshotDir = *snapshotDirFlag
+	nodeSearchBucketSize = *searchBucketSize
+	nodeRegAttemptTimeout = *regAttemptTimeout
+	nodeNodesPerSourceBucket = *nodesPerSourceBucket
+
+	// Absolute watchdog: guarantee the process exits even if the workload or
+	// teardown wedges. The discv5 search-shutdown path can deadlock when a
+	// heavily- or fully-churned network leaves searcher goroutines stuck, and
+	// the post-teardown watchdog below only arms after the workload returns —
+	// so it cannot help if the workload itself hangs. This one is armed up
+	// front. It must clear every healthy-run delay before search even starts —
+	// the per-node spawn and register staggers (spawnDelay×N, registerStagger×N
+	// are minutes at 10k), plus bootstrap-wait, register-wait and the full
+	// search-timeout — then an 8-minute grace for teardown.
+	n := time.Duration(*nodes)
+	hardCap := n*(*spawnDelay) + *bootstrapWait + n*(*registerStagger) + *registerWait + *searchTimeout + 20*time.Minute
+	go func() {
+		time.Sleep(hardCap)
+		fmt.Printf("absolute watchdog (%s) expired; force-exiting\n", hardCap)
+		os.Exit(0)
+	}()
 
 	fmt.Printf("simnet-testbed: spawning %d nodes (latency=%dms, bw=%dMibps)\n",
 		*nodes, *latencyMs, *bandwidthMibps)
@@ -67,7 +110,25 @@ func main() {
 	sim.Start()
 	defer sim.Close()
 
-	all := spawnNodes(sim, settings, *nodes, legacySet, *maxBootnodes, *spawnDelay, *refreshInterval)
+	// Mixed-binary interop workload: a fraction of nodes run the real stock
+	// upstream geth v1.17.3 discv5 stack as substrate; the rest run TopDisc.
+	// This path has its own spawn/teardown (two stacks) and bypasses the normal
+	// single-stack path below.
+	if *vanillaFrac > 0 {
+		monitorStop := make(chan struct{})
+		monitorDone := make(chan struct{})
+		go monitorBuffers(sim, monitorStop, monitorDone)
+		pacing := searchPacing{Stagger: *searchStagger, MaxPause: *searchPauseMax, TargetCount: *searchTargetCount, Checkpoint: *checkpointInterval}
+		runVanillaInterop(sim, settings, *nodes, *vanillaFrac, *numTopics, *zipfS, *seed,
+			*bootstrapWait, *registerWait, *searchTimeout, *regProbePeriod, *registerStagger, *refreshInterval,
+			*maxBootnodes, *spawnDelay, *metricsOut, pacing)
+		close(monitorStop)
+		<-monitorDone
+		fmt.Println("teardown complete")
+		return
+	}
+
+	all := spawnNodes(sim, settings, *nodes, legacySet, *maxBootnodes, *spawnDelay, *refreshInterval, *adLifetime)
 	defer func() {
 		// Parallelize disc.Close across nodes. Sequential close of N
 		// nodes takes O(N × per-node-shutdown) which becomes minutes at
@@ -108,8 +169,14 @@ func main() {
 
 	switch {
 	case *churnInterval > 0:
-		runChurnWorkload(all, *numTopics, *zipfS, *seed, *registerWait, *searchTimeout, *regProbePeriod, *registerStagger,
-			churnParams{Interval: *churnInterval, Frac: *churnFrac}, *metricsOut, pacing)
+		runChurnWorkload(sim, settings, *maxBootnodes, *refreshInterval, all, *numTopics, *zipfS, *seed, *registerWait, *searchTimeout, *regProbePeriod, *registerStagger,
+			churnParams{Interval: *churnInterval, Frac: *churnFrac, SteadyState: *churnMode == "steadystate"}, *metricsOut, pacing)
+	case *allRegister:
+		nt := *numTopics
+		if nt < 1 {
+			nt = 1
+		}
+		runMultiTopicWorkload(all, nt, *zipfS, *seed, *registerWait, *searchTimeout, *regProbePeriod, *registerStagger, *metricsOut, pacing)
 	case *legacyFrac > 0 && *numTopics <= 1:
 		runDiscNGValidationWorkload(all, *registerWait, *searchTimeout, *metricsOut)
 	case *numTopics <= 1:
@@ -119,6 +186,16 @@ func main() {
 		// stay as passive Discv5 peers and only contribute to the
 		// routing-table substrate).
 		runMultiTopicWorkload(all, *numTopics, *zipfS, *seed, *registerWait, *searchTimeout, *regProbePeriod, *registerStagger, *metricsOut, pacing)
+	}
+	if *overheadOutFlag != "" {
+		tqByIdx := make(map[int]int64, len(all))
+		idByIdx := make(map[int]string, len(all))
+		for _, nr := range all {
+			tqByIdx[nr.idx] = discover.TopicQueryRcvCount(nr.ln.ID())
+			idByIdx[nr.idx] = nr.ln.ID().String()
+		}
+		dumpOverhead(*overheadOutFlag, tqByIdx, idByIdx)
+		fmt.Printf("overhead written to: %s\n", *overheadOutFlag)
 	}
 	fmt.Println("teardown complete")
 
