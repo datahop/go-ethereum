@@ -57,21 +57,13 @@ const (
 )
 
 // Decode-time bounds on the variable-length fields of the topic-discovery
-// messages. These are defense-in-depth: the transport MTU and the message
-// handlers bound these fields further, but the decoder should reject clearly
-// oversized inputs on its own.
+// messages. Worst-case limits.
 const (
-	// Worst-case decode bounds on the variable-length topic-message fields. They
-	// are deliberately loose upper limits — chosen so they can never reject a
-	// valid message — that reject only absurd inputs; the authoritative limits
-	// are enforced downstream (handler truncation, ticket Unpack, packet MTU).
-
-	// maxTopicBucketCount: one entry per log-distance; distance 0 is the node
-	// itself, so valid distances are 1..256.
+	// maxTopicBucketCount: one entry per log-distance; 
 	maxTopicBucketCount = 256
 	// maxTopicNodeCount: the discv5 per-response NODES limit.
 	maxTopicNodeCount = 16
-	// maxTicketSizeBytes: the sealed ticket is a fixed 90 bytes (Unpack enforces it).
+	// maxTicketSizeBytes: the sealed ticket is a fixed 90 bytes.
 	maxTicketSizeBytes = 90
 )
 
