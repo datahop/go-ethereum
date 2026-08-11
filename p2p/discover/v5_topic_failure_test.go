@@ -113,3 +113,41 @@ func TestTopicEvictNodeRemovesRegistration(t *testing.T) {
 	test.udp.topicSys.evictNode(ln1.Node().ID())
 	waitForCond(t, "evicted node removed from reg", func() bool { return reg.nodeCount() == 1 })
 }
+
+// TestTopicRegTimeoutTracksNotEvicts checks the local-vs-global split after
+// topic RPC failures were wired into the DHT wire-failure counter: a single
+// REGTOPIC timeout is counted toward the node's consecutive-failure tally (via
+// trackRequest) but does NOT evict the node's ad. Eviction is deferred to the
+// DHT's threshold — the old behaviour evicted on the first timeout, which this
+// test guards against.
+func TestTopicRegTimeoutTracksNotEvicts(t *testing.T) {
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	topic := topicindex.TopicID{9, 9, 9}
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.2.55:30303")
+	ln := test.getNode(key, addr)
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+
+	// Seed n's ad in the local topic table (owned by the dispatch goroutine).
+	done := make(chan struct{})
+	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, topic); close(done) }
+	<-done
+
+	// Make n a registration target and start registering; catch the REGTOPIC and
+	// never answer it, so the call times out.
+	test.table.addFoundNode(n, true)
+	test.udp.RegisterTopic(topic, 1)
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {})
+
+	// The timeout is counted toward n's consecutive wire-failure tally...
+	waitForCond(t, "regtopic timeout counted toward wire-failure tally", func() bool {
+		return test.db.FindFails(n.ID(), n.IPAddr()) >= 1
+	})
+	// ...but must not evict n's ad on the first timeout.
+	if got := test.udp.LocalTopicNodes(topic); len(got) != 1 || got[0].ID() != n.ID() {
+		t.Fatalf("ad evicted on first timeout; eviction should defer to the DHT threshold: %v", got)
+	}
+}
