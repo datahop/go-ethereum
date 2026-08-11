@@ -309,15 +309,12 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			if resp.err != nil {
 				reg.state.HandleErrorResponse(resp.att, resp.err)
 				if resp.err == errTimeout {
-					// Count the timeout toward the node's consecutive wire-failure
-					// tally. It is evicted from the topic tables only once that
-					// crosses the routing table's threshold (via evictRemovedNodes),
-					// not on the first timeout.
+					// Count the timeout toward the global eviction counter
 					sys.transport.trackTopicRequest(resp.att.Node, false)
 				}
 				continue
 			}
-			// The registrar responded: reset its consecutive wire-failure tally.
+			// The node responded: reset its global counter
 			sys.transport.trackTopicRequest(resp.att.Node, true)
 			wt := time.Duration(resp.msg.WaitTime) * time.Millisecond
 			if len(resp.msg.Ticket) > 0 {
@@ -500,9 +497,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				// shutdown cancel: liveness unknown, not a failure.
 			case resp.err != nil && len(resp.topicNodes)+len(resp.auxNodes) == 0:
 				// No nodes at all: drop the node from this search. A timeout counts
-				// toward its consecutive wire-failure tally; it is globally evicted
-				// (ads + parked attempts, via evictRemovedNodes) only once that
-				// crosses the routing table's threshold, not on the first timeout.
+				// toward its global wire eviction
 				state.HandleErrorResponse(resp.src, resp.err)
 				if resp.err == errTimeout {
 					sys.transport.trackTopicRequest(resp.src, false)
@@ -513,7 +508,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 					// node counts as responsive and is kept. Still log the error.
 					s.config.Log.Debug("TOPICQUERY/v5 failed", "topic", s.topic, "id", resp.src.ID(), "err", resp.err)
 				}
-				// The node responded: reset its consecutive wire-failure tally.
+				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 				state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
