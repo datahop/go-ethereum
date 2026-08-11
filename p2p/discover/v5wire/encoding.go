@@ -124,8 +124,7 @@ var (
 	// ErrInvalidReqID represents error when the ID is invalid.
 	ErrInvalidReqID = errors.New("request ID larger than 8 bytes")
 
-	// ErrOversizedField is returned when a topic message carries a
-	// variable-length field that exceeds its decode-time bound.
+	// ErrOversizedField is returned when a topic message carries a variable-length field that exceeds its decode-time bound.
 	ErrOversizedField = errors.New("oversized topic message field")
 )
 
