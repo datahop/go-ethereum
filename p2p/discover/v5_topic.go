@@ -355,10 +355,16 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			if resp.err != nil {
 				reg.state.HandleErrorResponse(resp.att, resp.err)
 				if resp.err == errTimeout {
-					sys.transport.evictTopicTableNode(resp.att.Node.ID())
+					// Count the timeout toward the node's consecutive wire-failure
+					// tally. It is evicted from the topic tables only once that
+					// crosses the routing table's threshold (via evictRemovedNodes),
+					// not on the first timeout.
+					sys.transport.trackTopicRequest(resp.att.Node, false)
 				}
 				continue
 			}
+			// The registrar responded: reset its consecutive wire-failure tally.
+			sys.transport.trackTopicRequest(resp.att.Node, true)
 			wt := time.Duration(resp.msg.WaitTime) * time.Millisecond
 			if len(resp.msg.Ticket) > 0 {
 				reg.state.HandleTicketResponse(resp.att, resp.msg.Ticket, wt)
@@ -542,15 +548,17 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			case resp.err == errClosed:
 				// shutdown cancel: liveness unknown, not a failure.
 			case resp.err != nil && len(resp.topicNodes)+len(resp.auxNodes) == 0:
-				// No nodes at all: drop the node. A partial response (some nodes
-				// before an error) is treated as a response by the default case.
+				// No nodes at all: drop the node from this search. A timeout counts
+				// toward its consecutive wire-failure tally; it is globally evicted
+				// (ads + parked attempts, via evictRemovedNodes) only once that
+				// crosses the routing table's threshold, not on the first timeout.
 				state.HandleErrorResponse(resp.src, resp.err)
-				// A timeout means the node is dead globally: evict its ads and
-				// its parked attempts in every reg table, as a DHT removal does.
 				if resp.err == errTimeout {
-					sys.evictNode(resp.src.ID())
+					sys.transport.trackTopicRequest(resp.src, false)
 				}
 			default:
+				// The node responded: reset its consecutive wire-failure tally.
+				sys.transport.trackTopicRequest(resp.src, true)
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 				state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
 			}

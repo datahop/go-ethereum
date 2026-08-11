@@ -70,10 +70,11 @@ func TestTopicDHTEvictionEvictsAd(t *testing.T) {
 	})
 }
 
-// TestTopicEvictNodeRemovesRegistration checks that evictNode (raised by a
-// failed TOPICQUERY) removes the node from a registration table, not just the
-// ad cache. Two nodes are registered so evicting one keeps NodeCount > 0 and
-// the session from restarting and re-seeding the evicted node from the table.
+// TestTopicEvictNodeRemovesRegistration checks that evictNode (raised when the
+// DHT drops a node after repeated wire failures) removes the node from a
+// registration table, not just the ad cache. Two nodes are registered so
+// evicting one keeps NodeCount > 0 and the session from restarting and
+// re-seeding the evicted node from the table.
 func TestTopicEvictNodeRemovesRegistration(t *testing.T) {
 	t.Parallel()
 	test := newUDPV5Test(t)
