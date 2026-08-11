@@ -59,7 +59,7 @@ const (
 // Decode-time bounds on the variable-length fields of the topic-discovery
 // messages. Worst-case limits.
 const (
-	// maxTopicBucketCount: one entry per log-distance; 
+	// maxTopicBucketCount: one entry per log-distance;
 	maxTopicBucketCount = 256
 	// maxTopicNodeCount: the discv5 per-response NODES limit.
 	maxTopicNodeCount = 16
