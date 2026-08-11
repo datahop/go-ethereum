@@ -1001,6 +1001,15 @@ func (t *UDPv5) evictTopicTableNode(id enode.ID) {
 	}
 }
 
+// trackTopicRequest feeds the outcome of a topic RPC (REGTOPIC/TOPICQUERY) into
+// the routing table's consecutive wire-failure counter — the same one FINDNODE
+// uses. A node is dropped, and evicted from the topic tables via
+// evictRemovedNodes, only after maxFindnodeFailures consecutive failures across
+// all wire requests; any successful response resets the count.
+func (t *UDPv5) trackTopicRequest(n *enode.Node, success bool) {
+	t.tab.trackRequest(n, success, nil)
+}
+
 // GetNode looks for a node record in table and database.
 func (t *UDPv5) GetNode(id enode.ID) *enode.Node {
 	if n := t.tab.getNode(id); n != nil {
