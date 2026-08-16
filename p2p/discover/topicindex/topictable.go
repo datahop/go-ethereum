@@ -263,6 +263,12 @@ func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (t
 		}
 	}
 
+	// The occupancy-scaled safety floor (baseTime * a tiny constant) was dropped:
+	// as a baseTime multiplier it did nothing at light load — sub-second, below
+	// the topicTableWaitTimeFloor admission slack — yet exploded at high
+	// occupancy, quoting an empty-topic / diverse-IP registrant an absurd wait
+	// even with free space. The wait is just the (lower-bounded) service and IP
+	// components.
 	neededTime := chargedService + chargedIP
 	return time.Duration(math.Ceil(neededTime * float64(time.Second))), comps
 }
