@@ -32,7 +32,7 @@ const (
 	// The table only keeps nodes at logdist(topic, n) > (256 - searchTableDepth).
 	// Should there be any nodes which are closer than this, they just go into the last
 	// (closest) bucket.
-	searchTableDepth = 18
+	searchTableDepth = 16
 
 	// IP subnet limit.
 	searchBucketSubnet, searchBucketIPLimit = 24, 1
