@@ -102,157 +102,6 @@ func TestTopicTableRandomNodes(t *testing.T) {
 	t.Run(fmt.Sprint(N+1), func(t *testing.T) { check(t, N+1, N) })
 }
 
-// TestTopicTableWaitTimeLowerBound verifies the paper §6 / spec §2.1.5
-// anti-gaming lower bound: once a wait time has been quoted to a registrant, a
-// later re-quote for the same (topic, id) cannot drop faster than real elapsed
-// time, i.e. w(t2) >= w(t1) - (t2 - t1). Without the lower bound, a registrant
-// that re-requests through a momentary occupancy dip is re-quoted the (much
-// lower) instantaneous wait, which is exactly the incumbent lock-in the bound
-// is meant to prevent.
-func TestTopicTableWaitTimeLowerBound(t *testing.T) {
-	clock := new(mclock.Simulated)
-	cfg := Config{
-		AdCacheSize: 100,
-		AdLifetime:  30 * time.Second,
-		Clock:       clock,
-		Log:         testlog.Logger(t, log.LvlTrace),
-	}
-	tab := NewTopicTable(cfg)
-
-	// Load the table with same-topic registrations so the computed wait for an
-	// outsider is large (high occupancy + topic-similarity modifier).
-	const fillers = 50
-	for i := 0; i < fillers; i++ {
-		n := nodeAtDistance(enode.ID(topic1), 200, intIP(i+1))
-		if !tab.Add(n, topic1) {
-			t.Fatalf("can't add filler node %d", i)
-		}
-	}
-
-	// Quote an outsider. This records the lower bound for (topic1, n.ID()).
-	n := nodeAtDistance(enode.ID(topic1), 100, net.IP{203, 0, 113, 1})
-	w1 := tab.WaitTime(n, topic1)
-	if w1 <= cfg.AdLifetime {
-		t.Fatalf("test setup: expected a large initial wait, got %v", w1)
-	}
-	t.Log("initial wait", w1)
-
-	// Advance to the filler lifetime and expire them. The table is now empty, so
-	// the *instantaneous* computed wait collapses toward zero — this is the
-	// occupancy dip an incumbent would exploit to reset its accumulated wait.
-	clock.Run(cfg.AdLifetime)
-	tab.Expire()
-	if tab.all.Len() != 0 {
-		t.Fatalf("expected empty table after expiry, got %d entries", tab.all.Len())
-	}
-
-	// A genuinely fresh outsider now gets only the small G floor (nothing to
-	// lower-bound). It must be in a different /24 than n, since the bound
-	// aggregates per /24.
-	fresh := nodeAtDistance(enode.ID(topic1), 100, net.IP{198, 51, 100, 2})
-	if wf := tab.WaitTime(fresh, topic1); wf > 5*time.Second {
-		t.Fatalf("fresh node should see only the small floor on an empty table, got %v", wf)
-	}
-
-	// The previously-quoted node must NOT be reset to the floor. Its quote may
-	// only have decayed by the elapsed time (AdLifetime).
-	w2 := tab.WaitTime(n, topic1)
-	t.Log("re-quoted wait after dip", w2)
-	if lb := w1 - cfg.AdLifetime; w2 < lb {
-		t.Fatalf("lower bound violated: w2=%v < w1-elapsed=%v", w2, lb)
-	}
-	if w2 <= 5*time.Second {
-		t.Fatalf("incumbent reset to the floor through the occupancy dip: %v", w2)
-	}
-
-	// Decay to completion: once timestamp+value has passed, the bound is dropped
-	// and the node is quoted only the small floor again.
-	clock.Run(w2 + time.Second)
-	tab.Expire()
-	if got := len(tab.wt.idBounds) + len(tab.wt.ipBounds); got != 0 {
-		t.Fatalf("expected all lower-bound tuples expired, got %d", got)
-	}
-	if w3 := tab.WaitTime(n, topic1); w3 > 5*time.Second {
-		t.Fatalf("expected only the small floor after the bound fully decayed, got %v", w3)
-	}
-}
-
-// TestTopicTableWaitTimeBoundPrefix verifies that the per-IP lower bound
-// aggregates by prefix — /24 for IPv4, /64 for IPv6 — so it can't be evaded by
-// rotating addresses within one allocation, while a different prefix stays
-// independent. Each node gets a distinct random id, so the only thing that can
-// carry the bound from one node to another is a shared IP prefix.
-func TestTopicTableWaitTimeBoundPrefix(t *testing.T) {
-	check := func(name string, first, samePrefix, otherPrefix net.IP) {
-		t.Run(name, func(t *testing.T) {
-			clock := new(mclock.Simulated)
-			cfg := Config{
-				AdCacheSize: 100,
-				AdLifetime:  30 * time.Second,
-				Clock:       clock,
-				Log:         testlog.Logger(t, log.LvlTrace),
-			}
-			tab := NewTopicTable(cfg)
-			for i := 0; i < 50; i++ {
-				if !tab.Add(nodeAtDistance(enode.ID(topic1), 200, intIP(i+1)), topic1) {
-					t.Fatalf("can't add filler %d", i)
-				}
-			}
-
-			// Quote `first` to record a bound for its prefix, then drain the table
-			// so the instantaneous computed wait collapses to ~0.
-			w1 := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, first), topic1)
-			if w1 <= cfg.AdLifetime {
-				t.Fatalf("setup: expected a large initial wait, got %v", w1)
-			}
-			clock.Run(cfg.AdLifetime)
-			tab.Expire()
-
-			// A node in the same prefix inherits the still-active bound.
-			if w := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, samePrefix), topic1); w <= 5*time.Second {
-				t.Errorf("same-prefix node was not bounded: got %v", w)
-			}
-			// A node in a different prefix is unaffected (only the small floor).
-			if w := tab.WaitTime(nodeAtDistance(enode.ID(topic1), 100, otherPrefix), topic1); w > 5*time.Second {
-				t.Errorf("different-prefix node was bounded: got %v", w)
-			}
-		})
-	}
-
-	check("ipv4",
-		net.IP{203, 0, 113, 1}, net.IP{203, 0, 113, 9}, net.IP{198, 51, 100, 9})
-	check("ipv6",
-		net.ParseIP("2001:db8:1:1::1"), net.ParseIP("2001:db8:1:1::9"), net.ParseIP("2001:db8:2:2::9"))
-}
-
-// TestTopicTableWaitTimeFloor checks the paper §6 safety floor G: a fresh
-// registrant on an empty table (both modifiers ~0) owes ~waitTimeFloor, above
-// the admission slack, and — since G is derived as waitTimeFloor/(baseMod*
-// AdLifetime) — the floor is that duration independent of AdLifetime.
-func TestTopicTableWaitTimeFloor(t *testing.T) {
-	for _, adLifetime := range []time.Duration{15 * time.Minute, time.Hour, 30 * time.Second} {
-		cfg := Config{
-			AdCacheSize: 100,
-			AdLifetime:  adLifetime,
-			Clock:       new(mclock.Simulated),
-			Log:         testlog.Logger(t, log.LvlTrace),
-		}
-		tab := NewTopicTable(cfg)
-
-		n := nodeAtDistance(enode.ID(topic1), 100, net.IP{203, 0, 113, 1})
-		w := tab.WaitTime(n, topic1)
-		t.Logf("adLifetime=%v floor wait=%v", adLifetime, w)
-		if w <= topicTableWaitTimeFloor {
-			t.Fatalf("adLifetime=%v: fresh registrant wait %v does not exceed the admission slack %v",
-				adLifetime, w, topicTableWaitTimeFloor)
-		}
-		// AdLifetime-independent: the empty-table floor is ~waitTimeFloor.
-		if w < waitTimeFloor || w > waitTimeFloor+time.Second {
-			t.Fatalf("adLifetime=%v: floor %v not ~waitTimeFloor %v", adLifetime, w, waitTimeFloor)
-		}
-	}
-}
-
 func TestTopicTableEviction(t *testing.T) {
 	simclock := new(mclock.Simulated)
 	cfg := testConfig(t)
@@ -305,6 +154,147 @@ func TestTopicTableEviction(t *testing.T) {
 	}
 }
 
+// TestLowerBoundDecay checks the decay and max-aggregation semantics of the
+// per-component lower bound (§6, "Lower Bound").
+func TestLowerBoundDecay(t *testing.T) {
+	var lb lowerBound
+	t0 := mclock.AbsTime(0)
+
+	if lb.remaining(t0) != 0 {
+		t.Fatal("zero-value bound should have no floor")
+	}
+	if got := lb.bump(10*time.Second, t0); got != 10*time.Second {
+		t.Fatalf("bump returned %v, want 10s", got)
+	}
+	// The floor decays 1:1 with elapsed time.
+	t1 := t0.Add(3 * time.Second)
+	if got := lb.remaining(t1); got != 7*time.Second {
+		t.Fatalf("remaining %v, want 7s", got)
+	}
+	// A smaller bump must not lower the floor.
+	if got := lb.bump(2*time.Second, t1); got != 7*time.Second {
+		t.Fatalf("smaller bump changed floor: %v", got)
+	}
+	// A larger bump raises it and resets the decay origin.
+	if got := lb.bump(20*time.Second, t1); got != 20*time.Second {
+		t.Fatalf("larger bump returned %v, want 20s", got)
+	}
+	if got := lb.remaining(t1.Add(5 * time.Second)); got != 15*time.Second {
+		t.Fatalf("remaining after raise %v, want 15s", got)
+	}
+	// Once fully elapsed, no floor remains.
+	if got := lb.remaining(t1.Add(30 * time.Second)); got != 0 {
+		t.Fatalf("expected fully decayed, got %v", got)
+	}
+}
+
+// TestTopicTableWaitLowerBound checks that WaitTime floors the service component
+// at the topic's recorded lower bound and that the floor decays over time.
+func TestTopicTableWaitLowerBound(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	n := newNode()
+	now := simclock.Now()
+
+	// Inject a service-component lower bound for topic1. With an otherwise-empty
+	// table the natural components are ~0, so the wait time must be floored here.
+	tab.wt.topicBounds[topic1] = lowerBound{value: 5 * time.Minute, since: now}
+
+	if wt := tab.WaitTime(n, topic1); wt < 5*time.Minute {
+		t.Fatalf("wait time %v below lower bound of 5m", wt)
+	}
+	// An unrelated topic is not affected by topic1's bound.
+	if wt := tab.WaitTime(n, topic2); wt > time.Second {
+		t.Fatalf("unrelated topic floored: %v", wt)
+	}
+
+	// The floor decays 1:1 with elapsed time.
+	simclock.Run(1 * time.Minute)
+	if wt := tab.WaitTime(n, topic1); wt < 4*time.Minute || wt > 4*time.Minute+time.Second {
+		t.Fatalf("decayed wait time %v, want ~4m", wt)
+	}
+
+	// After the bound has fully elapsed, no floor remains.
+	simclock.Run(5 * time.Minute)
+	if wt := tab.WaitTime(n, topic1); wt > time.Second {
+		t.Fatalf("bound did not decay away: %v", wt)
+	}
+}
+
+// TestTopicTableWaitBoundGC checks that a topic's lower bound is recorded when a
+// wait ticket is issued and dropped when the topic's last ad leaves the cache.
+func TestTopicTableWaitBoundGC(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	// Fill the cache with topic1 ads so the service component is large and
+	// Register issues a wait ticket instead of admitting immediately.
+	for i := 0; i < 16; i++ {
+		if !tab.Add(newNode(), topic1) {
+			t.Fatalf("could not add ad %d", i)
+		}
+	}
+
+	m := newNode()
+	if wt := tab.Register(m, topic1, 0); wt <= topicTableWaitTimeFloor {
+		t.Fatalf("expected a wait ticket, got %v", wt)
+	}
+	if _, ok := tab.wt.topicBounds[topic1]; !ok {
+		t.Fatal("no lower bound recorded for topic1 after issuing a wait ticket")
+	}
+
+	// When all topic1 ads expire, the bound must be GC'd. Note: testConfig leaves
+	// AdLifetime unset, so read the effective value from the table.
+	simclock.Run(tab.AdLifetime() + time.Second)
+	tab.Expire()
+	if _, ok := tab.wt.topicBounds[topic1]; ok {
+		t.Fatal("lower bound not dropped after topic emptied")
+	}
+}
+
+// TestTopicTableRecordsIPBound checks that issuing a wait ticket records an
+// IP-component lower bound on the longest-prefix-match node in the IP tree.
+func TestTopicTableRecordsIPBound(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdCacheSize = 200
+	tab := NewTopicTable(cfg)
+
+	// Fill the cache with ads from a single /24 so that another address in that
+	// subnet receives a positive IP-similarity score (a non-zero IP component).
+	for i := 1; i <= 60; i++ {
+		ip := net.IPv4(203, 0, 113, byte(i))
+		if !tab.Add(nodeWithIP(ip), topic1) {
+			t.Fatalf("could not add clustered ad %d", i)
+		}
+	}
+
+	// A fresh node from the same subnet, registering for an *empty* topic so the
+	// service component is zero and only the IP component is exercised.
+	target := net.IPv4(203, 0, 113, 200)
+	score, node := tab.wt.ipv4.scoreNode(target.To4())
+	if score == 0 {
+		t.Fatal("expected a positive IP-similarity score for the clustered subnet")
+	}
+	if node == nil {
+		t.Fatal("scoreNode returned no longest-prefix-match node")
+	}
+
+	now := simclock.Now()
+	if wt := tab.Register(nodeWithIP(target), topic2, 0); wt <= topicTableWaitTimeFloor {
+		t.Fatalf("expected a wait ticket, got %v", wt)
+	}
+	if node.bound.remaining(now) <= 0 {
+		t.Fatal("Register did not record an IP-component lower bound")
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	return Config{
 		AdCacheSize: 20,
@@ -319,6 +309,13 @@ func newNode() *enode.Node {
 	return enode.SignNull(&r, id)
 }
 
+func nodeWithIP(ip net.IP) *enode.Node {
+	var r enr.Record
+	r.Set(enr.IP(ip))
+	var id enode.ID
+	mrand.Read(id[:])
+	return enode.SignNull(&r, id)
+}
 func uniqueNodeIDs(nodes []*enode.Node) []enode.ID {
 	byID := make(map[enode.ID]struct{}, len(nodes))
 	for _, n := range nodes {
