@@ -22,7 +22,7 @@ var ipv4TestOps = []treeAddOp{
 	{"1.1.1.1", 1.0},
 	{"8.8.8.8", 1.0},
 }
- 
+
 var ipv6TestOps = []treeAddOp{
 	{"fe80::716b:dafc:774e:a826", 0.0},
 	{"fe80::716b:dafc:774e:a827", 0.0},

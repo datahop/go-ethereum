@@ -52,7 +52,7 @@ func (it *ipTree) insert(ip net.IP) float64 {
 	it.root.counter++
 	effectiveDepth := byte(0)
 	for depth := byte(0); depth < it.bits; depth++ {
-		//beyond this point the tree has no statistical power to 
+		//beyond this point the tree has no statistical power to
 		// flag a bucket as overloaded
 		balanced := rootCounter / math.Pow(2, float64(depth+1))
 		if balanced < 1 {
@@ -90,7 +90,7 @@ func (it *ipTree) score(ip net.IP) float64 {
 		if balanced < 1 {
 			break
 		}
-		
+
 		effectiveDepth++
 		// mimic the behaviour of insert() that creates new nodes when
 		// adding an address and keeps increasing effectiveDepth.
