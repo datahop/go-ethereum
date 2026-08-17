@@ -104,7 +104,7 @@ type UDPv5 struct {
 	callOutcomeCh chan callOutcome
 
 	// channels into dispatch
-	onDispatchCh chan func()
+	onDispatchCh  chan func()
 	packetInCh    chan ReadPacket
 	readNextCh    chan struct{}
 	callCh        chan *callV5
@@ -801,9 +801,8 @@ func (t *UDPv5) dispatch() {
 
 		case c := <-t.callDoneCh:
 			// A call reported done must be in exactly one of two states: the
-			// active call for its node, or still parked in callQueue. dispatch
-			// makes a call active and removes it from the queue atomically, so
-			// both-at-once or neither is a bookkeeping bug.
+			// active call for its node, or still parked in callQueue.
+			// remove call or panic if not found.
 			isActive := t.activeCallByNode[c.id] == c
 			qi := slices.Index(t.callQueue[c.id], c)
 			inQueue := qi >= 0
@@ -1376,7 +1375,12 @@ func (t *UDPv5) collectTopicAuxNodes(topic topicindex.TopicID, reqDist []uint, r
 	check := func(n *enode.Node) bool {
 		return topicindex.SupportsTopicDiscovery(n) && netutil.CheckRelayAddr(remoteIP, n.IPAddr()) == nil
 	}
-	return t.tab.collectOnePerDist(enode.ID(topic), reqDist, regtopicNodesLimit, check)
+	// One node is returned per distance, so cap the requested distances to keep
+	// the response (and the scan) within regtopicNodesLimit.
+	if len(reqDist) > regtopicNodesLimit {
+		reqDist = reqDist[:regtopicNodesLimit]
+	}
+	return t.tab.collectOnePerDist(enode.ID(topic), reqDist, check)
 }
 
 func waitTimeToMs(d time.Duration) uint {
