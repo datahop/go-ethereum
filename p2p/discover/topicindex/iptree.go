@@ -50,8 +50,16 @@ func (it *ipTree) insert(ip net.IP) float64 {
 	node := &it.root
 	rootCounter := float64(it.root.counter)
 	it.root.counter++
-
+	effectiveDepth := byte(0)
 	for depth := byte(0); depth < it.bits; depth++ {
+		//beyond this point the tree has no statistical power to 
+		// flag a bucket as overloaded
+		balanced := rootCounter / math.Pow(2, float64(depth+1))
+		if balanced < 1 {
+			break
+		}
+		effectiveDepth++
+
 		if ipBit(ip, depth) {
 			node = &(*node).left
 		} else {
@@ -61,14 +69,12 @@ func (it *ipTree) insert(ip net.IP) float64 {
 			*node = new(ipTreeNode)
 		}
 		n := *node
-
-		balanced := rootCounter / math.Pow(2, float64(depth+1))
 		if float64(n.counter) > balanced {
 			sum++
 		}
 		n.counter++
 	}
-	return it.computeScore(sum)
+	return it.computeScore(sum, effectiveDepth)
 }
 
 // score computes the score that the addition of an IP would return.
@@ -77,24 +83,38 @@ func (it *ipTree) score(ip net.IP) float64 {
 	sum := 0
 	node := &it.root
 	rootCounter := float64(it.root.counter)
-
+	effectiveDepth := byte(0)
+	hitNil := false
 	for depth := byte(0); depth < it.bits; depth++ {
+		balanced := rootCounter / math.Pow(2, float64(depth+1))
+		if balanced < 1 {
+			break
+		}
+		
+		effectiveDepth++
+		// mimic the behaviour of insert() that creates new nodes when
+		// adding an address and keeps increasing effectiveDepth.
+		if hitNil {
+			continue
+		}
+
 		if ipBit(ip, depth) {
 			node = &(*node).left
 		} else {
 			node = &(*node).right
 		}
 		if *node == nil {
-			break
+			// insert() would create a node here and continue, so we do
+			// the same to make the score match.
+			hitNil = true
+			continue
 		}
 		n := *node
-
-		balanced := rootCounter / math.Pow(2, float64(depth+1))
 		if float64(n.counter) > balanced {
 			sum++
 		}
 	}
-	return it.computeScore(sum)
+	return it.computeScore(sum, effectiveDepth)
 }
 
 // remove removes an IP from the tree.
@@ -102,7 +122,6 @@ func (it *ipTree) remove(ip net.IP) {
 	ip = it.normIP(ip)
 	node := &it.root
 	it.root.counter--
-
 	for depth := byte(0); depth < it.bits; depth++ {
 		if ipBit(ip, depth) {
 			node = &(*node).left
@@ -114,7 +133,6 @@ func (it *ipTree) remove(ip net.IP) {
 		}
 		n := *node
 		n.counter--
-
 		// If this was the last IP in this node, remove the branch.
 		if n.counter == 0 {
 			*node = nil
@@ -131,12 +149,15 @@ func (it *ipTree) count() int {
 	return it.root.counter
 }
 
-func (it *ipTree) computeScore(sum int) float64 {
+func (it *ipTree) computeScore(sum int, effectiveDepth byte) float64 {
 	c := it.count()
 	if c == 0 {
 		return 0
 	}
-	sc := float64(sum) / float64(int(it.bits))
+	if effectiveDepth == 0 {
+		return 0
+	}
+	sc := float64(sum) / float64(effectiveDepth)
 	return sc
 }
 
