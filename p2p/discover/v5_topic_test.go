@@ -337,3 +337,73 @@ func TestTopicRegTimeoutTracksNotEvicts(t *testing.T) {
 		t.Fatalf("ad evicted on first timeout; eviction should defer to the DHT threshold: %v", got)
 	}
 }
+
+// TestFilterTopicDiscovery checks the gate that keeps non-topic-discovery nodes
+// out of the reg/search tables: only nodes advertising the topic-discovery ENR
+// entry are kept. This is what stops a plain devp2p node from being sent (and
+// then penalised for not answering) a topic RPC it never supported.
+func TestFilterTopicDiscovery(t *testing.T) {
+	t.Parallel()
+	mkNode := func(id byte, topdisc bool) *enode.Node {
+		var r enr.Record
+		r.Set(enr.IPv4{127, 0, 0, 1})
+		if topdisc {
+			r.Set(topicindex.TopicDiscoveryVersion)
+		}
+		return enode.SignNull(&r, enode.ID{id})
+	}
+	withFlag1 := mkNode(1, true)
+	without := mkNode(2, false)
+	withFlag2 := mkNode(3, true)
+
+	got := filterTopicDiscovery([]*enode.Node{withFlag1, without, withFlag2})
+	if len(got) != 2 {
+		t.Fatalf("filterTopicDiscovery kept %d nodes, want 2 (topic-discovery only)", len(got))
+	}
+	for _, n := range got {
+		if !topicindex.SupportsTopicDiscovery(n) {
+			t.Fatalf("kept node %v without the topic-discovery ENR entry", n.ID())
+		}
+		if n.ID() == without.ID() {
+			t.Fatal("non-topic-discovery node was not filtered out")
+		}
+	}
+}
+
+// TestTopicRegSuccessResetsFailures checks that a successful REGTOPIC resets the
+// node's consecutive wire-failure counter: a first timeout increments it, and a
+// subsequent REGCONFIRMATION brings it back to zero. This is the reset side of
+// the local-vs-global split — a briefly-flaky node that starts responding again
+// does not accumulate toward eviction.
+func TestTopicRegSuccessResetsFailures(t *testing.T) {
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	topic := topicindex.TopicID{7, 7, 7}
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.3.44:30303")
+	ln := test.getNode(key, addr)
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+
+	test.table.addFoundNode(n, true)
+	test.udp.RegisterTopic(topic, 1)
+
+	// First REGTOPIC: never answered → timeout → counter increments.
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {})
+	waitForCond(t, "regtopic timeout counted toward wire-failure tally", func() bool {
+		return test.db.FindFails(n.ID(), n.IPAddr()) >= 1
+	})
+
+	// Retry REGTOPIC: answered with a REGCONFIRMATION → success → counter resets.
+	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+		test.packetInFrom(key, a, &v5wire.Regconfirmation{
+			ReqID:    p.ReqID,
+			Ticket:   nil,
+			WaitTime: 900000,
+		})
+	})
+	waitForCond(t, "successful REGTOPIC reset the wire-failure tally", func() bool {
+		return test.db.FindFails(n.ID(), n.IPAddr()) == 0
+	})
+}
