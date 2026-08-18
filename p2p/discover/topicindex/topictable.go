@@ -189,7 +189,7 @@ func (tab *TopicTable) add(n *enode.Node, topic TopicID) *topicTableEntry {
 		tab.reg[topic] = list.New()
 	}
 	reg.topicElem = tab.reg[topic].PushFront(reg)
-	reg.allElem = tab.all.PushFront(reg)
+	reg.allElem = tab.all.PushBack(reg)
 	tab.wt.addReg(reg)
 	return reg
 }
