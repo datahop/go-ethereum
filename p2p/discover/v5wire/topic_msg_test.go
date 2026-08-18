@@ -232,3 +232,62 @@ func TestTopicMessageOversizedFields(t *testing.T) {
 		})
 	}
 }
+
+// TestTopicMessageFieldsAtCap checks that a variable-length field sized exactly
+// at its decode limit is accepted — the complement of TestTopicMessageOversizedFields,
+// which only exercises the reject-when-over side.
+func TestTopicMessageFieldsAtCap(t *testing.T) {
+	rec := signedTestRecord(t)
+	var topic [32]byte
+	records := func(n int) []*enr.Record {
+		rs := make([]*enr.Record, n)
+		for i := range rs {
+			rs[i] = rec
+		}
+		return rs
+	}
+	cases := []struct {
+		name string
+		kind byte
+		body []byte
+	}{
+		{"regtopic-buckets-at-cap", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: []byte{1}, ENR: rec, Buckets: make([]uint, maxTopicDistances)})},
+		{"regtopic-ticket-at-cap", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: make([]byte, maxTicketSizeBytes), ENR: rec, Buckets: []uint{}})},
+		{"regconfirmation-ticket-at-cap", RegconfirmationMsg, rlpMust(&Regconfirmation{ReqID: []byte{1}, RespCount: 1, Ticket: make([]byte, maxTicketSizeBytes)})},
+		{"topicquery-buckets-at-cap", TopicQueryMsg, rlpMust(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: make([]uint, maxTopicDistances)})},
+		{"topicnodes-nodes-at-cap", TopicNodesMsg, rlpMust(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: records(maxTopicNodeCount)})},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := DecodeMessage(c.kind, c.body); err != nil {
+				t.Fatalf("rejected message with field at cap: %v", err)
+			}
+		})
+	}
+}
+
+// FuzzDecodeMessage checks that DecodeMessage never panics on arbitrary input,
+// and that any message it accepts re-encodes without error. Seeded from the
+// valid round-trip corpus so the fuzzer starts from well-formed messages.
+func FuzzDecodeMessage(f *testing.F) {
+	rec := signedTestRecord(f)
+	var topic [32]byte
+	seeds := []Packet{
+		&Regtopic{ReqID: []byte{1, 2, 3}, Topic: topic, Ticket: []byte{9, 9}, ENR: rec, Buckets: []uint{250, 251}},
+		&Regconfirmation{ReqID: []byte{4}, RespCount: 2, Ticket: []byte{7, 7}, WaitTime: 1500},
+		&TopicQuery{ReqID: []byte{5}, Topic: topic, Buckets: []uint{248}},
+		&TopicNodes{ReqID: []byte{6}, RespCount: 3, Nodes: []*enr.Record{rec}},
+	}
+	for _, m := range seeds {
+		f.Add(byte(m.Kind()), rlpMust(m))
+	}
+	f.Fuzz(func(t *testing.T, kind byte, body []byte) {
+		msg, err := DecodeMessage(kind, body)
+		if err != nil {
+			return
+		}
+		if _, err := rlp.EncodeToBytes(msg); err != nil {
+			t.Fatalf("re-encode of decoded %T failed: %v", msg, err)
+		}
+	})
+}
