@@ -279,7 +279,7 @@ func FuzzDecodeMessage(f *testing.F) {
 		&TopicNodes{ReqID: []byte{6}, RespCount: 3, Nodes: []*enr.Record{rec}},
 	}
 	for _, m := range seeds {
-		f.Add(byte(m.Kind()), rlpMust(m))
+		f.Add(m.Kind(), rlpMust(m))
 	}
 	f.Fuzz(func(t *testing.T, kind byte, body []byte) {
 		msg, err := DecodeMessage(kind, body)
