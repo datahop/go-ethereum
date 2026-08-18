@@ -59,8 +59,8 @@ const (
 // Decode-time bounds on the variable-length fields of the topic-discovery
 // messages. Worst-case limits.
 const (
-	// maxTopicBucketCount: one entry per log-distance;
-	maxTopicBucketCount = 256
+	// maxTopicDistances: one entry per log-distance;
+	maxTopicDistances = 256
 	// maxTopicNodeCount: the discv5 per-response NODES limit.
 	maxTopicNodeCount = 16
 	// maxTicketSizeBytes: the sealed ticket is a fixed 90 bytes.
@@ -217,7 +217,7 @@ func DecodeMessage(ptype byte, body []byte) (Packet, error) {
 	}
 	switch m := dec.(type) {
 	case *Regtopic:
-		if len(m.Buckets) > maxTopicBucketCount || len(m.Ticket) > maxTicketSizeBytes {
+		if len(m.Buckets) > maxTopicDistances || len(m.Ticket) > maxTicketSizeBytes {
 			return nil, ErrOversizedField
 		}
 	case *Regconfirmation:
@@ -225,7 +225,7 @@ func DecodeMessage(ptype byte, body []byte) (Packet, error) {
 			return nil, ErrOversizedField
 		}
 	case *TopicQuery:
-		if len(m.Buckets) > maxTopicBucketCount {
+		if len(m.Buckets) > maxTopicDistances {
 			return nil, ErrOversizedField
 		}
 	case *TopicNodes:
