@@ -366,6 +366,128 @@ func nodeAtDistance(base enode.ID, ld int, ip net.IP) *enode.Node {
 	return enode.SignNull(&r, randomID(base, ld))
 }
 
+// nodeWithSeq creates a node with an explicit ID, IP and sequence number. It is
+// used to simulate a node re-advertising itself with a newer record.
+func nodeWithSeq(id enode.ID, ip net.IP, seq uint64) *enode.Node {
+	var r enr.Record
+	r.Set(enr.IP(ip))
+	r.SetSeq(seq)
+	return enode.SignNull(&r, id)
+}
+
 func intIP(i int) net.IP {
 	return net.IP{byte(i), 0, 2, byte(i)}
+}
+
+// TestRegistrationRecordUpdate checks how an already-scheduled node's newer ENR
+// is handled: a non-newer seq is ignored, and an endpoint change keeps the
+// per-/24 IP tracker consistent — a move within the same /24 is kept, a move to
+// a free /24 seats the new subnet and releases the old, a move into a full /24
+// is dropped, and a dropped node never releases a co-tenant's slot.
+func TestRegistrationRecordUpdate(t *testing.T) {
+	type probe struct {
+		ip    net.IP
+		admit bool
+	}
+	cases := []struct {
+		name     string
+		limit    int
+		setup    []net.IP // admitted up front; index 0's record is updated
+		moveIP   net.IP   // index 0's new endpoint
+		sameSeq  bool     // offer the update with a non-newer seq (must be ignored)
+		wantKept bool     // whether index 0 survives the update
+		probes   []probe  // follow-up admissions checking the tracker count
+	}{
+		{
+			name:     "stale-seq-ignored",
+			limit:    1,
+			setup:    []net.IP{{3, 0, 2, 1}},
+			moveIP:   net.IP{4, 0, 2, 1}, // offered with a non-newer seq
+			sameSeq:  true,
+			wantKept: true,
+			// Update ignored: /24-3 still held (rejected), /24-4 never counted (admitted).
+			probes: []probe{{net.IP{3, 0, 2, 9}, false}, {net.IP{4, 0, 2, 9}, true}},
+		},
+		{
+			name:     "into-empty-subnet",
+			limit:    1,
+			setup:    []net.IP{{3, 0, 2, 1}},
+			moveIP:   net.IP{6, 0, 2, 1}, // different /24, has room
+			wantKept: true,
+			// Old /24-3 slot is freed (a fresh node fits); new /24-6 is now counted.
+			probes: []probe{{net.IP{3, 0, 2, 9}, true}, {net.IP{6, 0, 2, 9}, false}},
+		},
+		{
+			name:     "into-full-subnet-limit-2",
+			limit:    2,
+			setup:    []net.IP{{3, 0, 2, 1}, {3, 0, 2, 2}, {4, 0, 2, 1}, {4, 0, 2, 2}},
+			moveIP:   net.IP{4, 0, 2, 99}, // /24-4 full (indexes 2,3)
+			wantKept: false,
+			// /24-3 must keep its co-tenant: exactly one more fits, a second does not.
+			probes: []probe{{net.IP{3, 0, 2, 3}, true}, {net.IP{3, 0, 2, 4}, false}},
+		},
+		{
+			name:     "within-same-subnet",
+			limit:    1,
+			setup:    []net.IP{{3, 0, 2, 1}},
+			moveIP:   net.IP{3, 0, 2, 250}, // same /24, different host
+			wantKept: true,
+		},
+	}
+	base := enode.ID(topic1)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := NewRegistration(topic1, testConfig(t))
+			bi := r.bucketIndex(nodeAtDistance(base, 200, net.IP{9, 0, 2, 9}).ID())
+			r.buckets[bi].ips.Limit = uint(c.limit)
+			bucket := &r.buckets[bi]
+
+			nodes := make([]*enode.Node, len(c.setup))
+			for i, ip := range c.setup {
+				nodes[i] = nodeAtDistance(base, 200, ip)
+			}
+			r.AddNodes(nil, nodes)
+			for i, n := range nodes {
+				if _, ok := bucket.att[n.ID()]; !ok {
+					t.Fatalf("setup: node %d (%v) not admitted", i, c.setup[i])
+				}
+			}
+
+			// Offer node 0 a new record. A non-newer seq must be ignored.
+			seq := nodes[0].Seq() + 1
+			if c.sameSeq {
+				seq = nodes[0].Seq()
+			}
+			r.AddNodes(nil, []*enode.Node{nodeWithSeq(nodes[0].ID(), c.moveIP, seq)})
+
+			att, ok := bucket.att[nodes[0].ID()]
+			if ok != c.wantKept {
+				t.Fatalf("after update: kept=%v, want %v", ok, c.wantKept)
+			}
+			if c.wantKept {
+				// A stale update is ignored, so the endpoint stays as it was.
+				wantIP := c.moveIP
+				if c.sameSeq {
+					wantIP = c.setup[0]
+				}
+				if !att.Node.IP().Equal(wantIP) {
+					t.Fatalf("endpoint after update: got %v, want %v", att.Node.IP(), wantIP)
+				}
+			}
+			// The other setup nodes are untouched by node 0's update and must remain.
+			for i := 1; i < len(nodes); i++ {
+				if _, ok := bucket.att[nodes[i].ID()]; !ok {
+					t.Fatalf("node %d (%v) should still be present", i, c.setup[i])
+				}
+			}
+
+			for _, p := range c.probes {
+				pn := nodeAtDistance(base, 200, p.ip)
+				r.AddNodes(nil, []*enode.Node{pn})
+				if _, ok := bucket.att[pn.ID()]; ok != p.admit {
+					t.Fatalf("probe %v admitted=%v, want %v", p.ip, ok, p.admit)
+				}
+			}
+		})
+	}
 }
