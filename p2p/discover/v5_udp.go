@@ -1229,6 +1229,43 @@ func packNodeRecords(nodes []*enode.Node) [][]*enr.Record {
 	return result
 }
 
+// checkRegtopicRecordIP validates a REGTOPIC record against the packet source:
+// searchers dial the stored record, not the source.
+func checkRegtopicRecordIP(n *enode.Node, src netip.Addr) error {
+	src = src.Unmap()
+	claimed, ok := recordIP(n, src.Is4())
+	if !ok {
+		return errors.New("no address for the source address family")
+	}
+	if claimed.Unmap() != src {
+		return errors.New("address does not match packet source")
+	}
+	if other, ok := recordIP(n, !src.Is4()); ok && !addrIsRoutable(other) {
+		return errors.New("unverifiable address is not publicly routable")
+	}
+	return nil
+}
+
+func recordIP(n *enode.Node, v4 bool) (netip.Addr, bool) {
+	if v4 {
+		var e enr.IPv4Addr
+		if n.Load(&e) != nil {
+			return netip.Addr{}, false
+		}
+		return netip.Addr(e), true
+	}
+	var e enr.IPv6Addr
+	if n.Load(&e) != nil {
+		return netip.Addr{}, false
+	}
+	return netip.Addr(e), true
+}
+
+func addrIsRoutable(addr netip.Addr) bool {
+	return addr.IsValid() && !addr.IsUnspecified() &&
+		!netutil.AddrIsSpecialNetwork(addr) && !netutil.AddrIsLAN(addr)
+}
+
 // handleRegtopic serves REGTOPIC messages.
 func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.Regtopic) {
 	ticket, err := t.ticketSealer.Unpack(p.Topic, p.Ticket)
@@ -1244,6 +1281,11 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 	}
 	if n.ID() != fromID {
 		t.log.Debug("Node record in REGTOPIC/v5 does not match id", "id", fromID, "addr", fromAddr)
+		return
+	}
+	if err := checkRegtopicRecordIP(n, fromAddr.Addr()); err != nil {
+		t.log.Debug("Bad address in REGTOPIC/v5 record", "id", fromID, "addr", fromAddr, "err", err)
+		regtopicRecordIPRejectCounter.Inc(1)
 		return
 	}
 
