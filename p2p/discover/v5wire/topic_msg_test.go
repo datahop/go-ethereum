@@ -201,8 +201,8 @@ func signedTestRecord(tb testing.TB) *enr.Record {
 }
 
 // TestTopicMessageOversizedFields checks that DecodeMessage bounds the
-// variable-length fields of the topic messages (Buckets, Nodes, Ticket) rather
-// than relying solely on the packet MTU and downstream handlers.
+// variable-length fields of the topic messages (Buckets, Nodes) rather than
+// relying solely on the packet MTU and downstream handlers.
 func TestTopicMessageOversizedFields(t *testing.T) {
 	rec := signedTestRecord(t)
 	var topic [32]byte
@@ -221,13 +221,34 @@ func TestTopicMessageOversizedFields(t *testing.T) {
 		{"regtopic-many-buckets", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: []byte{1}, ENR: rec, Buckets: make([]uint, 100000)})},
 		{"topicquery-many-buckets", TopicQueryMsg, rlpMust(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: make([]uint, 100000)})},
 		{"topicnodes-many-nodes", TopicNodesMsg, rlpMust(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: manyRecords(5000)})},
-		{"regtopic-huge-ticket", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: make([]byte, 1<<20), ENR: rec, Buckets: []uint{}})},
-		{"regconfirmation-huge-ticket", RegconfirmationMsg, rlpMust(&Regconfirmation{ReqID: []byte{1}, RespCount: 1, Ticket: make([]byte, 1<<20)})},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if _, err := DecodeMessage(c.kind, c.body); err == nil {
 				t.Fatal("decoded oversized message without error")
+			}
+		})
+	}
+}
+
+// TestTopicMessageOpaqueTicket checks that tickets are decoded as opaque byte
+// blobs of any size: their layout is up to the issuing implementation.
+func TestTopicMessageOpaqueTicket(t *testing.T) {
+	rec := signedTestRecord(t)
+	var topic [32]byte
+	ticket := make([]byte, 1<<16)
+	cases := []struct {
+		name string
+		kind byte
+		body []byte
+	}{
+		{"regtopic", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: ticket, ENR: rec, Buckets: []uint{}})},
+		{"regconfirmation", RegconfirmationMsg, rlpMust(&Regconfirmation{ReqID: []byte{1}, RespCount: 1, Ticket: ticket})},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := DecodeMessage(c.kind, c.body); err != nil {
+				t.Fatalf("rejected large opaque ticket: %v", err)
 			}
 		})
 	}
@@ -252,8 +273,6 @@ func TestTopicMessageFieldsAtCap(t *testing.T) {
 		body []byte
 	}{
 		{"regtopic-buckets-at-cap", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: []byte{1}, ENR: rec, Buckets: make([]uint, maxTopicDistances)})},
-		{"regtopic-ticket-at-cap", RegtopicMsg, rlpMust(&Regtopic{ReqID: []byte{1}, Topic: topic, Ticket: make([]byte, maxTicketSizeBytes), ENR: rec, Buckets: []uint{}})},
-		{"regconfirmation-ticket-at-cap", RegconfirmationMsg, rlpMust(&Regconfirmation{ReqID: []byte{1}, RespCount: 1, Ticket: make([]byte, maxTicketSizeBytes)})},
 		{"topicquery-buckets-at-cap", TopicQueryMsg, rlpMust(&TopicQuery{ReqID: []byte{1}, Topic: topic, Buckets: make([]uint, maxTopicDistances)})},
 		{"topicnodes-nodes-at-cap", TopicNodesMsg, rlpMust(&TopicNodes{ReqID: []byte{1}, RespCount: 1, Nodes: records(maxTopicNodeCount)})},
 	}

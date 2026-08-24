@@ -17,6 +17,7 @@
 package v5wire
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
@@ -63,8 +64,6 @@ const (
 	maxTopicDistances = 256
 	// maxTopicNodeCount: the discv5 per-response NODES limit.
 	maxTopicNodeCount = 16
-	// maxTicketSizeBytes: the sealed ticket is a fixed 90 bytes.
-	maxTicketSizeBytes = 90
 )
 
 // Protocol messages.
@@ -217,20 +216,16 @@ func DecodeMessage(ptype byte, body []byte) (Packet, error) {
 	}
 	switch m := dec.(type) {
 	case *Regtopic:
-		if len(m.Buckets) > maxTopicDistances || len(m.Ticket) > maxTicketSizeBytes {
-			return nil, ErrOversizedField
-		}
-	case *Regconfirmation:
-		if len(m.Ticket) > maxTicketSizeBytes {
-			return nil, ErrOversizedField
+		if len(m.Buckets) > maxTopicDistances {
+			return nil, errors.New("too many buckets in REGTOPIC")
 		}
 	case *TopicQuery:
 		if len(m.Buckets) > maxTopicDistances {
-			return nil, ErrOversizedField
+			return nil, errors.New("too many buckets in TOPICQUERY")
 		}
 	case *TopicNodes:
 		if len(m.Nodes) > maxTopicNodeCount {
-			return nil, ErrOversizedField
+			return nil, errors.New("too many nodes in TOPICNODES")
 		}
 	}
 	return dec, nil
