@@ -184,6 +184,10 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		if id == r.cfg.Self {
 			continue
 		}
+		// Skip nodes that are temporarily blacklisted for repeated RPC failures.
+		if r.cfg.Blacklist.Contains(id) {
+			continue
+		}
 
 		bi := r.bucketIndex(id)
 		b := &r.buckets[bi]
@@ -238,6 +242,24 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
+// RemoveNode drops any registration attempt for the given node from the table.
+// It is used to evict nodes that have become unresponsive. An attempt with an
+// in-flight request (index == -2) is left in place: removing it would desync the
+// pending response handling. Such an attempt is harmless — blacklist gating in
+// AddNodes prevents the node from being re-selected once the request completes.
+func (r *Registration) RemoveNode(id enode.ID) {
+	b := &r.buckets[r.bucketIndex(id)]
+	att, ok := b.att[id]
+	if !ok {
+		return
+	}
+	if att.index == -2 {
+		return
+	}
+	r.removeAttempt(att, "evicted")
+	r.refillAttempts(b)
+}
+
 func (r *Registration) setAttemptState(att *RegAttempt, state RegAttemptState) {
 	att.bucket.count[att.State]--
 	att.bucket.count[state]++
@@ -286,7 +308,30 @@ func (r *Registration) Update() *RegAttempt {
 		case Standby:
 			panic("standby attempt in Registration.heap")
 		case Registered:
-			r.removeAttempt(att, "expired")
+			if att.bucket.count[Standby] >= r.cfg.RegBucketStandbyLimit {
+				// The candidate pool is already full, so we don't need to
+				// retain this expired registrar to keep the bucket from
+				// draining. Drop it — it stays in the DHT routing table and
+				// can be rediscovered if still relevant — so a freshly
+				// discovered candidate can rotate into the freed standby
+				// slot. This keeps registration spread across diverse
+				// registrars instead of ossifying around already-used ones
+				// (AddNodes rejects new nodes while standby is full).
+				r.removeAttempt(att, "expired")
+			} else {
+				// The candidate pool has room: demote the expired attempt
+				// back to Standby instead of deleting it. The registrar is
+				// still in our routing table and remains a valid renewal
+				// target; deleting it here would drain the bucket's candidate
+				// pool, capping fan-out at ceil(register-wait / AdLifetime)
+				// candidates per registrant. Resetting the ticket / wait-time
+				// counters lets refillAttempts treat it as a fresh candidate.
+				heap.Remove(&r.heap, att.index)
+				att.Ticket = nil
+				att.totalWaitTime = 0
+				att.reqCount = 0
+				r.setAttemptState(att, Standby)
+			}
 			r.refillAttempts(att.bucket)
 		case Waiting:
 			return att

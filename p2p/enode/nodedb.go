@@ -411,16 +411,18 @@ func (db *DB) UpdateFindFails(id ID, ip netip.Addr, fails int) error {
 	return db.storeInt64(nodeItemKey(id, ip, dbNodeFindFails), int64(fails))
 }
 
-// FindFailsV5 retrieves the discv5 findnode failure counter.
-func (db *DB) FindFailsV5(id ID, ip netip.Addr) int {
+// TopDiscLivenessFails retrieves the count of consecutive failed topic-discovery
+// liveness checks (failed discv5 RPCs that did not get a response) for a node.
+func (db *DB) TopDiscLivenessFails(id ID, ip netip.Addr) int {
 	if !ip.IsValid() {
 		return 0
 	}
 	return int(db.fetchInt64(v5Key(id, ip, dbNodeFindFails)))
 }
 
-// UpdateFindFailsV5 stores the discv5 findnode failure counter.
-func (db *DB) UpdateFindFailsV5(id ID, ip netip.Addr, fails int) error {
+// SetTopDiscLivenessFails stores the count of consecutive failed topic-discovery
+// liveness checks for a node.
+func (db *DB) SetTopDiscLivenessFails(id ID, ip netip.Addr, fails int) error {
 	if !ip.IsValid() {
 		return errInvalidIP
 	}
