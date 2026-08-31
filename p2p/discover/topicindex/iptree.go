@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common/mclock"
 )
 
 type ipTree struct {
@@ -128,6 +131,31 @@ func (it *ipTree) scoreNode(ip net.IP) (float64, *ipTreeNode) {
 	return it.computeScore(sum, effectiveDepth), lpm
 }
 
+// pathFloor returns the largest still-effective lower bound stored on any
+// existing node along the IP's path. A bound on an ancestor covers every
+// address under its prefix, and later inserts can create nodes deeper than the
+// one a bound was recorded on, so the whole path is walked rather than just
+// checking the longest-prefix-match node.
+func (it *ipTree) pathFloor(ip net.IP, now mclock.AbsTime) time.Duration {
+	ip = it.normIP(ip)
+	var floor time.Duration
+	node := it.root
+	for depth := byte(0); depth < it.bits; depth++ {
+		if ipBit(ip, depth) {
+			node = node.left
+		} else {
+			node = node.right
+		}
+		if node == nil {
+			break
+		}
+		if rem := node.bound.remaining(now); rem > floor {
+			floor = rem
+		}
+	}
+	return floor
+}
+
 // remove removes an IP from the tree.
 func (it *ipTree) remove(ip net.IP) {
 	ip = it.normIP(ip)
@@ -144,7 +172,8 @@ func (it *ipTree) remove(ip net.IP) {
 		}
 		n := *node
 		n.counter--
-		// If this was the last IP in this node, remove the branch.
+		// If this was the last IP in this node, remove the branch. This is also
+		// what garbage-collects the lower bounds stored on the branch's nodes.
 		if n.counter == 0 {
 			*node = nil
 			return

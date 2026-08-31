@@ -243,6 +243,93 @@ func TestTopicTableRecordsIPBound(t *testing.T) {
 	}
 }
 
+// TestTopicTableIPBoundGC checks that IP-component lower bounds are freed
+// together with their tree nodes when the ads keeping the branch alive expire.
+func TestTopicTableIPBoundGC(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdCacheSize = 200
+	tab := NewTopicTable(cfg)
+
+	for i := 1; i <= 60; i++ {
+		ip := net.IPv4(203, 0, 113, byte(i))
+		if !tab.Add(nodeWithIP(ip), topic1) {
+			t.Fatalf("could not add clustered ad %d", i)
+		}
+	}
+	target := net.IPv4(203, 0, 113, 200)
+	if wt := tab.Register(nodeWithIP(target), topic2, 0); wt <= topicTableWaitTimeFloor {
+		t.Fatalf("expected a wait ticket, got %v", wt)
+	}
+	if tab.wt.ipv4.pathFloor(target.To4(), simclock.Now()) <= 0 {
+		t.Fatal("no IP-component lower bound recorded")
+	}
+
+	// Expire all ads: the branch carrying the bound must be freed with them.
+	simclock.Run(tab.AdLifetime() + time.Second)
+	tab.Expire()
+	if c := tab.wt.ipv4.count(); c != 0 {
+		t.Fatalf("IP tree not empty after expiry: count %d", c)
+	}
+	if tab.wt.ipv4.root.left != nil || tab.wt.ipv4.root.right != nil {
+		t.Fatal("IP tree branches (and their bounds) not freed after expiry")
+	}
+}
+
+// TestTopicTableIPBoundDeeperLPM checks that a recorded IP floor is still
+// charged after later inserts move the longest-prefix-match node deeper than
+// the node the floor was recorded on.
+func TestTopicTableIPBoundDeeperLPM(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdCacheSize = 2000
+	tab := NewTopicTable(cfg)
+
+	for i := 1; i <= 60; i++ {
+		ip := net.IPv4(203, 0, 113, byte(i))
+		if !tab.Add(nodeWithIP(ip), topic1) {
+			t.Fatalf("could not add clustered ad %d", i)
+		}
+	}
+	target := net.IPv4(203, 0, 113, 200)
+	if wt := tab.Register(nodeWithIP(target), topic2, 0); wt <= topicTableWaitTimeFloor {
+		t.Fatalf("expected a wait ticket, got %v", wt)
+	}
+	now := simclock.Now()
+	_, boundNode := tab.wt.ipv4.scoreNode(target.To4())
+	if boundNode.bound.remaining(now) <= 0 {
+		t.Fatal("no bound recorded on the LPM node")
+	}
+
+	// Deepen the tree on target's path: ads in the surrounding /23 raise the
+	// effective depth, and their inserts create nodes below boundNode.
+	for i := 1; i <= 200; i++ {
+		ip := net.IPv4(203, 0, 112, byte(i))
+		if !tab.Add(nodeWithIP(ip), topic1) {
+			t.Fatalf("could not add filler ad %d", i)
+		}
+	}
+	_, lpm := tab.wt.ipv4.scoreNode(target.To4())
+	if lpm == boundNode {
+		t.Fatal("setup failed: LPM node did not move deeper")
+	}
+	if lpm.bound.remaining(now) > 0 {
+		t.Fatal("setup failed: new LPM node unexpectedly carries a bound")
+	}
+	if tab.wt.ipv4.pathFloor(target.To4(), now) <= 0 {
+		t.Fatal("recorded floor not found via path walk")
+	}
+
+	// Raise the ancestor's floor far above any fresh component: WaitTime must
+	// charge it even though the current LPM node carries no bound.
+	boundNode.bound.bump(2*time.Hour, now)
+	if wt := tab.WaitTime(nodeWithIP(target), topic2); wt < 2*time.Hour {
+		t.Fatalf("WaitTime %v does not charge the floor on the ancestor node", wt)
+	}
+}
+
 func TestTopicTableEviction(t *testing.T) {
 	simclock := new(mclock.Simulated)
 	cfg := testConfig(t)

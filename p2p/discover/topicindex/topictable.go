@@ -240,7 +240,7 @@ func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (t
 	topicMod := float64(tab.topicSize(t)) / float64(regCount+1)
 
 	// ipMod changes the waiting time based on IP address diversity.
-	ipMod, ipNodes := tab.wt.ipScore(n)
+	ipMod, ipNodes, ipFloor := tab.wt.ipScore(n, now)
 
 	comps := waitTimeComponents{
 		topic:       t,
@@ -254,13 +254,13 @@ func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (t
 	if rem := tab.wt.topicBounds[t].remaining(now).Seconds(); rem > chargedService {
 		chargedService = rem
 	}
+	// The IP floor is the maximum over all nodes on the IP's tree path: bounds
+	// are recorded on the longest-prefix-match node at quote time, and later
+	// inserts can create deeper nodes, so reading only the current deepest node
+	// would skip previously recorded floors.
 	chargedIP := comps.ipSecs
-	for _, nd := range ipNodes {
-		if nd != nil {
-			if rem := nd.bound.remaining(now).Seconds(); rem > chargedIP {
-				chargedIP = rem
-			}
-		}
+	if rem := ipFloor.Seconds(); rem > chargedIP {
+		chargedIP = rem
 	}
 
 	// The occupancy-scaled safety floor (baseTime * a tiny constant) was dropped:
@@ -395,21 +395,28 @@ func newWaitTimeState() waitTimeState {
 	}
 }
 
-func (wt *waitTimeState) ipScore(n *enode.Node) (float64, [2]*ipTreeNode) {
+func (wt *waitTimeState) ipScore(n *enode.Node, now mclock.AbsTime) (float64, [2]*ipTreeNode, time.Duration) {
 	var (
 		ip4    enr.IPv4
 		ip6    enr.IPv6
 		score4 float64
 		score6 float64
 		nodes  [2]*ipTreeNode
+		floor  time.Duration
 	)
 	if n.Load(&ip4) == nil && !netutil.IsLAN(net.IP(ip4)) {
 		score4, nodes[0] = wt.ipv4.scoreNode(net.IP(ip4))
+		if f := wt.ipv4.pathFloor(net.IP(ip4), now); f > floor {
+			floor = f
+		}
 	}
 	if n.Load(&ip6) == nil && !netutil.IsLAN(net.IP(ip6)) {
 		score6, nodes[1] = wt.ipv6.scoreNode(net.IP(ip6))
+		if f := wt.ipv6.pathFloor(net.IP(ip6), now); f > floor {
+			floor = f
+		}
 	}
-	return math.Max(score4, score6), nodes
+	return math.Max(score4, score6), nodes, floor
 }
 
 func (wt *waitTimeState) addReg(reg *topicTableEntry) {
