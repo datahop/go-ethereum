@@ -317,6 +317,54 @@ func TestRegistrationExpiry(t *testing.T) {
 	}
 }
 
+// TestRegistrationRemoveNode checks that RemoveNode drops a parked attempt but
+// leaves an in-flight one for its pending response.
+func TestRegistrationRemoveNode(t *testing.T) {
+	cfg := testConfig(t)
+	r := NewRegistration(topic1, cfg)
+
+	// Waiting attempt: removed.
+	waiting := nodesAtDistance(enode.ID(r.Topic()), 30, 1)
+	r.AddNodes(nil, waiting)
+	if att := r.Update(); att == nil || att.State != Waiting {
+		t.Fatal("no waiting attempt scheduled")
+	}
+	r.RemoveNode(waiting[0].ID())
+	if r.buckets[r.bucketIndex(waiting[0].ID())].att[waiting[0].ID()] != nil {
+		t.Fatal("waiting attempt not removed")
+	}
+
+	// Registered attempt (ad not yet expired): removed before expiry.
+	registered := nodesAtDistance(enode.ID(r.Topic()), 40, 1)
+	r.AddNodes(nil, registered)
+	att := r.Update()
+	if att == nil {
+		t.Fatal("no attempt scheduled")
+	}
+	r.StartRequest(att)
+	r.HandleRegistered(att, cfg.AdLifetime)
+	r.RemoveNode(registered[0].ID())
+	if r.buckets[r.bucketIndex(registered[0].ID())].att[registered[0].ID()] != nil {
+		t.Fatal("registered attempt not removed before ad expiry")
+	}
+
+	// Unknown node: no-op.
+	r.RemoveNode(enode.ID{42})
+
+	// In-flight attempt: left in place, the pending response handles it.
+	inflight := nodesAtDistance(enode.ID(r.Topic()), 50, 1)
+	r.AddNodes(nil, inflight)
+	att = r.Update()
+	if att == nil {
+		t.Fatal("no attempt scheduled")
+	}
+	r.StartRequest(att)
+	r.RemoveNode(inflight[0].ID())
+	if r.buckets[r.bucketIndex(inflight[0].ID())].att[inflight[0].ID()] == nil {
+		t.Fatal("in-flight attempt removed; must be left for response handling")
+	}
+}
+
 // TestRegistrationHandleTicketResponseDropAboveBudget verifies that a
 // registrar quoting a wait time above RegAttemptTimeout causes the attempt
 // to be dropped, freeing the bucket slot for another registrar. Without
