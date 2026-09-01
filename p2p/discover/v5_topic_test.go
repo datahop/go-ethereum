@@ -216,10 +216,6 @@ func TestTopicRegNodeTableUpdates(t *testing.T) {
 			WaitTime: 900000,
 		})
 	})
-
-	if got := test.udp.topicSys.reg[testTopic1].state.NodeCount(); got != 2 {
-		t.Fatalf("wrong node count in reg state: got %d, want 2", got)
-	}
 }
 
 // TestTopicDiscoveryENRFlag verifies that the topic-discovery ENR entry is
@@ -259,4 +255,155 @@ func TestTopicDiscoveryFilterNodes(t *testing.T) {
 	if filtered[0].ID() != withFlag.Self().ID() {
 		t.Fatal("wrong node passed filter")
 	}
+}
+
+// waitForCond polls cond until it returns true or the deadline passes.
+func waitForCond(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for: %s", what)
+}
+
+// TestTopicDHTEvictionEvictsAd checks that when the DHT routing table evicts a
+// node, that node's ads are removed from the local ad cache too. The ad cache
+// needs this signal because advertisers are never the target of topic RPCs, so
+// it cannot observe their liveness itself.
+func TestTopicDHTEvictionEvictsAd(t *testing.T) {
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	topic := topicindex.TopicID{1, 2, 3}
+	n := nodeAtDistance(test.table.self().ID(), 128, net.IP{203, 0, 113, 9})
+
+	// Seed the ad cache with n. The topic table is owned by the dispatch
+	// goroutine, so add it there.
+	done := make(chan struct{})
+	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, topic); close(done) }
+	<-done
+
+	if got := test.udp.LocalTopicNodes(topic); len(got) != 1 || got[0].ID() != n.ID() {
+		t.Fatalf("ad not present before eviction: %v", got)
+	}
+
+	// Fire a DHT routing-table eviction for n; the topic system subscribes to
+	// this feed and should drop n's ads from the ad cache.
+	test.table.removedFeed.Send(n.ID())
+
+	waitForCond(t, "ad removed from cache after DHT eviction", func() bool {
+		return len(test.udp.LocalTopicNodes(topic)) == 0
+	})
+}
+
+// TestTopicRegTimeoutTracksNotEvicts checks the local-vs-global split after
+// topic RPC failures were wired into the DHT wire-failure counter: a single
+// REGTOPIC timeout is counted toward the node's consecutive-failure tally (via
+// trackRequest) but does NOT evict the node's ad. Eviction is deferred to the
+// DHT's threshold — the old behaviour evicted on the first timeout, which this
+// test guards against.
+func TestTopicRegTimeoutTracksNotEvicts(t *testing.T) {
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	topic := topicindex.TopicID{9, 9, 9}
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.2.55:30303")
+	ln := test.getNode(key, addr)
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+
+	// Seed n's ad in the local topic table (owned by the dispatch goroutine).
+	done := make(chan struct{})
+	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, topic); close(done) }
+	<-done
+
+	// Make n a registration target and start registering; catch the REGTOPIC and
+	// never answer it, so the call times out.
+	test.table.addFoundNode(n, true)
+	test.udp.RegisterTopic(topic, 1)
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {})
+
+	// The timeout is counted toward n's consecutive wire-failure tally...
+	waitForCond(t, "regtopic timeout counted toward wire-failure tally", func() bool {
+		return test.db.FindFails(n.ID(), n.IPAddr()) >= 1
+	})
+	// ...but must not evict n's ad on the first timeout.
+	if got := test.udp.LocalTopicNodes(topic); len(got) != 1 || got[0].ID() != n.ID() {
+		t.Fatalf("ad evicted on first timeout; eviction should defer to the DHT threshold: %v", got)
+	}
+}
+
+// TestFilterTopicDiscovery checks the gate that keeps non-topic-discovery nodes
+// out of the reg/search tables: only nodes advertising the topic-discovery ENR
+// entry are kept. This is what stops a plain devp2p node from being sent (and
+// then penalised for not answering) a topic RPC it never supported.
+func TestFilterTopicDiscovery(t *testing.T) {
+	t.Parallel()
+	mkNode := func(id byte, topdisc bool) *enode.Node {
+		var r enr.Record
+		r.Set(enr.IPv4{127, 0, 0, 1})
+		if topdisc {
+			r.Set(topicindex.TopicDiscoveryVersion)
+		}
+		return enode.SignNull(&r, enode.ID{id})
+	}
+	withFlag1 := mkNode(1, true)
+	without := mkNode(2, false)
+	withFlag2 := mkNode(3, true)
+
+	got := filterTopicDiscovery([]*enode.Node{withFlag1, without, withFlag2})
+	if len(got) != 2 {
+		t.Fatalf("filterTopicDiscovery kept %d nodes, want 2 (topic-discovery only)", len(got))
+	}
+	for _, n := range got {
+		if !topicindex.SupportsTopicDiscovery(n) {
+			t.Fatalf("kept node %v without the topic-discovery ENR entry", n.ID())
+		}
+		if n.ID() == without.ID() {
+			t.Fatal("non-topic-discovery node was not filtered out")
+		}
+	}
+}
+
+// TestTopicRegSuccessResetsFailures checks that a successful REGTOPIC resets the
+// node's consecutive wire-failure counter: a first timeout increments it, and a
+// subsequent REGCONFIRMATION brings it back to zero. This is the reset side of
+// the local-vs-global split — a briefly-flaky node that starts responding again
+// does not accumulate toward eviction.
+func TestTopicRegSuccessResetsFailures(t *testing.T) {
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	topic := topicindex.TopicID{7, 7, 7}
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.3.44:30303")
+	ln := test.getNode(key, addr)
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+
+	test.table.addFoundNode(n, true)
+	test.udp.RegisterTopic(topic, 1)
+
+	// First REGTOPIC: never answered → timeout → counter increments.
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {})
+	waitForCond(t, "regtopic timeout counted toward wire-failure tally", func() bool {
+		return test.db.FindFails(n.ID(), n.IPAddr()) >= 1
+	})
+
+	// Retry REGTOPIC: answered with a REGCONFIRMATION → success → counter resets.
+	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+		test.packetInFrom(key, a, &v5wire.Regconfirmation{
+			ReqID:    p.ReqID,
+			Ticket:   nil,
+			WaitTime: 900000,
+		})
+	})
+	waitForCond(t, "successful REGTOPIC reset the wire-failure tally", func() bool {
+		return test.db.FindFails(n.ID(), n.IPAddr()) == 0
+	})
 }

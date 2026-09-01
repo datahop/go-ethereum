@@ -36,13 +36,52 @@ type topicSystem struct {
 
 	mu  sync.Mutex
 	reg map[topicindex.TopicID]*topicReg
+
+	wg   sync.WaitGroup
+	quit chan struct{}
 }
 
 func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
-	return &topicSystem{
+	sys := &topicSystem{
 		transport: transport,
 		config:    config,
 		reg:       make(map[topicindex.TopicID]*topicReg),
+		quit:      make(chan struct{}),
+	}
+	sys.wg.Add(1)
+	go sys.evictRemovedNodes()
+	return sys
+}
+
+// evictRemovedNodes evicts nodes dropped by the DHT routing table from the ad
+// cache and registration tables.
+func (sys *topicSystem) evictRemovedNodes() {
+	defer sys.wg.Done()
+	removed := make(chan enode.ID, bucketSize*nBuckets)
+	sub := sys.transport.tab.subscribeRemovedNodes(removed)
+	defer sub.Unsubscribe()
+
+	for {
+		select {
+		case <-sys.quit:
+			return
+		case id := <-removed:
+			sys.evictNode(id)
+		}
+	}
+}
+
+// evictNode removes a dead node's ads and its reg attempts in every reg table.
+func (sys *topicSystem) evictNode(id enode.ID) {
+	sys.transport.evictTopicTableNode(id)
+	sys.mu.Lock()
+	regs := make([]*topicReg, 0, len(sys.reg))
+	for _, r := range sys.reg {
+		regs = append(regs, r)
+	}
+	sys.mu.Unlock()
+	for _, r := range regs {
+		r.evict(id)
 	}
 }
 
@@ -67,6 +106,9 @@ func (sys *topicSystem) stopRegister(topic topicindex.TopicID) {
 }
 
 func (sys *topicSystem) stop() {
+	close(sys.quit)
+	sys.wg.Wait()
+
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
@@ -97,9 +139,23 @@ type topicReg struct {
 	regRequest  chan topicRegJob
 	regResponse chan topicRegResult
 
+	// evictCh delivers IDs of dead nodes (DHT routing-table removals and search
+	// query timeouts) to be removed from the registration table.
+	evictCh chan enode.ID
+
 	// nodes subscription
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
+}
+
+// evict requests removal of a node from the registration table. It is called
+// from the topic system's eviction path (evictNode), fed by DHT removals and
+// search query timeouts.
+func (reg *topicReg) evict(id enode.ID) {
+	select {
+	case reg.evictCh <- id:
+	case <-reg.quit:
+	}
 }
 
 func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topicReg {
@@ -110,6 +166,7 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 		quit:        make(chan struct{}),
 		regRequest:  make(chan topicRegJob),
 		regResponse: make(chan topicRegResult),
+		evictCh:     make(chan enode.ID, 64),
 	}
 
 	// Set up the subscription for new main table nodes.
@@ -177,6 +234,8 @@ func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
 				return false
 			case <-reg.newNodesCh:
 				// Drain the channel to avoid blocking the Table's feed sender.
+			case id := <-reg.evictCh:
+				reg.state.RemoveNode(id)
 			case <-reg.quit:
 				return true
 			}
@@ -215,6 +274,15 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 				reg.state.AddNodes(nil, []*enode.Node{n})
 			}
 
+		case id := <-reg.evictCh:
+			reg.state.RemoveNode(id)
+			// If the evicted node was the attempt selected for the next
+			// request, cancel the pending send: its attempt has been removed,
+			// so StartRequest would operate on a stale (removed) attempt.
+			if sendAttemptCh != nil && nextAttempt.node.ID() == id {
+				sendAttemptCh = nil
+			}
+
 		case <-updateCh:
 			attempt := reg.state.Update()
 			if attempt != nil {
@@ -232,13 +300,22 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			sendAttemptCh = nil
 
 		case resp := <-reg.regResponse:
+			if resp.err == errClosed {
+				continue // shutdown cancel: liveness unknown, not a failure
+			}
 			if len(resp.nodes) > 0 {
 				reg.state.AddNodes(resp.att.Node, filterTopicDiscovery(resp.nodes))
 			}
 			if resp.err != nil {
 				reg.state.HandleErrorResponse(resp.att, resp.err)
+				if resp.err == errTimeout {
+					// Count the timeout toward the global eviction counter
+					sys.transport.trackTopicRequest(resp.att.Node, false)
+				}
 				continue
 			}
+			// The node responded: reset its global counter
+			sys.transport.trackTopicRequest(resp.att.Node, true)
 			wt := time.Duration(resp.msg.WaitTime) * time.Millisecond
 			if len(resp.msg.Ticket) > 0 {
 				reg.state.HandleTicketResponse(resp.att, resp.msg.Ticket, wt)
@@ -350,7 +427,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		shuffleNodes(nodes)
 		state.AddNodes(nil, nodes)
 
-		if exit := s.run(state); exit {
+		if exit := s.run(sys, state); exit {
 			return
 		}
 	}
@@ -382,7 +459,7 @@ type topicQueryJob struct {
 	buckets []uint
 }
 
-func (s *topicSearch) run(state *topicindex.Search) (exit bool) {
+func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool) {
 	var (
 		queryCh   chan<- topicQueryJob
 		nextQuery topicQueryJob
@@ -415,10 +492,26 @@ func (s *topicSearch) run(state *topicindex.Search) (exit bool) {
 
 		case queryCh <- nextQuery:
 		case resp := <-s.queryRespCh:
-			state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
-			state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
-			if resp.err != nil {
-				s.config.Log.Debug("TOPICQUERY/v5 failed", "topic", s.topic, "id", resp.src.ID(), "err", resp.err)
+			switch {
+			case resp.err == errClosed:
+				// shutdown cancel: liveness unknown, not a failure.
+			case resp.err != nil && len(resp.topicNodes)+len(resp.auxNodes) == 0:
+				// No nodes at all: drop the node from this search. A timeout counts
+				// toward its global wire eviction
+				state.HandleErrorResponse(resp.src, resp.err)
+				if resp.err == errTimeout {
+					sys.transport.trackTopicRequest(resp.src, false)
+				}
+			default:
+				if resp.err != nil {
+					// Partial response: nodes arrived before the error, so the
+					// node counts as responsive and is kept. Still log the error.
+					s.config.Log.Debug("TOPICQUERY/v5 failed", "topic", s.topic, "id", resp.src.ID(), "err", resp.err)
+				}
+				// The node responded: reset its global counter
+				sys.transport.trackTopicRequest(resp.src, true)
+				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
+				state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
 			}
 			queryCh = nil
 
