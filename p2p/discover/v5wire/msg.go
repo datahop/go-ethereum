@@ -17,6 +17,7 @@
 package v5wire
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
@@ -54,6 +55,15 @@ const (
 
 	UnknownPacket   = byte(255) // any non-decryptable packet
 	WhoareyouPacket = byte(254) // the WHOAREYOU packet
+)
+
+// Decode-time bounds on the variable-length fields of the topic-discovery
+// messages. Worst-case limits.
+const (
+	// maxTopicDistances: one entry per log-distance;
+	maxTopicDistances = 256
+	// maxTopicNodeCount: the discv5 per-response NODES limit.
+	maxTopicNodeCount = 16
 )
 
 // Protocol messages.
@@ -203,6 +213,20 @@ func DecodeMessage(ptype byte, body []byte) (Packet, error) {
 	}
 	if dec.RequestID() != nil && len(dec.RequestID()) > 8 {
 		return nil, ErrInvalidReqID
+	}
+	switch m := dec.(type) {
+	case *Regtopic:
+		if len(m.Buckets) > maxTopicDistances {
+			return nil, errors.New("too many buckets in REGTOPIC")
+		}
+	case *TopicQuery:
+		if len(m.Buckets) > maxTopicDistances {
+			return nil, errors.New("too many buckets in TOPICQUERY")
+		}
+	case *TopicNodes:
+		if len(m.Nodes) > maxTopicNodeCount {
+			return nil, errors.New("too many nodes in TOPICNODES")
+		}
 	}
 	return dec, nil
 }
