@@ -32,14 +32,12 @@ import (
 // wait time computation constants.
 const (
 	occupancyExp = 10
+
+	// scales the occupancy-based part of the waiting time
+	waitTimeBaseModifier = 0.1
 )
 
 // If a node has less than this time to wait, they will be accepted anyway.
-// Acts as an admission slack absorbing one-way network latency, queueing
-// delay, and minor clock drift, so honest registrants whose REGTOPIC arrives
-// fractionally before the formula's requirement aren't bounced into a
-// retry. Not a security feature; the bucket-slot squat via a huge quote is
-// handled on the registrant side in registration.go.
 const topicTableWaitTimeFloor = 1 * time.Second
 
 // TopicTable holds node registrations.
@@ -214,6 +212,10 @@ func (tab *TopicTable) remove(reg *topicTableEntry) {
 	topicList := tab.reg[reg.topic]
 	if topicList.Len() == 1 {
 		delete(tab.reg, reg.topic)
+		// The topic's last ad is leaving the cache, so its service component
+		// returns to zero and its lower-bound entry can be dropped. This keeps
+		// topicBounds bounded by the number of distinct topics in the cache.
+		delete(tab.wt.topicBounds, reg.topic)
 	} else {
 		topicList.Remove(reg.topicElem)
 	}
@@ -232,6 +234,12 @@ func (tab *TopicTable) topicSize(t TopicID) int {
 
 // WaitTime returns the amount of time that node n must have waited to register for topic t.
 func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
+	total, _ := tab.waitTime(n, t, tab.config.Clock.Now())
+	return total
+}
+
+// computes the required waiting time for (n, t) as of 'now'
+func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (time.Duration, waitTimeComponents) {
 	regCount := tab.all.Len()
 
 	// occupancy is the *inverse* of the table fill-ratio.
@@ -240,18 +248,77 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	// baseTime is the required wait-time, purely based on occupancy. When occupancy is
 	// near 1.0 (i.e. the table is empty), baseTime is AdLifetime/10. As the table gets
 	// fuller, baseTime goes up and will eventually exceed AdLifetime.
-	baseModifier := 0.1
-	baseTime := baseModifier * tab.config.AdLifetime.Seconds() / math.Pow(occupancy, occupancyExp)
+	baseTime := waitTimeBaseModifier * tab.config.AdLifetime.Seconds() / math.Pow(occupancy, occupancyExp)
 
 	// topicMod changes the waiting time based on the ratio of registrations in the
 	// requested topic vs. all topics.
 	topicMod := float64(tab.topicSize(t)) / float64(regCount+1)
 
 	// ipMod changes the waiting time based on IP address diversity.
-	ipMod := tab.wt.ipModifier(n)
+	ipMod, ipNodes, ipFloor := tab.wt.ipScore(n, now)
 
-	neededTime := baseTime * math.Max(topicMod+ipMod, 0.000001)
-	return time.Duration(math.Ceil(neededTime * float64(time.Second)))
+	comps := waitTimeComponents{
+		topic:       t,
+		serviceSecs: baseTime * topicMod,
+		ipSecs:      baseTime * ipMod,
+		ipNodes:     ipNodes,
+	}
+
+	// Apply the per-component lower bounds (read-only).
+	chargedService := comps.serviceSecs
+	if rem := tab.wt.topicBounds[t].remaining(now).Seconds(); rem > chargedService {
+		chargedService = rem
+	}
+	// The IP floor is the maximum over all nodes on the IP's tree path: bounds
+	// are recorded on the longest-prefix-match node at quote time, and later
+	// inserts can create deeper nodes, so reading only the current deepest node
+	// would skip previously recorded floors.
+	chargedIP := comps.ipSecs
+	if rem := ipFloor.Seconds(); rem > chargedIP {
+		chargedIP = rem
+	}
+
+	// The occupancy-scaled safety floor (baseTime * a tiny constant) was dropped:
+	// as a baseTime multiplier it did nothing at light load — sub-second, below
+	// the topicTableWaitTimeFloor admission slack — yet exploded at high
+	// occupancy, quoting an empty-topic / diverse-IP registrant an absurd wait
+	// even with free space. The wait is just the (lower-bounded) service and IP
+	// components.
+	neededTime := chargedService + chargedIP
+	return time.Duration(math.Ceil(neededTime * float64(time.Second))), comps
+}
+
+// recordWaitTime updates the per-component lower bounds after a wait ticket has
+// been issued, so a subsequent request for the same topic / IP prefix cannot
+// obtain a smaller waiting time by more than the elapsed time.
+func (tab *TopicTable) recordWaitTime(c waitTimeComponents, now mclock.AbsTime) {
+	// Service component. serviceSecs > 0 implies the topic has at least one ad in
+	// the cache, so the entry count is bounded by the cache capacity; the entry is
+	// dropped in remove() when the topic's last ad leaves.
+	if c.serviceSecs > 0 {
+		b := tab.wt.topicBounds[c.topic]
+		b.bump(secondsToDuration(c.serviceSecs), now)
+		tab.wt.topicBounds[c.topic] = b
+	}
+	// IP component, stored on the longest-prefix-match node(s). Those nodes exist
+	// only because of admitted ads, so nothing is allocated for a request that is
+	// never admitted.
+	if ipDur := secondsToDuration(c.ipSecs); ipDur > 0 {
+		for _, nd := range c.ipNodes {
+			if nd != nil {
+				nd.bound.bump(ipDur, now)
+			}
+		}
+	}
+}
+
+// secondsToDuration converts a wait-time value in (fractional) seconds to a
+// Duration, rounding up so a stored floor is never below the value it represents.
+func secondsToDuration(s float64) time.Duration {
+	if s <= 0 {
+		return 0
+	}
+	return time.Duration(math.Ceil(s * float64(time.Second)))
 }
 
 // Register adds node n for topic t if it has waited long enough.
@@ -264,18 +331,22 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 		return 0
 	}
 
+	now := tab.config.Clock.Now()
+	requiredTime, comps := tab.waitTime(n, t, now)
+
 	// Check if the node has waited enough.
-	requiredTime := tab.WaitTime(n, t)
 	if waitTime < requiredTime {
 		remaining := requiredTime - waitTime
 		if remaining > topicTableWaitTimeFloor {
+			// A wait ticket is being issued: record the per-component lower bounds
+			// so the node can't obtain a cheaper quote by re-requesting.
+			tab.recordWaitTime(comps, now)
 			return remaining
 		}
 	}
 
 	// Check if there is space. If not, the node needs to come back when a slot opens.
 	if tab.all.Len() >= tab.config.AdCacheSize {
-		now := tab.config.Clock.Now()
 		return tab.NextExpiryTime().Sub(now)
 	}
 
@@ -283,38 +354,84 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 	return 0
 }
 
-// Note about lower bound removal: Lower bound information only needs to be kept for
-// active registration topic/id/ip, because only active registrations influence the
-// waiting time modifier value. The lower-bound value kept is a tuple of (value,
-// timestamp). After time wt has expired (at timestamp+wt), the tuple can be deleted.
+// lowerBound is a lower bound on a waiting-time component (§6, "Lower Bound").
+//
+// It records the largest value recently quoted for a component together with the
+// time it was recorded. The bound decays 1:1 with elapsed time, which enforces
+// the invariant that a re-request cannot obtain a value smaller than a previous
+// quote by more than the time that has passed (w1 - w2 <= t2 - t1). The zero
+// value is a valid, already-expired bound (no floor).
+type lowerBound struct {
+	value time.Duration  // floor value as of 'since'
+	since mclock.AbsTime // when the floor was recorded
+}
 
-// waitTimeState holds the state of waiting time modifier functions.
+// remaining returns the still-effective floor at 'now'. It never goes negative.
+func (lb lowerBound) remaining(now mclock.AbsTime) time.Duration {
+	d := lb.value - now.Sub(lb.since)
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// bump raises the floor to v (recorded at 'now') when v exceeds the currently
+// remaining floor, and returns the value that should actually be charged.
+func (lb *lowerBound) bump(v time.Duration, now mclock.AbsTime) time.Duration {
+	rem := lb.remaining(now)
+	if v > rem {
+		lb.value, lb.since = v, now
+		return v
+	}
+	return rem
+}
+
+// waitTimeComponents holds the freshly-computed (un-floored) waiting-time
+// components for a single request
+type waitTimeComponents struct {
+	topic       TopicID
+	serviceSecs float64
+	ipSecs      float64
+	ipNodes     [2]*ipTreeNode // longest-prefix-match nodes for IPv4/IPv6
+}
+
+// waitTimeState holds the state of waiting time modifier functions (including the lower bounds).
 type waitTimeState struct {
-	ipv4 *ipTree
-	ipv6 *ipTree
+	ipv4        *ipTree
+	ipv6        *ipTree
+	topicBounds map[TopicID]lowerBound
 }
 
 func newWaitTimeState() waitTimeState {
 	return waitTimeState{
-		ipv4: newIPTree(32),
-		ipv6: newIPTree(128),
+		ipv4:        newIPTree(32),
+		ipv6:        newIPTree(128),
+		topicBounds: make(map[TopicID]lowerBound),
 	}
 }
 
-func (wt *waitTimeState) ipModifier(n *enode.Node) float64 {
+func (wt *waitTimeState) ipScore(n *enode.Node, now mclock.AbsTime) (float64, [2]*ipTreeNode, time.Duration) {
 	var (
 		ip4    enr.IPv4
 		ip6    enr.IPv6
 		score4 float64
 		score6 float64
+		nodes  [2]*ipTreeNode
+		floor  time.Duration
 	)
 	if n.Load(&ip4) == nil && !netutil.IsLAN(net.IP(ip4)) {
-		score4 = wt.ipv4.score(net.IP(ip4))
+		score4, nodes[0] = wt.ipv4.scoreNode(net.IP(ip4))
+		if f := wt.ipv4.pathFloor(net.IP(ip4), now); f > floor {
+			floor = f
+		}
 	}
 	if n.Load(&ip6) == nil && !netutil.IsLAN(net.IP(ip6)) {
-		score6 = wt.ipv6.score(net.IP(ip6))
+		score6, nodes[1] = wt.ipv6.scoreNode(net.IP(ip6))
+		if f := wt.ipv6.pathFloor(net.IP(ip6), now); f > floor {
+			floor = f
+		}
 	}
-	return math.Max(score4, score6)
+	return math.Max(score4, score6), nodes, floor
 }
 
 func (wt *waitTimeState) addReg(reg *topicTableEntry) {
