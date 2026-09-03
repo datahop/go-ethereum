@@ -113,11 +113,13 @@ type RegAttempt struct {
 	// reqCount tracks the number of registration requests sent.
 	reqCount int
 
-	// filledBuckets records the bucket indexes that this registrar has already contributed
-	// an entry to. It enforces the 'one-per-source-per-bucket' rule across
-	// multiple responses. Because it lives on the attempt, it is freed when the
-	// registrar is evicted.
-	filledBuckets map[int]struct{}
+	// filledBuckets records the bucket indexes that this registrar, acting as a
+	// source of nodes, has already contributed an entry to. It enforces the
+	// 'one-per-source-per-bucket' rule across multiple responses. Because it
+	// lives on the attempt, it is freed when the registrar is evicted — so the
+	// per-source accounting is tied to the registrar's lifetime rather than
+	// accumulating forever in the buckets.
+	filledBuckets map[int]int
 
 	index  int // index in regHeap
 	bucket *regBucket
@@ -173,7 +175,10 @@ func (r *Registration) BucketsWithFreeSpace(dists []uint) []uint {
 // 'src' is the registrar that returned these nodes, or nil when they come from
 // our own routing table (bootstrap / the node feed).
 func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
-	// When the nodes come from a remote registrar, find that registrar's attempt.
+	// When the nodes come from a remote registrar, find that registrar's own
+	// attempt. The 'one-per-source-per-bucket' rule is tracked on it (in
+	// filledBuckets), so the accounting is freed when the registrar is evicted
+	// instead of accumulating forever.
 	var srcAtt *RegAttempt
 	if src != nil {
 		srcAtt = r.buckets[r.bucketIndex(src.ID())].att[src.ID()]
@@ -184,7 +189,6 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		if id == r.cfg.Self {
 			continue
 		}
-
 		bi := r.bucketIndex(id)
 		b := &r.buckets[bi]
 		attempt, ok := b.att[id]
@@ -208,8 +212,8 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		// entry to a given bucket, within a single response and across responses.
 		// This prevents a single registrar from dominating a bucket.
 		if srcAtt != nil {
-			if _, ok := srcAtt.filledBuckets[bi]; ok {
-				r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "source-already-in-bucket")
+			if srcAtt.filledBuckets[bi] >= r.cfg.MaxNodesPerSourcePerBucket {
+				r.log.Debug("Ignoring registration node", "id", n.ID(), "reason", "max-per-source-per-bucket")
 				continue
 			}
 		}
@@ -226,13 +230,13 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 
 		// Create a new attempt.
-		att := &RegAttempt{Node: n, bucket: b, index: -1, filledBuckets: make(map[int]struct{})}
+		att := &RegAttempt{Node: n, bucket: b, index: -1, filledBuckets: make(map[int]int)}
 		b.att[id] = att
 		b.count[att.State]++
 		// Record that the source has now filled this bucket, so a later
 		// response from the same registrar can't add another entry here.
 		if srcAtt != nil {
-			srcAtt.filledBuckets[bi] = struct{}{}
+			srcAtt.filledBuckets[bi]++
 		}
 		r.refillAttempts(att.bucket)
 	}
@@ -301,7 +305,33 @@ func (r *Registration) Update() *RegAttempt {
 		case Standby:
 			panic("standby attempt in Registration.heap")
 		case Registered:
-			r.removeAttempt(att, "expired")
+			// This branch is reached only for a successful registration
+			// (set via HandleRegistered) whose ad has now reached its
+			// TTL. Failed attempts never get here: they are deleted at
+			// the point of failure by HandleErrorResponse and by the
+			// wait-time-too-high drop in HandleTicketResponse. So only a
+			// genuinely-valid registration is kept on expiry.
+			//
+			// On expiry, demote back to Standby instead of deleting, so
+			// the candidate registrar — still in our routing table —
+			// remains a target for renewal. Permanently removing it would
+			// drain the bucket's candidate pool, capping fan-out at
+			// ceil(register-wait / AdLifetime) candidates per registrant.
+			//
+			// Demote only while there is room in the standby pool. If the
+			// pool is already full there are enough renewal candidates, so
+			// drop this one instead and keep count[Standby] within
+			// RegBucketStandbyLimit. Either way the freed Registered slot
+			// is backfilled from standby by refillAttempts.
+			if r.cfg.RemoveOnExpiry || att.bucket.count[Standby] >= r.cfg.RegBucketStandbyLimit {
+				r.removeAttempt(att, "expired")
+			} else {
+				heap.Remove(&r.heap, att.index)
+				att.Ticket = nil
+				att.totalWaitTime = 0
+				att.reqCount = 0
+				r.setAttemptState(att, Standby)
+			}
 			r.refillAttempts(att.bucket)
 		case Waiting:
 			return att

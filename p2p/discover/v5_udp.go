@@ -91,6 +91,9 @@ type UDPv5 struct {
 	// misc buffers used during message handling
 	logcontext []interface{}
 
+	// per-message-type wire counters (nil unless enabled)
+	wireStats *wireStats
+
 	// talkreq handler registry
 	talk *talkSystem
 
@@ -208,6 +211,7 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		closeCtx:       closeCtx,
 		cancelCloseCtx: cancelCloseCtx,
 	}
+	t.wireStats = newWireStats()
 	t.talk = newTalkSystem(t)
 	tab, err := newTable(t, t.db, cfg)
 	if err != nil {
@@ -309,6 +313,26 @@ func (t *UDPv5) RegisterTopic(topic topicindex.TopicID, opid uint64) {
 // StopRegisterTopic removes a topic from registration.
 func (t *UDPv5) StopRegisterTopic(topic topicindex.TopicID) {
 	t.topicSys.stopRegister(topic)
+}
+
+// TopicCacheOccupancy reports how full this node's ad cache is (ads held,
+// capacity) plus the per-topic breakdown. The waiting-time function is driven
+// by occupancy, so sampling it over a run shows the cache filling and the
+// registration pressure that produces. Runs on the dispatch goroutine, which
+// owns the topic table.
+func (t *UDPv5) TopicCacheOccupancy() (held, capacity int, byTopic map[topicindex.TopicID]int) {
+	done := make(chan struct{})
+	fn := func() {
+		held, capacity = t.topicTable.Occupancy()
+		byTopic = t.topicTable.TopicOccupancy()
+		close(done)
+	}
+	select {
+	case t.onDispatchCh <- fn:
+		<-done
+	case <-t.closeCtx.Done():
+	}
+	return held, capacity, byTopic
 }
 
 // LocalTopicNodes returns all locally-registered nodes for a topic.
@@ -902,6 +926,7 @@ func (t *UDPv5) send(toID enode.ID, toAddr netip.AddrPort, packet v5wire.Packet,
 	}
 
 	_, err = t.conn.WriteToUDPAddrPort(enc, toAddr)
+	t.wireStats.countTx(packet.Name(), len(enc))
 	t.log.Trace(">> "+packet.Name(), t.logcontext...)
 	return nonce, err
 }
@@ -958,6 +983,7 @@ func (t *UDPv5) handlePacket(rawpacket []byte, fromAddr netip.AddrPort) error {
 		t.log.Debug("Bad discv5 packet", "id", fromID, "addr", addr, "err", err)
 		return err
 	}
+	t.wireStats.countRx(wireStatsName(packet), len(rawpacket))
 	if fromNode != nil {
 		// Handshake succeeded, add to table.
 		t.tab.addInboundNode(fromNode)
@@ -1229,6 +1255,12 @@ func packNodeRecords(nodes []*enode.Node) [][]*enr.Record {
 	return result
 }
 
+// addrIsRoutable reports whether addr is a globally routable unicast address.
+func addrIsRoutable(addr netip.Addr) bool {
+	return addr.IsValid() && !addr.IsUnspecified() &&
+		!netutil.AddrIsSpecialNetwork(addr) && !netutil.AddrIsLAN(addr)
+}
+
 // handleRegtopic serves REGTOPIC messages.
 func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.Regtopic) {
 	ticket, err := t.ticketSealer.Unpack(p.Topic, p.Ticket)
@@ -1261,6 +1293,7 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 
 	// Attempt to register.
 	newTime := t.topicTable.Register(n, ticket.Topic, waitTime)
+	recordWaitQuote(ticket.Topic, newTime, waitTime)
 
 	// Build confirmation.
 	confirmation := &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: responseCount}
@@ -1290,8 +1323,37 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 	}
 }
 
+// topicQueryRcv counts TOPICQUERY messages received per node (keyed by the
+// receiving node's ID). Exposed for testbed per-registrar query-load analysis.
+var (
+	topicQueryRcvMu sync.Mutex
+	topicQueryRcv   = make(map[enode.ID]int64)
+	tqRcvOn         bool
+)
+
+// EnableTQRcv turns on per-node TOPICQUERY-received counting (off by default to
+// avoid global-mutex contention on the hot query path).
+func EnableTQRcv() { tqRcvOn = true }
+
+func bumpTopicQueryRcv(id enode.ID) {
+	if !tqRcvOn {
+		return
+	}
+	topicQueryRcvMu.Lock()
+	topicQueryRcv[id]++
+	topicQueryRcvMu.Unlock()
+}
+
+// TopicQueryRcvCount returns how many TOPICQUERY messages the node received.
+func TopicQueryRcvCount(id enode.ID) int64 {
+	topicQueryRcvMu.Lock()
+	defer topicQueryRcvMu.Unlock()
+	return topicQueryRcv[id]
+}
+
 // handleTopicQuery serves TOPICQUERY messages.
 func (t *UDPv5) handleTopicQuery(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.TopicQuery) {
+	bumpTopicQueryRcv(t.Self().ID())
 	// Collect closest nodes to topic hash.
 	auxNodes := t.collectTopicAuxNodes(p.Topic, p.Buckets, fromAddr.Addr())
 	auxResponses := packNodeRecords(auxNodes)

@@ -22,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
@@ -293,27 +292,73 @@ func TestRegistrationExpiry(t *testing.T) {
 		t.Fatal("wrong next update time:", next)
 	}
 
-	// The attempt should be removed when the ad expires.
+	// When the ad expires, the candidate should be demoted to Standby and
+	// then promoted again to Waiting via refillAttempts (renewal), so the
+	// same candidate becomes eligible for re-registration without needing
+	// AddNodes to be called again.
 	simclock.Run(cfg.AdLifetime)
-	if a := r.Update(); a != nil {
-		t.Log(spew.Sdump(a))
-		t.Fatal("Update returned an attempt, but nothing to do.")
-	}
-	if r.heap.Len() > 0 {
-		t.Fatal("attempt not removed")
-	}
-
-	// Re-add the node.
-	simclock.Run(1 * time.Second)
-	r.AddNodes(nil, node)
-
-	// It should get scheduled for registration again.
 	att = r.Update()
 	if att == nil {
-		t.Fatal("no request scheduled")
+		t.Fatal("expired Registered attempt was not re-scheduled for renewal")
 	}
 	if att.State != Waiting {
-		t.Fatal("attempt should be in state", Waiting, "but has state", att.State)
+		t.Fatal("renewed attempt should be in state", Waiting, "but has state", att.State)
+	}
+	if att.Ticket != nil {
+		t.Fatal("renewed attempt should have its ticket cleared")
+	}
+	if att.reqCount != 0 || att.totalWaitTime != 0 {
+		t.Fatal("renewed attempt should have reqCount and totalWaitTime reset")
+	}
+}
+
+// TestRegistrationExpiryDropsWhenStandbyFull checks that an expired registration
+// is dropped (not demoted) when the bucket's standby pool is already full, so the
+// standby limit is never exceeded.
+func TestRegistrationExpiryDropsWhenStandbyFull(t *testing.T) {
+	simclock := new(mclock.Simulated)
+
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdLifetime = 20
+	cfg.RegBucketSize = 1
+	cfg.RegBucketStandbyLimit = 2
+	r := NewRegistration(topic1, cfg)
+
+	// Three nodes in the same bucket: one becomes active (Waiting), the other
+	// two fill the standby pool to its limit.
+	nodes := nodesAtDistanceFrom(enode.ID(r.Topic()), 30, 3, 1)
+	r.AddNodes(nil, nodes)
+
+	// Register the active attempt.
+	att := r.Update()
+	if att == nil || att.State != Waiting {
+		t.Fatal("no waiting attempt scheduled")
+	}
+	registeredID := att.Node.ID()
+	r.StartRequest(att)
+	r.HandleRegistered(att, cfg.AdLifetime)
+
+	// The standby pool is full while this ad is Registered.
+	b := &r.buckets[r.bucketIndex(registeredID)]
+	if b.count[Standby] != cfg.RegBucketStandbyLimit {
+		t.Fatalf("standby=%d, want %d", b.count[Standby], cfg.RegBucketStandbyLimit)
+	}
+	before := r.NodeCount()
+
+	// On expiry, with the standby pool already full, the attempt must be
+	// dropped rather than demoted back to Standby.
+	simclock.Run(cfg.AdLifetime)
+	r.Update()
+
+	if _, ok := b.att[registeredID]; ok {
+		t.Fatal("expired attempt was not dropped despite a full standby pool")
+	}
+	if got := r.NodeCount(); got != before-1 {
+		t.Fatalf("NodeCount=%d after drop, want %d", got, before-1)
+	}
+	if b.count[Standby] > cfg.RegBucketStandbyLimit {
+		t.Fatalf("standby count %d exceeds limit %d", b.count[Standby], cfg.RegBucketStandbyLimit)
 	}
 }
 
@@ -364,6 +409,9 @@ func TestRegistrationRemoveNode(t *testing.T) {
 		t.Fatal("in-flight attempt removed; must be left for response handling")
 	}
 }
+
+// TestRegistrationRemoveNode checks that RemoveNode drops a parked attempt but
+// leaves an in-flight one for its pending response.
 
 // TestRegistrationHandleTicketResponseDropAboveBudget verifies that a
 // registrar quoting a wait time above RegAttemptTimeout causes the attempt

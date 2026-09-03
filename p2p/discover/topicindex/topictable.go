@@ -232,6 +232,23 @@ func (tab *TopicTable) topicSize(t TopicID) int {
 	return list.Len()
 }
 
+// Occupancy reports how full the ad cache is: the number of ads currently held
+// and the configured capacity. It is the quantity the waiting-time function is
+// driven by, so sampling it over a run shows the cache filling and the pressure
+// that produces.
+func (tab *TopicTable) Occupancy() (held, capacity int) {
+	return tab.all.Len(), tab.config.AdCacheSize
+}
+
+// TopicOccupancy reports the number of ads held per topic.
+func (tab *TopicTable) TopicOccupancy() map[TopicID]int {
+	out := make(map[TopicID]int, len(tab.reg))
+	for t, l := range tab.reg {
+		out[t] = l.Len()
+	}
+	return out
+}
+
 // WaitTime returns the amount of time that node n must have waited to register for topic t.
 func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	total, _ := tab.waitTime(n, t, tab.config.Clock.Now())

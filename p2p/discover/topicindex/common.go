@@ -41,9 +41,18 @@ type Config struct {
 	// Search settings.
 	SearchBucketSize int // number of nodes in search buckets
 
+	MaxNodesPerSourcePerBucket int  // max nodes accepted from one source into one bucket
+	RemoveOnExpiry             bool // remove (vs renew) registration on expiry
+
 	// These settings are exposed for testing purposes.
 	Clock mclock.Clock
 	Log   log.Logger
+}
+
+// WithDefaults returns a copy of the config with defaults filled in for unset
+// options.
+func (cfg Config) WithDefaults() Config {
+	return cfg.withDefaults()
 }
 
 // withDefaults configures defaults for unset config options.
@@ -62,13 +71,16 @@ func (cfg Config) withDefaults() Config {
 		cfg.RegAttemptTimeout = cfg.AdLifetime + cfg.AdLifetime/2
 	}
 	if cfg.RegBucketSize == 0 {
-		cfg.RegBucketSize = 10
+		cfg.RegBucketSize = 3
 	}
 	if cfg.RegBucketStandbyLimit == 0 {
 		cfg.RegBucketStandbyLimit = 20
 	}
 	if cfg.SearchBucketSize == 0 {
-		cfg.SearchBucketSize = 8
+		cfg.SearchBucketSize = 20
+	}
+	if cfg.MaxNodesPerSourcePerBucket == 0 {
+		cfg.MaxNodesPerSourcePerBucket = 1
 	}
 
 	if cfg.Log == nil {
