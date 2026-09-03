@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/p2p/discover"
@@ -103,6 +104,10 @@ type overheadSeries struct {
 	// The normal teardown path and the absolute watchdog can both reach dump
 	// concurrently, so stopping the sampler has to be idempotent.
 	stopOnce sync.Once
+	// skipCache makes the final sample cheap: polling every node's ad cache
+	// round-trips through its dispatch goroutine, which is exactly what is
+	// unavailable when a run is torn down under load.
+	skipCache atomic.Bool
 }
 
 // startOverheadSeries samples cumulative traffic counters every period until
@@ -131,7 +136,7 @@ func (o *overheadSeries) sample(start time.Time) {
 	nodes := liveNodeRecs()
 	// Occupancy is read on each node's dispatch goroutine, so it is far more
 	// expensive than the atomic counters. Sample a bounded subset and scale.
-	cacheSample := len(nodes) <= cacheSampleLimit
+	cacheSample := len(nodes) <= cacheSampleLimit && !o.skipCache.Load()
 	s := overheadSample{
 		TSec:         time.Since(start).Seconds(),
 		TxBytes:      make([]int64, overheadBuckets),
@@ -190,7 +195,10 @@ func (o *overheadSeries) sample(start time.Time) {
 // dump stops sampling and writes the series, plus the final per-topic
 // wait-time samples, to path.
 func (o *overheadSeries) dump(path string) {
-	o.stopOnce.Do(func() { close(o.stop) })
+	o.stopOnce.Do(func() {
+		o.skipCache.Store(true)
+		close(o.stop)
+	})
 	<-o.done
 	o.mu.Lock()
 	defer o.mu.Unlock()

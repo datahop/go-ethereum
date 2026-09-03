@@ -327,10 +327,24 @@ func (t *UDPv5) TopicCacheOccupancy() (held, capacity int, byTopic map[topicinde
 		byTopic = t.topicTable.TopicOccupancy()
 		close(done)
 	}
+	// The dispatch goroutine can be arbitrarily busy under load, and a caller
+	// sampling thousands of nodes must not be held up by one of them. Give up
+	// rather than block; a missed sample beats a stalled teardown.
+	timeout := time.NewTimer(250 * time.Millisecond)
+	defer timeout.Stop()
 	select {
 	case t.onDispatchCh <- fn:
-		<-done
 	case <-t.closeCtx.Done():
+		return 0, 0, nil
+	case <-timeout.C:
+		return 0, 0, nil
+	}
+	select {
+	case <-done:
+	case <-t.closeCtx.Done():
+		return 0, 0, nil
+	case <-timeout.C:
+		return 0, 0, nil
 	}
 	return held, capacity, byTopic
 }

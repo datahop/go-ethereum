@@ -97,8 +97,16 @@ func main() {
 	go func() {
 		time.Sleep(hardCap)
 		fmt.Printf("absolute watchdog (%s) expired; force-exiting\n", hardCap)
+		// Flush what we can, but never let the flush prevent the exit: the
+		// watchdog exists precisely for runs whose normal paths are stuck.
 		if watchdogDump != nil {
-			watchdogDump()
+			flushed := make(chan struct{})
+			go func() { defer close(flushed); watchdogDump() }()
+			select {
+			case <-flushed:
+			case <-time.After(2 * time.Minute):
+				fmt.Println("watchdog: dump did not finish in time; exiting anyway")
+			}
 		}
 		os.Exit(0)
 	}()
