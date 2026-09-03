@@ -100,6 +100,9 @@ type overheadSeries struct {
 	samples []overheadSample
 	stop    chan struct{}
 	done    chan struct{}
+	// The normal teardown path and the absolute watchdog can both reach dump
+	// concurrently, so stopping the sampler has to be idempotent.
+	stopOnce sync.Once
 }
 
 // startOverheadSeries samples cumulative traffic counters every period until
@@ -187,7 +190,7 @@ func (o *overheadSeries) sample(start time.Time) {
 // dump stops sampling and writes the series, plus the final per-topic
 // wait-time samples, to path.
 func (o *overheadSeries) dump(path string) {
-	close(o.stop)
+	o.stopOnce.Do(func() { close(o.stop) })
 	<-o.done
 	o.mu.Lock()
 	defer o.mu.Unlock()

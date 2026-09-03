@@ -135,10 +135,10 @@ func main() {
 	if *overheadSeriesOutFlag != "" {
 		ohSeries = startOverheadSeries(*overheadSeriesPeriod, time.Now())
 	}
-	dumpOverheadIfSet = func() {
-		if *overheadOutFlag == "" {
-			return
-		}
+	// Both the normal teardown path and the watchdog goroutine reach these, so
+	// each dump runs at most once.
+	var overheadOnce sync.Once
+	dumpOverheadNow := func(path string) {
 		nodes := liveNodeRecs()
 		tqByIdx := make(map[int]int64, len(nodes))
 		idByIdx := make(map[int]string, len(nodes))
@@ -146,16 +146,25 @@ func main() {
 			tqByIdx[nr.idx] = discover.TopicQueryRcvCount(nr.ln.ID())
 			idByIdx[nr.idx] = nr.ln.ID().String()
 		}
-		dumpOverhead(*overheadOutFlag, tqByIdx, idByIdx)
-		fmt.Printf("overhead written to: %s\n", *overheadOutFlag)
-		dumpOverheadIfSet = func() {} // once
+		dumpOverhead(path, tqByIdx, idByIdx)
+		fmt.Printf("overhead written to: %s\n", path)
 	}
+	dumpOverheadIfSet = func() {
+		if *overheadOutFlag == "" {
+			return
+		}
+		overheadOnce.Do(func() { dumpOverheadNow(*overheadOutFlag) })
+	}
+	var dumpOnce sync.Once
 	dumpSeries := func() {
-		if ohSeries != nil {
+		if ohSeries == nil {
+			return
+		}
+		// Reached from both the normal teardown path and the watchdog goroutine.
+		dumpOnce.Do(func() {
 			ohSeries.dump(*overheadSeriesOutFlag)
 			fmt.Printf("overhead series written to: %s\n", *overheadSeriesOutFlag)
-			ohSeries = nil // dump once, whoever gets there first
-		}
+		})
 	}
 	// The absolute watchdog can fire mid-workload on a slow run; make sure the
 	// series still reaches disk in that case.
