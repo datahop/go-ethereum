@@ -37,6 +37,8 @@ var (
 	bucketsCounter      []*metrics.Counter
 	ingressTrafficMeter = metrics.NewRegisteredMeter(ingressMeterName, nil)
 	egressTrafficMeter  = metrics.NewRegisteredMeter(egressMeterName, nil)
+
+	regtopicRecordIPRejectCounter = metrics.NewRegisteredCounter(moduleName+"/regtopic/recordipreject", nil)
 )
 
 func init() {
