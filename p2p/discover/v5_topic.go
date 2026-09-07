@@ -41,6 +41,9 @@ type topicSystem struct {
 	quit chan struct{}
 }
 
+// EnableReach turns on topicindex reach sampling (testbed bottleneck analysis).
+func EnableReach() { topicindex.EnableReach() }
+
 func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 	sys := &topicSystem{
 		transport: transport,
