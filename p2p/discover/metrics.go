@@ -39,6 +39,8 @@ var (
 	egressTrafficMeter  = metrics.NewRegisteredMeter(egressMeterName, nil)
 	v4BadPacketMeter    = metrics.NewRegisteredMeter(moduleName+"/v4/bad", nil)
 	v5BadPacketMeter    = metrics.NewRegisteredMeter(moduleName+"/v5/bad", nil)
+
+	regtopicRecordIPRejectCounter = metrics.NewRegisteredCounter(moduleName+"/regtopic/recordipreject", nil)
 )
 
 // markInbound counts a received packet by its wire name, e.g. discover/ingress/PING/v4.

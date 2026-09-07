@@ -17,6 +17,8 @@
 package discover
 
 import (
+	"bytes"
+	"crypto/ecdsa"
 	"net"
 	"net/netip"
 	"testing"
@@ -405,5 +407,143 @@ func TestTopicRegSuccessResetsFailures(t *testing.T) {
 	})
 	waitForCond(t, "successful REGTOPIC reset the wire-failure tally", func() bool {
 		return test.db.FindFails(n.ID(), n.IPAddr()) == 0
+	})
+}
+
+// signedRecord builds a signed record carrying the given addresses. An invalid
+// netip.Addr leaves the corresponding entry out.
+func signedRecord(t *testing.T, key *ecdsa.PrivateKey, ip4, ip6 netip.Addr, port uint16) *enr.Record {
+	t.Helper()
+	var r enr.Record
+	if ip4.IsValid() {
+		r.Set(enr.IPv4Addr(ip4))
+	}
+	if ip6.IsValid() {
+		r.Set(enr.IPv6Addr(ip6))
+	}
+	r.Set(enr.UDP(port))
+	if err := enode.SignV4(&r, key); err != nil {
+		t.Fatal(err)
+	}
+	return &r
+}
+
+// TestCheckRegtopicRecordIP covers the address rules applied to a REGTOPIC
+// record: the entry for the source's address family must be present and equal to
+// the source, and the entry for the other family, which this packet cannot
+// prove, must at least be publicly routable.
+func TestCheckRegtopicRecordIP(t *testing.T) {
+	t.Parallel()
+
+	var (
+		none    netip.Addr
+		src4    = netip.MustParseAddr("203.0.113.7")
+		src6    = netip.MustParseAddr("2001:db8::7")
+		other4  = netip.MustParseAddr("198.51.100.9")
+		pub4    = netip.MustParseAddr("1.2.3.4")
+		pub6    = netip.MustParseAddr("2606:4700::1111")
+		lan4    = netip.MustParseAddr("192.168.1.5")
+		loop4   = netip.MustParseAddr("127.0.0.1")
+		linkl6  = netip.MustParseAddr("fe80::1")
+		mapped4 = netip.MustParseAddr("::ffff:203.0.113.7")
+	)
+
+	tests := []struct {
+		name     string
+		src      netip.Addr
+		ip4, ip6 netip.Addr
+		port     uint16
+		wantErr  bool
+	}{
+		{name: "v4 match", src: src4, ip4: src4, port: 30303},
+		{name: "v4 mismatch", src: src4, ip4: other4, port: 30303, wantErr: true},
+		{name: "v4 source, port differs", src: src4, ip4: src4, port: 40404},
+		{name: "v4 source, no v4 entry", src: src4, ip6: src6, port: 30303, wantErr: true},
+		{name: "v4 source mapped in v6", src: mapped4, ip4: src4, port: 30303},
+		{name: "v6 match", src: src6, ip6: src6, port: 30303},
+		{name: "v6 mismatch", src: src6, ip6: pub6, port: 30303, wantErr: true},
+		{name: "v6 source, no v6 entry", src: src6, ip4: src4, port: 30303, wantErr: true},
+		{name: "dual stack, other is public", src: src4, ip4: src4, ip6: pub6, port: 30303},
+		{name: "dual stack over v6, other is public", src: src6, ip4: pub4, ip6: src6, port: 30303},
+		{name: "dual stack, other is LAN", src: src4, ip4: src4, ip6: linkl6, port: 30303, wantErr: true},
+		{name: "dual stack over v6, other is private", src: src6, ip4: lan4, ip6: src6, port: 30303, wantErr: true},
+		{name: "dual stack over v6, other is loopback", src: src6, ip4: loop4, ip6: src6, port: 30303, wantErr: true},
+		{name: "no addresses", src: src4, ip4: none, ip6: none, port: 30303, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			n, err := enode.New(enode.ValidSchemes, signedRecord(t, newkey(), test.ip4, test.ip6, test.port))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := checkRegtopicRecordIP(n, test.src); (err != nil) != test.wantErr {
+				t.Fatalf("got %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+// TestHandleRegtopicRecordIP checks that handleRegtopic actually drops the ad
+// when the record fails the address rules, and stores it when it passes.
+func TestHandleRegtopicRecordIP(t *testing.T) {
+	t.Parallel()
+
+	t.Run("mismatch rejected", func(t *testing.T) {
+		t.Parallel()
+		test := newUDPV5Test(t)
+		defer test.close()
+
+		var (
+			spooferKey  = newkey()
+			spooferAddr = netip.MustParseAddrPort("10.0.1.1:30303")
+			victimAddr  = netip.MustParseAddr("10.0.9.9")
+			honestKey   = newkey()
+			honestAddr  = netip.MustParseAddrPort("10.0.1.2:30303")
+		)
+
+		// Signed by the sender, so the ID check passes, but advertising a third party.
+		test.packetInFrom(spooferKey, spooferAddr, &v5wire.Regtopic{
+			ReqID: []byte{1}, Topic: testTopic1,
+			ENR: signedRecord(t, spooferKey, victimAddr, netip.Addr{}, spooferAddr.Port()),
+		})
+		test.packetInFrom(honestKey, honestAddr, &v5wire.Regtopic{
+			ReqID: []byte{2}, Topic: testTopic1,
+			ENR: signedRecord(t, honestKey, honestAddr.Addr(), netip.Addr{}, honestAddr.Port()),
+		})
+
+		// Only the honest registration is confirmed. Waiting for it also synchronizes
+		// with the dispatch goroutine, so the table is settled below.
+		test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {
+			if !bytes.Equal(p.ReqID, []byte{2}) {
+				t.Errorf("got REGCONFIRMATION for ReqID %x, want 02", p.ReqID)
+			}
+		})
+
+		nodes := test.udp.LocalTopicNodes(testTopic1)
+		if len(nodes) != 1 {
+			t.Fatalf("wrong number of ads: got %d, want 1", len(nodes))
+		}
+		if nodes[0].ID() != enode.PubkeyToIDV4(&honestKey.PublicKey) {
+			t.Fatal("ad with mismatched source address was stored")
+		}
+	})
+
+	t.Run("port mismatch accepted", func(t *testing.T) {
+		t.Parallel()
+		test := newUDPV5Test(t)
+		defer test.close()
+
+		key := newkey()
+		addr := netip.MustParseAddrPort("10.0.1.1:30303")
+
+		test.packetInFrom(key, addr, &v5wire.Regtopic{
+			ReqID: []byte{1}, Topic: testTopic1,
+			ENR: signedRecord(t, key, addr.Addr(), netip.Addr{}, 40404),
+		})
+		test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {})
+
+		if nodes := test.udp.LocalTopicNodes(testTopic1); len(nodes) != 1 {
+			t.Fatalf("registration from rebound port was rejected: %d ads, want 1", len(nodes))
+		}
 	})
 }
