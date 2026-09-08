@@ -414,6 +414,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 	defer s.closeDown()
 
 	time := mclock.AbsTime(-1)
+	cycle := 0
 	for {
 		if time >= 0 {
 			if exit := s.pause(time); exit {
@@ -423,6 +424,8 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		time = s.config.Clock.Now()
 
 		state := topicindex.NewSearch(s.topic, s.config)
+		state.SetCycle(cycle)
+		cycle++
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue

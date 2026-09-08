@@ -27,13 +27,6 @@ import (
 )
 
 const (
-	// searchTableDepth is the number of buckets kept in the search table.
-	//
-	// The table only keeps nodes at logdist(topic, n) > (256 - searchTableDepth).
-	// Should there be any nodes which are closer than this, they just go into the last
-	// (closest) bucket.
-	searchTableDepth = 18
-
 	// IP subnet limit.
 	searchBucketSubnet, searchBucketIPLimit = 24, 1
 )
@@ -45,7 +38,7 @@ type Search struct {
 	log   log.Logger
 
 	// Note: search buckets are ordered far -> close.
-	buckets [searchTableDepth]searchBucket
+	buckets []searchBucket
 
 	bucketCheck  map[int]struct{}
 	cycle        int               // search-cycle index, set by runLoop each rollover
@@ -71,8 +64,9 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		log:         cfg.Log.New("topic", topic),
 		topic:       topic,
 		resultSeen:  make(map[enode.ID]struct{}),
-		bucketCheck: make(map[int]struct{}, searchTableDepth),
+		bucketCheck: make(map[int]struct{}, cfg.SearchTableDepth),
 		origin:      make(map[enode.ID]bool),
+		buckets:     make([]searchBucket, cfg.SearchTableDepth),
 	}
 	dist := 256
 	for i := range s.buckets {
@@ -109,6 +103,7 @@ func (s *Search) IsDone() bool {
 	for i := range s.buckets {
 		provBucketOcc[i].Add(int64(s.buckets[i].count()))
 	}
+	provBucketCount.Store(int64(len(s.buckets)))
 	provBucketSamples.Add(1)
 	return true
 }
@@ -209,7 +204,7 @@ func (s *Search) removeNode(id enode.ID) {
 // with candidates, join the random pool.
 func (s *Search) QueryTarget() *enode.Node {
 	// Collect buckets with new nodes.
-	withnew := make([]*searchBucket, 0, searchTableDepth)
+	withnew := make([]*searchBucket, 0, len(s.buckets))
 	for i := range s.buckets {
 		if len(s.buckets[i].new) > 0 {
 			withnew = append(withnew, &s.buckets[i])
@@ -384,7 +379,8 @@ var (
 	provRejectFull         atomic.Int64
 	provRejectOnePerBucket atomic.Int64
 	provRejectIP           atomic.Int64
-	provBucketOcc          [searchTableDepth]atomic.Int64
+	provBucketOcc          [maxTableDepth]atomic.Int64
+	provBucketCount        atomic.Int64
 	provBucketSamples      atomic.Int64
 )
 
@@ -402,8 +398,8 @@ func SearchProvenance() map[string]int64 {
 // AddNodes rejection counts.
 func SearchBucketStats() ([]float64, map[string]int64) {
 	n := provBucketSamples.Load()
-	occ := make([]float64, len(provBucketOcc))
-	for i := range provBucketOcc {
+	occ := make([]float64, provBucketCount.Load())
+	for i := range occ {
 		if n > 0 {
 			occ[i] = float64(provBucketOcc[i].Load()) / float64(n)
 		}

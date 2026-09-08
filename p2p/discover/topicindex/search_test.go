@@ -279,6 +279,7 @@ func TestSearchResultsTracking(t *testing.T) {
 func TestSearchBucketsWithFreeSpace(t *testing.T) {
 	config := testConfig(t)
 	s := NewSearch(topic1, config)
+	searchTableDepth := len(s.buckets)
 
 	// On a fresh table, every bucket has free space, covering the full
 	// distance range 256 .. 256-searchTableDepth+1.

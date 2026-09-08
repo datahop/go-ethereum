@@ -33,6 +33,11 @@ type Config struct {
 	AdLifetime  time.Duration
 	AdCacheSize int
 
+	// Table depths: number of distance buckets kept. Nodes closer than the
+	// last bucket's distance all fall into it. Bounded by maxTableDepth.
+	RegTableDepth    int
+	SearchTableDepth int
+
 	// Registration settings.
 	RegBucketSize         int           // max/ number of active nodes in registration bucket
 	RegBucketStandbyLimit int           // max. number of 'standby' state nodes in bucket
@@ -61,14 +66,20 @@ func (cfg Config) withDefaults() Config {
 		// and it's better to pick another one.
 		cfg.RegAttemptTimeout = cfg.AdLifetime + cfg.AdLifetime/2
 	}
+	if cfg.RegTableDepth == 0 {
+		cfg.RegTableDepth = 10
+	}
+	if cfg.SearchTableDepth == 0 {
+		cfg.SearchTableDepth = 10
+	}
 	if cfg.RegBucketSize == 0 {
-		cfg.RegBucketSize = 10
+		cfg.RegBucketSize = 5
 	}
 	if cfg.RegBucketStandbyLimit == 0 {
 		cfg.RegBucketStandbyLimit = 20
 	}
 	if cfg.SearchBucketSize == 0 {
-		cfg.SearchBucketSize = 8
+		cfg.SearchBucketSize = 16
 	}
 
 	if cfg.Log == nil {

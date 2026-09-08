@@ -32,12 +32,8 @@ const (
 	// IP subnet limit.
 	regBucketSubnet, regBucketIPLimit = 24, 1
 
-	// regTableDepth is the number of buckets kept in the registration table.
-	//
-	// The table only keeps nodes at logdist(topic, n) > (256 - regTableDepth).
-	// Should there be any nodes which are closer than this, they just go into the last
-	// (closest) bucket.
-	regTableDepth = 18
+	// maxTableDepth bounds Config.RegTableDepth / SearchTableDepth.
+	maxTableDepth = 32
 )
 
 // Registration is the state associated with registering in a single topic.
@@ -47,7 +43,7 @@ type Registration struct {
 	log   log.Logger
 
 	// Note: registration buckets are ordered far -> close.
-	buckets [regTableDepth]regBucket
+	buckets []regBucket
 	heap    regHeap
 }
 
@@ -126,9 +122,10 @@ type RegAttempt struct {
 func NewRegistration(topic TopicID, cfg Config) *Registration {
 	cfg = cfg.withDefaults()
 	r := &Registration{
-		topic: topic,
-		cfg:   cfg,
-		log:   cfg.Log.New("topic", topic),
+		topic:   topic,
+		cfg:     cfg,
+		log:     cfg.Log.New("topic", topic),
+		buckets: make([]regBucket, cfg.RegTableDepth),
 	}
 	dist := 256
 	for i := range r.buckets {
