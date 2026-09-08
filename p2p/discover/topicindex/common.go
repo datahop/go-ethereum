@@ -46,6 +46,12 @@ type Config struct {
 	// Search settings.
 	SearchBucketSize int // number of nodes in search buckets
 
+	// Response sizes. TopicNodesLimit caps the topic nodes in a TOPICQUERY
+	// reply; AuxNodesLimit caps the closest-to-topic nodes attached to both
+	// TOPICQUERY and REGTOPIC replies (one per requested distance).
+	TopicNodesLimit int
+	AuxNodesLimit   int
+
 	// These settings are exposed for testing purposes.
 	Clock mclock.Clock
 	Log   log.Logger
@@ -81,6 +87,12 @@ func (cfg Config) withDefaults() Config {
 	if cfg.SearchBucketSize == 0 {
 		cfg.SearchBucketSize = 16
 	}
+	if cfg.TopicNodesLimit == 0 {
+		cfg.TopicNodesLimit = 16
+	}
+	if cfg.AuxNodesLimit == 0 {
+		cfg.AuxNodesLimit = 8
+	}
 
 	if cfg.Log == nil {
 		cfg.Log = log.Root()
@@ -89,6 +101,12 @@ func (cfg Config) withDefaults() Config {
 		cfg.Clock = mclock.System{}
 	}
 	return cfg
+}
+
+// ResponseLimits returns TopicNodesLimit and AuxNodesLimit with defaults applied.
+func (cfg Config) ResponseLimits() (topicNodes, auxNodes int) {
+	cfg = cfg.withDefaults()
+	return cfg.TopicNodesLimit, cfg.AuxNodesLimit
 }
 
 // TopicID represents a topic.

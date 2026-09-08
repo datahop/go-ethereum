@@ -45,8 +45,6 @@ const (
 	lookupRequestLimit      = 3  // max requests against a single node during lookup
 	findnodeResultLimit     = 16 // applies in FINDNODE handler
 	totalNodesResponseLimit = 5  // applies in waitForNodes
-	regtopicNodesLimit      = 8
-	topicNodesResultLimit   = 16 // applies in TOPICQUERY handler
 )
 
 // codecV5 is implemented by v5wire.Codec (and testCodec).
@@ -99,6 +97,7 @@ type UDPv5 struct {
 
 	// topic stuff
 	topicTable   *topicindex.TopicTable
+	topicLimits  struct{ topicNodes, auxNodes int }
 	ticketSealer *topicindex.TicketSealer
 	topicSys     *topicSystem
 
@@ -218,6 +217,7 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		return nil, err
 	}
 	t.tab = tab
+	t.topicLimits.topicNodes, t.topicLimits.auxNodes = topicConfig.ResponseLimits()
 	t.topicSys = newTopicSystem(t, topicConfig)
 	// Advertise the topic-discovery capability in the local node's ENR.
 	ln.Set(topicindex.TopicDiscoveryVersion)
@@ -622,18 +622,18 @@ func (t *UDPv5) regtopic(quit <-chan struct{}, n *enode.Node, topic topicindex.T
 			switch resp := responseMsg.(type) {
 			case *v5wire.Regconfirmation:
 				if total == -1 {
-					total = min(int(resp.RespCount), regtopicNodesLimit)
+					total = min(int(resp.RespCount), t.topicLimits.auxNodes)
 				}
 				received++
 				result.msg = resp
 				confirmed = true
 			case *v5wire.Nodes:
 				if total == -1 {
-					total = min(int(resp.RespCount), regtopicNodesLimit)
+					total = min(int(resp.RespCount), t.topicLimits.auxNodes)
 				}
 				received++
 				for _, record := range resp.Nodes {
-					if len(nodes) >= regtopicNodesLimit {
+					if len(nodes) >= t.topicLimits.auxNodes {
 						break
 					}
 					node, err := t.verifyResponseNode(c, record, nil, seen)
@@ -677,11 +677,11 @@ func (t *UDPv5) topicQuery(quit <-chan struct{}, n *enode.Node, topic topicindex
 			switch resp := responseMsg.(type) {
 			case *v5wire.Nodes:
 				if total == -1 {
-					total = min(int(resp.RespCount), topicNodesResultLimit)
+					total = min(int(resp.RespCount), t.topicLimits.topicNodes)
 				}
 				received++
 				for _, record := range resp.Nodes {
-					if len(auxNodes) >= topicNodesResultLimit {
+					if len(auxNodes) >= t.topicLimits.topicNodes {
 						break
 					}
 					node, err := t.verifyResponseNode(c, record, nil, auxSeen)
@@ -693,11 +693,11 @@ func (t *UDPv5) topicQuery(quit <-chan struct{}, n *enode.Node, topic topicindex
 				}
 			case *v5wire.TopicNodes:
 				if total == -1 {
-					total = min(int(resp.RespCount), topicNodesResultLimit)
+					total = min(int(resp.RespCount), t.topicLimits.topicNodes)
 				}
 				received++
 				for _, record := range resp.Nodes {
-					if len(topicNodes) >= topicNodesResultLimit {
+					if len(topicNodes) >= t.topicLimits.topicNodes {
 						break
 					}
 					node, err := t.verifyResponseNode(c, record, nil, topicSeen)
@@ -1409,7 +1409,7 @@ func (t *UDPv5) handleTopicQuery(fromID enode.ID, fromAddr netip.AddrPort, p *v5
 	auxResponses := packNodeRecords(auxNodes)
 
 	// Get matching nodes from the topic table.
-	topicNodes := t.topicTable.RandomNodes(p.Topic, topicNodesResultLimit, func(n *enode.Node) bool {
+	topicNodes := t.topicTable.RandomNodes(p.Topic, t.topicLimits.topicNodes, func(n *enode.Node) bool {
 		return netutil.CheckRelayAddr(fromAddr.Addr(), n.IPAddr()) == nil
 	})
 	topicResponses := packNodeRecords(topicNodes)
@@ -1446,9 +1446,9 @@ func (t *UDPv5) collectTopicAuxNodes(topic topicindex.TopicID, reqDist []uint, r
 		return topicindex.SupportsTopicDiscovery(n) && netutil.CheckRelayAddr(remoteIP, n.IPAddr()) == nil
 	}
 	// One node is returned per distance, so cap the requested distances to keep
-	// the response (and the scan) within regtopicNodesLimit.
-	if len(reqDist) > regtopicNodesLimit {
-		reqDist = reqDist[:regtopicNodesLimit]
+	// the response (and the scan) within t.topicLimits.auxNodes.
+	if len(reqDist) > t.topicLimits.auxNodes {
+		reqDist = reqDist[:t.topicLimits.auxNodes]
 	}
 	return t.tab.collectOnePerDist(enode.ID(topic), reqDist, check)
 }
