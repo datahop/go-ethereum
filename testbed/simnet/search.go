@@ -32,6 +32,25 @@ type searchPacing struct {
 	// results back-to-back.
 	MaxPause time.Duration
 
+	// PauseNovelOnly restricts the MaxPause sleep to yields that reveal a
+	// registrant this searcher has not seen yet. Search rollover re-yields
+	// known registrants (~8 per new one at 7.5k nodes), so pausing on those
+	// spends the searcher's iteration budget without gaining information.
+	PauseNovelOnly bool
+
+	// RedialWait mirrors geth's dialHistoryExpiration: how long after a dial
+	// attempt the same node is skipped before being tried again.
+	RedialWait time.Duration
+
+	// Resumable keeps a searcher alive after its slots fill, parked until a
+	// peer drops. Only meaningful when something can actually disconnect;
+	// otherwise a full searcher just returns and the run ends when all do.
+	Resumable bool
+
+	// Conns, if non-nil, makes a searcher stop consuming discovery results
+	// once its outbound peer slots are full, the way geth's dialer does.
+	Conns *connTable
+
 	// TargetCount, if > 0, causes a searcher to close its iterator as
 	// soon as it has seen this many *distinct* registrants. Stops the
 	// search early — a real application typically needs a handful of
@@ -75,6 +94,12 @@ type searchResult struct {
 	// first seen at each timestamp. Pairs discovery time with ID-space
 	// position (FoundRegistrantIDs is an unordered set and cannot).
 	UniqueFoundIDs []string `json:"uniqueFoundIds"`
+	// Connection-model outcome (zero unless -conn-model is set).
+	OutboundConns   int   `json:"outboundConns"`   // outbound slots filled
+	DialAttempts    int   `json:"dialAttempts"`    // novel registrants this searcher tried to dial
+	DialRefused     int   `json:"dialRefused"`     // refused because the target's inbound slots were full
+	SlotsFilledAtMs int64 `json:"slotsFilledAtMs"` // ms from search start until outbound was full (0 = never)
+
 	// SearchStartMs is this searcher's start offset from the run's common
 	// epoch (registration start). UniqueFoundAtMs is relative to this
 	// searcher's own start, which is not comparable across searchers that
@@ -256,7 +281,6 @@ func runOneSearcher(n nodeRec, topicIdx int, topic topicindex.TopicID, deadlineA
 	pacing searchPacing, has func(enode.ID, int) bool, target int, rngSeed int64,
 	stats *liveStats, deadTracker *deadResultTracker) searchResult {
 
-	iter := n.disc.TopicSearch(topic, uint64(n.idx))
 	// Snapshot of nodes already in this searcher's routing table when the
 	// search begins. A registrant already here was given to us by bootstrap,
 	// not discovered by search; the net-new metric discards these to isolate
@@ -265,30 +289,49 @@ func runOneSearcher(n nodeRec, topicIdx int, topic topicindex.TopicID, deadlineA
 	for _, cn := range n.disc.AllNodes() {
 		connected[cn.ID()] = struct{}{}
 	}
-	deadline := time.After(time.Until(deadlineAt))
+	// Closed (not sent to) so every pump goroutine across sessions observes it.
+	deadline := make(chan struct{})
+	deadlineTimer := time.AfterFunc(time.Until(deadlineAt), func() { close(deadline) })
+	defer deadlineTimer.Stop()
+
+	// A searcher may run several search sessions: it stops consuming when its
+	// outbound slots fill, and opens a fresh search if a peer later drops.
+	var (
+		iter   enode.Iterator
+		nodeCh chan *enode.Node
+	)
 	// Best-effort close. The discv5 topicSearch shutdown path
 	// (search.stop -> wg.Wait) can hang at high node counts when internal
 	// runLoop/runRequests goroutines are stuck on a saturated UDP socket and
 	// never observe quit. Calling Close in a detached goroutine lets the
 	// searcher's outer goroutine return so the workload can complete; the
 	// leaked shutdown goroutine is reaped by main()'s teardown watchdog.
-	closeIter := func() { go iter.Close() }
+	closeIter := func() {
+		if iter != nil {
+			go iter.Close()
+			iter = nil
+		}
+	}
 	defer closeIter()
 
 	// Decouple iter.Next() from the main loop via a pump goroutine: iter.Close()
 	// does not reliably unblock a parked iter.Next() at scale, so reading via a
 	// channel lets us bail when the deadline fires even if iter.Next() is stuck.
-	nodeCh := make(chan *enode.Node, 1)
-	go func() {
-		defer close(nodeCh)
-		for iter.Next() {
-			select {
-			case nodeCh <- iter.Node():
-			case <-deadline:
-				return
+	openSearch := func() {
+		it := n.disc.TopicSearch(topic, uint64(n.idx))
+		ch := make(chan *enode.Node, 1)
+		iter, nodeCh = it, ch
+		go func() {
+			defer close(ch)
+			for it.Next() {
+				select {
+				case ch <- it.Node():
+				case <-deadline:
+					return
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	rng := rand.New(rand.NewSource(rngSeed)) // per-searcher, so pacing pauses don't align
 	start := time.Now()
@@ -305,64 +348,111 @@ func runOneSearcher(n nodeRec, topicIdx int, topic topicindex.TopicID, deadlineA
 		seenNewReg     = make(map[enode.ID]struct{})
 		newAtMs        []int64
 		alreadyConnReg int
+
+		outboundConns   int
+		dialAttempts    int
+		dialRefused     int
+		slotsFilledAtMs int64
+		lastDial        = make(map[enode.ID]time.Time)
 	)
 	selfID := n.ln.ID()
-loop:
+	var refillSince time.Time
+sessions:
 	for {
-		var nd *enode.Node
-		var ok bool
-		select {
-		case <-deadline:
-			hitDeadline = true
-			closeIter()
-			break loop
-		case nd, ok = <-nodeCh:
-			if !ok {
-				break loop
-			}
-		}
-		if timeFirst == 0 {
-			timeFirst = time.Since(start)
-		}
-		id := nd.ID()
-		if id == selfID {
-			continue
-		}
-		totalYields++
-		if has(id, topicIdx) {
-			if _, dup := seenReg[id]; !dup {
-				seenReg[id] = struct{}{}
-				uniqueAtMs = append(uniqueAtMs, time.Since(start).Milliseconds())
-				uniqueIDs = append(uniqueIDs, id.TerminalString())
-				if _, already := connected[id]; already {
-					alreadyConnReg++
-				} else {
-					seenNewReg[id] = struct{}{}
-					newAtMs = append(newAtMs, time.Since(start).Milliseconds())
-				}
-				stats.recordUniqueFind(topicIdx, id)
-				// Record whether this registrant was already dead when first
-				// returned to this searcher, and how stale it was.
-				if deadTracker != nil {
-					dl.record(deadTracker, id, time.Now())
-				}
-			}
-			registered++
-		} else {
-			extra++
-		}
-		if pacing.TargetCount > 0 && len(seenReg) >= pacing.TargetCount {
-			closeIter()
-			break loop
-		}
-		if pacing.MaxPause > 0 {
+		openSearch()
+	consume:
+		for {
+			var nd *enode.Node
+			var ok bool
 			select {
 			case <-deadline:
 				hitDeadline = true
-				closeIter()
-				break loop
-			case <-time.After(time.Duration(rng.Int63n(int64(pacing.MaxPause)))):
+				break sessions
+			case nd, ok = <-nodeCh:
+				if !ok {
+					break consume
+				}
 			}
+			if timeFirst == 0 {
+				timeFirst = time.Since(start)
+			}
+			id := nd.ID()
+			if id == selfID {
+				continue
+			}
+			totalYields++
+			novel := false
+			isReg := has(id, topicIdx)
+			if isReg {
+				if _, dup := seenReg[id]; !dup {
+					novel = true
+					seenReg[id] = struct{}{}
+					uniqueAtMs = append(uniqueAtMs, time.Since(start).Milliseconds())
+					uniqueIDs = append(uniqueIDs, id.TerminalString())
+					if _, already := connected[id]; already {
+						alreadyConnReg++
+					} else {
+						seenNewReg[id] = struct{}{}
+						newAtMs = append(newAtMs, time.Since(start).Milliseconds())
+					}
+					stats.recordUniqueFind(topicIdx, id)
+					// Record whether this registrant was already dead when first
+					// returned to this searcher, and how stale it was.
+					if deadTracker != nil {
+						dl.record(deadTracker, id, time.Now())
+					}
+				}
+				registered++
+			} else {
+				extra++
+			}
+			// Dialing is gated on connection state, not on novelty: discovery may
+			// return a node it has returned before, and the dialer retries it once
+			// its redial cooldown expires. connTable rejects peers already
+			// connected in either direction.
+			if isReg && pacing.Conns != nil && !recentlyDialed(lastDial, id, pacing.RedialWait) {
+				lastDial[id] = time.Now()
+				dialAttempts++
+				if ok, targetFull := pacing.Conns.dial(n.idx, id); ok {
+					outboundConns++
+					if !refillSince.IsZero() {
+						pacing.Conns.recordRefill(time.Since(refillSince))
+						refillSince = time.Time{}
+					}
+					if pacing.Conns.outboundFull(n.idx) {
+						if slotsFilledAtMs == 0 {
+							slotsFilledAtMs = time.Since(start).Milliseconds()
+						}
+						break consume
+					}
+				} else if targetFull {
+					dialRefused++
+				}
+			}
+			if pacing.TargetCount > 0 && len(seenReg) >= pacing.TargetCount {
+				break sessions
+			}
+			if pacing.MaxPause > 0 && (novel || !pacing.PauseNovelOnly) {
+				select {
+				case <-deadline:
+					hitDeadline = true
+					break sessions
+				case <-time.After(time.Duration(rng.Int63n(int64(pacing.MaxPause)))):
+				}
+			}
+		}
+		// Slots are full (or discovery ended): stop searching, which is what
+		// makes a churn-free run go quiet, then wait for a peer to drop.
+		closeIter()
+		if pacing.Conns == nil || !pacing.Resumable || !pacing.Conns.shouldPark(n.idx) {
+			break sessions
+		}
+		select {
+		case <-pacing.Conns.wakeCh(n.idx):
+			refillSince = time.Now()
+		case <-deadline:
+			hitDeadline = true
+			break sessions
 		}
 	}
 	elapsed := time.Since(start)
@@ -388,6 +478,10 @@ loop:
 		UniqueFoundAtMs:     uniqueAtMs,
 		UniqueFoundIDs:      uniqueIDs,
 		SearchStartMs:       searchStartOffsetMs(start),
+		OutboundConns:       outboundConns,
+		DialAttempts:        dialAttempts,
+		DialRefused:         dialRefused,
+		SlotsFilledAtMs:     slotsFilledAtMs,
 		HitTimeoutBefore:    hitDeadline,
 		ConnectedAtStart:    len(connected),
 		AlreadyConnectedReg: alreadyConnReg,

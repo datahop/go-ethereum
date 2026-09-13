@@ -29,6 +29,7 @@ var (
 	nodeRegAttemptTimeout    time.Duration
 	nodeRemoveOnExpiry       bool
 	nodeNodesPerSourceBucket int
+	nodeAdCacheSize          int
 )
 
 // makeTopic returns a deterministic 32-byte topic ID for index i.
@@ -125,6 +126,9 @@ func spawnNode(sim *simnet.Simnet, settings simnet.NodeBiDiLinkSettings, idx int
 	}
 	if nodeSearchBucketSize > 0 {
 		cfg.Topic.SearchBucketSize = nodeSearchBucketSize
+	}
+	if nodeAdCacheSize > 0 {
+		cfg.Topic.AdCacheSize = nodeAdCacheSize
 	}
 	if nodeRegAttemptTimeout > 0 {
 		cfg.Topic.RegAttemptTimeout = nodeRegAttemptTimeout

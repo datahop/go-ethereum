@@ -39,6 +39,15 @@ func main() {
 	maxBootnodes := flag.Int("max-bootnodes", 20, "max bootnodes each newly-spawned node uses to discover the network; smaller = less startup traffic, slower routing-table convergence")
 	searchStagger := flag.Duration("search-stagger", 0, "per-slot delay before each searcher starts its TopicSearch; spreads search activity across a window")
 	searchPauseMax := flag.Duration("search-pause-max", 0, "upper bound for random sleep between iter.Next() calls per searcher; models paced consumption instead of full-speed polling")
+	connModel := flag.Bool("conn-model", false, "model geth peer slots: a searcher stops consuming discovery once its outbound slots are full, so a churn-free run reaches a steady state")
+	connMaxPeers := flag.Int("conn-max-peers", 50, "total peer slots per node (geth default)")
+	connDialRatio := flag.Int("conn-dial-ratio", 3, "1/N of the slots are outbound, the rest inbound (geth default 3)")
+	sessionChurn := flag.Bool("session-churn", false, "give each node a session length drawn from a measured discv5 crawl (42.3% stay for the whole run, the rest fall off geometrically from a very short mode); on expiry a node drops all its connections and stops accepting dials for -session-churn-gap, then returns and refills")
+	sessionChurnGap := flag.Duration("session-churn-gap", 30*time.Second, "how long a departed node stays unreachable before rejoining")
+	disconnectInterval := flag.Duration("disconnect-interval", 0, "if > 0, drop -disconnect-frac of live connections every interval; models transient network failure with no node leaving (requires -conn-model)")
+	disconnectFrac := flag.Float64("disconnect-frac", 0.01, "fraction of live connections dropped each -disconnect-interval")
+	connRedialWait := flag.Duration("conn-redial-wait", 35*time.Second, "cooldown before a searcher re-dials the same node (geth dialHistoryExpiration = 35s)")
+	searchPauseNovelOnly := flag.Bool("search-pause-novel-only", false, "apply -search-pause-max only to yields of not-yet-seen registrants; rollover re-yields known ones and pausing on those consumes the searcher's iteration budget without new information")
 	searchTargetCount := flag.Int("search-target-count", 0, "stop each searcher once it has seen this many distinct registrants (0 = no limit, run for full search-timeout)")
 	checkpointInterval := flag.Duration("checkpoint-interval", 0, "if > 0, print per-topic coverage snapshot at this cadence during the search phase; useful for long continuous runs to see progress without waiting for the final report")
 	refreshInterval := flag.Duration("refresh-interval", 0, "discv5 routing table refresh interval (0 = use discv5 default of 30 min). Lower values run more background random lookups; useful for long-running simnets where coverage plateaus if routing tables freeze")
@@ -49,7 +58,8 @@ func main() {
 	adLifetime := flag.Duration("ad-lifetime", 0, "topic ad lifetime (0 = discv5 default of 15m); also drives RegAttemptTimeout = 1.5x this")
 	allRegister := flag.Bool("all-register", false, "single shared topic where every node both registers and searches it (uniform membership, no Zipf); routes through the multi-topic engine with 1 topic")
 	snapshotDirFlag := flag.String("snapshot-dir", "", "if set, write periodic per-registrant find-count snapshots + registrant manifest (id+logdist) here for offline spatial analysis")
-	searchBucketSize := flag.Int("search-bucket-size", 0, "topic search bucket size per distance bucket (0 = default 8); raises the 18*size per-search registrar ceiling")
+	adCacheSize := flag.Int("ad-cache-size", 0, "per-node topic ad cache capacity (0 = default 5000); drives the waiting-time occupancy term")
+	searchBucketSize := flag.Int("search-bucket-size", 0, "topic search bucket size per distance bucket (0 = spec default 16); raises the depth*size per-search registrar ceiling")
 	nodesPerSourceBucket := flag.Int("nodes-per-source-bucket", 0, "max nodes accepted per source per bucket in search+registration tables (0 = default 1)")
 	regAttemptTimeout := flag.Duration("reg-attempt-timeout", 0, "max time a registrant waits on one registrar before giving up (0 = default 1.5x ad-lifetime)")
 	overheadOutFlag := flag.String("overhead-out", "", "if set, write per-node sent/received packet+byte counts to this JSON file")
@@ -75,6 +85,7 @@ func main() {
 	}
 	snapshotDir = *snapshotDirFlag
 	nodeSearchBucketSize = *searchBucketSize
+	nodeAdCacheSize = *adCacheSize
 	nodeRegAttemptTimeout = *regAttemptTimeout
 	nodeNodesPerSourceBucket = *nodesPerSourceBucket
 
@@ -97,8 +108,16 @@ func main() {
 	go func() {
 		time.Sleep(hardCap)
 		fmt.Printf("absolute watchdog (%s) expired; force-exiting\n", hardCap)
+		// Flush what we can, but never let the flush prevent the exit: the
+		// watchdog exists precisely for runs whose normal paths are stuck.
 		if watchdogDump != nil {
-			watchdogDump()
+			flushed := make(chan struct{})
+			go func() { defer close(flushed); watchdogDump() }()
+			select {
+			case <-flushed:
+			case <-time.After(2 * time.Minute):
+				fmt.Println("watchdog: dump did not finish in time; exiting anyway")
+			}
 		}
 		os.Exit(0)
 	}()
@@ -168,7 +187,13 @@ func main() {
 	}
 	// The absolute watchdog can fire mid-workload on a slow run; make sure the
 	// series still reaches disk in that case.
-	watchdogDump = dumpSeries
+	// The watchdog must flush every dump, not just the series: at 10k the
+	// teardown regularly outlasts the budget, and losing the per-node and reach
+	// dumps costs measurements the run cannot cheaply reproduce.
+	watchdogDump = func() {
+		dumpSeries()
+		dumpOverheadIfSet()
+	}
 
 	// Mixed-binary interop workload: a fraction of nodes run the real stock
 	// upstream geth v1.17.3 discv5 stack as substrate; the rest run TopDisc.
@@ -178,7 +203,7 @@ func main() {
 		monitorStop := make(chan struct{})
 		monitorDone := make(chan struct{})
 		go monitorBuffers(sim, monitorStop, monitorDone)
-		pacing := searchPacing{Stagger: *searchStagger, MaxPause: *searchPauseMax, TargetCount: *searchTargetCount, Checkpoint: *checkpointInterval}
+		pacing := searchPacing{Stagger: *searchStagger, MaxPause: *searchPauseMax, PauseNovelOnly: *searchPauseNovelOnly, TargetCount: *searchTargetCount, Checkpoint: *checkpointInterval, RedialWait: *connRedialWait}
 		runVanillaInterop(sim, settings, *nodes, *vanillaFrac, *numTopics, *zipfS, *seed,
 			*bootstrapWait, *registerWait, *searchTimeout, *regProbePeriod, *registerStagger, *refreshInterval,
 			*maxBootnodes, *spawnDelay, *metricsOut, pacing)
@@ -223,10 +248,29 @@ func main() {
 	time.Sleep(*bootstrapWait)
 
 	pacing := searchPacing{
-		Stagger:     *searchStagger,
-		MaxPause:    *searchPauseMax,
-		TargetCount: *searchTargetCount,
-		Checkpoint:  *checkpointInterval,
+		Stagger:        *searchStagger,
+		MaxPause:       *searchPauseMax,
+		PauseNovelOnly: *searchPauseNovelOnly,
+		TargetCount:    *searchTargetCount,
+		Checkpoint:     *checkpointInterval,
+		RedialWait:     *connRedialWait,
+	}
+	if *connModel {
+		pacing.Conns = newConnTable(all, *connMaxPeers, *connDialRatio)
+		defer pacing.Conns.report()
+		pacing.Resumable = *disconnectInterval > 0 || *churnInterval > 0 || *sessionChurn
+		if *sessionChurn {
+			scStop := make(chan struct{})
+			scDone := make(chan struct{})
+			go runSessionChurn(pacing.Conns, *searchTimeout, *sessionChurnGap, *seed, scStop, scDone)
+			defer func() { close(scStop); <-scDone }()
+		}
+		if *disconnectInterval > 0 {
+			dcStop := make(chan struct{})
+			dcDone := make(chan struct{})
+			go runDisconnectDriver(pacing.Conns, *disconnectInterval, *disconnectFrac, *seed, dcStop, dcDone)
+			defer func() { close(dcStop); <-dcDone }()
+		}
 	}
 
 	switch {

@@ -4,7 +4,7 @@ go 1.25.1
 
 replace github.com/ethereum/go-ethereum => ../..
 
-replace github.com/marcopolo/simnet => github.com/srene/simnet v0.0.8-0.20260514104505-b1b838a35825
+replace github.com/marcopolo/simnet => /home/sergi/simnet-fork
 
 replace github.com/ethereum/go-ethereum-vanilla => /home/sergi/geth-vanilla
 

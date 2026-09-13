@@ -71,13 +71,13 @@ func (cfg Config) withDefaults() Config {
 		cfg.RegAttemptTimeout = cfg.AdLifetime + cfg.AdLifetime/2
 	}
 	if cfg.RegBucketSize == 0 {
-		cfg.RegBucketSize = 3
+		cfg.RegBucketSize = 5
 	}
 	if cfg.RegBucketStandbyLimit == 0 {
 		cfg.RegBucketStandbyLimit = 20
 	}
 	if cfg.SearchBucketSize == 0 {
-		cfg.SearchBucketSize = 20
+		cfg.SearchBucketSize = 16
 	}
 	if cfg.MaxNodesPerSourcePerBucket == 0 {
 		cfg.MaxNodesPerSourcePerBucket = 1

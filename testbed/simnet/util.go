@@ -78,9 +78,9 @@ func monitorBuffers(sim *simnet.Simnet, stop <-chan struct{}, done chan<- struct
 	for {
 		select {
 		case <-stop:
-			fmt.Printf("[buf] final peak — router: max %d / cap %d (sum peak %d across %d shards); links: max %d / cap %d (sum peak %d across %d drivers)\n",
+			fmt.Printf("[buf] final peak — router: max %d / cap %d (sum peak %d across %d shards); links: max %d / cap %d (sum peak %d across %d drivers); dropped=%d\n",
 				peakRouterMax, routerCap, peakRouterSum, routerShards,
-				peakLinkMax, linkCap, peakLinkSum, linkCount)
+				peakLinkMax, linkCap, peakLinkSum, linkCount, sim.Stats().LinkDropped)
 			return
 
 		case <-tickSample.C:
@@ -111,10 +111,10 @@ func monitorBuffers(sim *simnet.Simnet, stop <-chan struct{}, done chan<- struct
 			if linkCap > 0 {
 				lPct = (peakLinkMax * 100) / linkCap
 			}
-			fmt.Printf("[buf] router peak %d/%d (%d%%, sum %d); links peak %d/%d (%d%%, sum %d); now router max=%d sum=%d, links max=%d sum=%d\n",
+			fmt.Printf("[buf] router peak %d/%d (%d%%, sum %d); links peak %d/%d (%d%%, sum %d); now router max=%d sum=%d, links max=%d sum=%d; dropped=%d\n",
 				peakRouterMax, routerCap, rPct, peakRouterSum,
 				peakLinkMax, linkCap, lPct, peakLinkSum,
-				s.RouterMax, s.RouterSum, s.LinkMax, s.LinkSum)
+				s.RouterMax, s.RouterSum, s.LinkMax, s.LinkSum, s.LinkDropped)
 		}
 	}
 }
