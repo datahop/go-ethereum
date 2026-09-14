@@ -65,7 +65,9 @@ func TestTopicReg(t *testing.T) {
 func TestTopicSearch(t *testing.T) {
 	node0 := startLocalhostV5(t, Config{})
 	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
-	node2 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+	// The searcher bootstraps from the registrar directly. Via node0 alone, it can
+	// only learn node1 from node0's aux nodes, which carry one node per distance.
+	node2 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self(), node1.Self()}})
 	node3 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
 	defer func() {
 		for _, n := range []*UDPv5{node0, node1, node2, node3} {
@@ -81,6 +83,8 @@ func TestTopicSearch(t *testing.T) {
 
 	it := node2.TopicSearch(testTopic1, 0)
 	defer it.Close()
+	timeout := time.AfterFunc(30*time.Second, it.Close)
+	defer timeout.Stop()
 	found := enode.ReadNodes(it, 2)
 	sortByID(found)
 
