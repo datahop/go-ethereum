@@ -974,6 +974,7 @@ func (t *UDPv5) send(toID enode.ID, toAddr netip.AddrPort, packet v5wire.Packet,
 
 	_, err = t.conn.WriteToUDPAddrPort(enc, toAddr)
 	t.wireStats.countTx(t.wireStats.txName(packet), len(enc))
+	t.wireStats.countOpTx(toID, packet, len(enc))
 	t.log.Trace(">> "+packet.Name(), t.logcontext...)
 	return nonce, err
 }
@@ -1036,6 +1037,7 @@ func (t *UDPv5) handlePacket(rawpacket []byte, fromAddr netip.AddrPort) error {
 			name = renewalRegtopicName
 		}
 		t.wireStats.countRx(name, len(rawpacket))
+		t.wireStats.countOpRx(t.callRequest(fromID, packet), len(rawpacket))
 	}
 	if fromNode != nil {
 		// Handshake succeeded, add to table.
@@ -1047,7 +1049,9 @@ func (t *UDPv5) handlePacket(rawpacket []byte, fromAddr netip.AddrPort) error {
 		t.logcontext = packet.AppendLogInfo(t.logcontext)
 		t.log.Trace("<< "+packet.Name(), t.logcontext...)
 	}
+	t.wireStats.beginRequest(packet, len(rawpacket))
 	t.handle(packet, fromID, fromAddr)
+	t.wireStats.endRequest()
 	return nil
 }
 
