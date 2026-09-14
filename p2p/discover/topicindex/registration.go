@@ -45,6 +45,34 @@ type Registration struct {
 	// Note: registration buckets are ordered far -> close.
 	buckets []regBucket
 	heap    regHeap
+
+	// everRegistered holds registrars that confirmed a registration before, so
+	// a later request to them is a renewal.
+	everRegistered map[enode.ID]struct{}
+}
+
+// BucketStats is the state of one registration bucket.
+type BucketStats struct {
+	Dist       int `json:"dist"`
+	Registered int `json:"registered"`
+	Waiting    int `json:"waiting"`
+	Standby    int `json:"standby"`
+	Target     int `json:"target"`
+}
+
+// BucketStats reports every bucket, ordered far to close.
+func (r *Registration) BucketStats() []BucketStats {
+	out := make([]BucketStats, len(r.buckets))
+	for i, b := range r.buckets {
+		out[i] = BucketStats{Dist: b.dist, Registered: b.count[Registered], Waiting: b.count[Waiting], Standby: b.count[Standby], Target: r.cfg.RegBucketSize}
+	}
+	return out
+}
+
+// WasRegistered reports whether the registrar confirmed a registration before.
+func (r *Registration) WasRegistered(id enode.ID) bool {
+	_, ok := r.everRegistered[id]
+	return ok
 }
 
 //go:generate go run golang.org/x/tools/cmd/stringer@latest -type RegAttemptState
@@ -122,10 +150,11 @@ type RegAttempt struct {
 func NewRegistration(topic TopicID, cfg Config) *Registration {
 	cfg = cfg.withDefaults()
 	r := &Registration{
-		topic:   topic,
-		cfg:     cfg,
-		log:     cfg.Log.New("topic", topic),
-		buckets: make([]regBucket, cfg.RegTableDepth),
+		everRegistered: make(map[enode.ID]struct{}),
+		topic:          topic,
+		cfg:            cfg,
+		log:            cfg.Log.New("topic", topic),
+		buckets:        make([]regBucket, cfg.RegTableDepth),
 	}
 	dist := 256
 	for i := range r.buckets {
@@ -362,6 +391,7 @@ func (r *Registration) HandleRegistered(att *RegAttempt, ttl time.Duration) {
 
 	r.log.Trace("Topic registration successful", "id", att.Node.ID(), "adlifetime", ttl)
 	r.setAttemptState(att, Registered)
+	r.everRegistered[att.Node.ID()] = struct{}{}
 	att.NextTime = r.cfg.Clock.Now().Add(ttl)
 	heap.Push(&r.heap, att)
 	r.refillAttempts(att.bucket)

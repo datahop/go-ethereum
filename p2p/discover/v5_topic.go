@@ -149,6 +149,8 @@ type topicReg struct {
 	// nodes subscription
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
+
+	statsCh chan chan []topicindex.BucketStats
 }
 
 // evict requests removal of a node from the registration table. It is called
@@ -170,6 +172,7 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 		regRequest:  make(chan topicRegJob),
 		regResponse: make(chan topicRegResult),
 		evictCh:     make(chan enode.ID, 64),
+		statsCh:     make(chan chan []topicindex.BucketStats),
 	}
 
 	// Set up the subscription for new main table nodes.
@@ -239,6 +242,8 @@ func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
 				// Drain the channel to avoid blocking the Table's feed sender.
 			case id := <-reg.evictCh:
 				reg.state.RemoveNode(id)
+			case ch := <-reg.statsCh:
+				ch <- reg.state.BucketStats()
 			case <-reg.quit:
 				return true
 			}
@@ -272,6 +277,9 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 		case <-reg.quit:
 			return true
 
+		case ch := <-reg.statsCh:
+			ch <- reg.state.BucketStats()
+
 		case n := <-reg.newNodesCh:
 			if topicindex.SupportsTopicDiscovery(n) {
 				reg.state.AddNodes(nil, []*enode.Node{n})
@@ -294,6 +302,7 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 					attempt: attempt,
 					node:    attempt.Node,
 					ticket:  attempt.Ticket,
+					renewal: reg.state.WasRegistered(attempt.Node.ID()),
 				}
 				nextAttempt.buckets = reg.state.BucketsWithFreeSpace(nextAttempt.buckets[:0])
 			}
@@ -338,6 +347,7 @@ type topicRegJob struct {
 	node    *enode.Node
 	ticket  []byte
 	buckets []uint
+	renewal bool
 }
 
 type topicRegResult struct {
@@ -354,7 +364,7 @@ func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 
 	for job := range reg.regRequest {
 		topic := reg.state.Topic()
-		resp := sys.transport.regtopic(reg.quit, job.node, topic, job.ticket, job.buckets, reg.opid)
+		resp := sys.transport.regtopic(reg.quit, job.node, topic, job.ticket, job.buckets, reg.opid, job.renewal)
 		resp.att = job.attempt
 
 		select {
@@ -380,6 +390,11 @@ type topicSearch struct {
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
+
+	// contacts counts TOPICQUERY requests and distinct nodes queried.
+	contactsMu sync.Mutex
+	queries    int
+	contacted  map[enode.ID]struct{}
 }
 
 func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.Node, opid uint64) *topicSearch {
@@ -392,6 +407,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
+		contacted:   make(map[enode.ID]struct{}),
 	}
 
 	s.newNodesCh = make(chan *enode.Node, 100)
@@ -497,6 +513,10 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			return true
 
 		case queryCh <- nextQuery:
+			s.contactsMu.Lock()
+			s.queries++
+			s.contacted[nextQuery.dst.ID()] = struct{}{}
+			s.contactsMu.Unlock()
 		case resp := <-s.queryRespCh:
 			switch {
 			case resp.err == errClosed:
@@ -582,6 +602,14 @@ func (tsi *topicSearchIterator) Next() bool {
 
 func (tsi *topicSearchIterator) Node() *enode.Node {
 	return tsi.cur
+}
+
+// Contacts reports how many TOPICQUERY requests the search has sent and to how
+// many distinct nodes.
+func (tsi *topicSearchIterator) Contacts() (queries, nodes int) {
+	tsi.search.contactsMu.Lock()
+	defer tsi.search.contactsMu.Unlock()
+	return tsi.search.queries, len(tsi.search.contacted)
 }
 
 func (tsi *topicSearchIterator) Close() {

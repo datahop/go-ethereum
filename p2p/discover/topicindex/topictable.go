@@ -47,6 +47,22 @@ type TopicTable struct {
 	wt  waitTimeState
 
 	config Config
+
+	admitted map[TopicID]map[enode.ID]struct{} // nil unless TrackAdmissions
+}
+
+// TrackAdmissions makes the table remember every advertiser it admitted, per
+// topic, so a later request from it can be told apart as a renewal.
+func (tab *TopicTable) TrackAdmissions() {
+	if tab.admitted == nil {
+		tab.admitted = make(map[TopicID]map[enode.ID]struct{})
+	}
+}
+
+// WasAdmitted reports whether the advertiser was admitted for the topic before.
+func (tab *TopicTable) WasAdmitted(id enode.ID, topic TopicID) bool {
+	_, ok := tab.admitted[topic][id]
+	return ok
 }
 
 type topicTableEntry struct {
@@ -188,6 +204,12 @@ func (tab *TopicTable) add(n *enode.Node, topic TopicID) *topicTableEntry {
 	}
 	reg.topicElem = tab.reg[topic].PushFront(reg)
 	reg.allElem = tab.all.PushBack(reg)
+	if tab.admitted != nil {
+		if tab.admitted[topic] == nil {
+			tab.admitted[topic] = make(map[enode.ID]struct{})
+		}
+		tab.admitted[topic][n.ID()] = struct{}{}
+	}
 	tab.wt.addReg(reg)
 	return reg
 }

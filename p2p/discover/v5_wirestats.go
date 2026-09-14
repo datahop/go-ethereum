@@ -40,16 +40,48 @@ type WireCounter struct {
 	RxBytes int64 `json:"rxBytes"`
 }
 
+// renewalRegtopicName is the counter key for REGTOPIC requests to a registrar
+// that already admitted the advertiser once; first registrations keep
+// "REGTOPIC/v5".
+const renewalRegtopicName = "REGTOPIC(renewal)/v5"
+
 type wireStats struct {
-	mu sync.Mutex
-	m  map[string]*WireCounter
+	mu       sync.Mutex
+	m        map[string]*WireCounter
+	renewals map[v5wire.Packet]struct{}
 }
 
 func newWireStats() *wireStats {
 	if !wireStatsOn {
 		return nil
 	}
-	return &wireStats{m: make(map[string]*WireCounter)}
+	return &wireStats{m: make(map[string]*WireCounter), renewals: make(map[v5wire.Packet]struct{})}
+}
+
+func (ws *wireStats) markRenewal(p v5wire.Packet, on bool) {
+	if ws == nil {
+		return
+	}
+	ws.mu.Lock()
+	if on {
+		ws.renewals[p] = struct{}{}
+	} else {
+		delete(ws.renewals, p)
+	}
+	ws.mu.Unlock()
+}
+
+func (ws *wireStats) txName(p v5wire.Packet) string {
+	if ws == nil {
+		return ""
+	}
+	ws.mu.Lock()
+	_, ok := ws.renewals[p]
+	ws.mu.Unlock()
+	if ok {
+		return renewalRegtopicName
+	}
+	return p.Name()
 }
 
 func (ws *wireStats) counter(name string) *WireCounter {

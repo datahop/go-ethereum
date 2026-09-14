@@ -211,6 +211,9 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		cancelCloseCtx: cancelCloseCtx,
 	}
 	t.wireStats = newWireStats()
+	if t.wireStats != nil {
+		t.topicTable.TrackAdmissions()
+	}
 	t.talk = newTalkSystem(t)
 	tab, err := newTable(t, t.db, cfg)
 	if err != nil {
@@ -362,6 +365,34 @@ func (t *UDPv5) LocalTopicNodes(topic topicindex.TopicID) []*enode.Node {
 }
 
 // TopicSearch returns an iterator over random nodes found in a topic.
+// TopicRegistrationBuckets reports the registration table of an active topic
+// registration, far to close, or nil when the topic is not being registered
+// or the registration loop does not answer in time.
+func (t *UDPv5) TopicRegistrationBuckets(topic topicindex.TopicID) []topicindex.BucketStats {
+	t.topicSys.mu.Lock()
+	reg := t.topicSys.reg[topic]
+	t.topicSys.mu.Unlock()
+	if reg == nil {
+		return nil
+	}
+	ch := make(chan []topicindex.BucketStats, 1)
+	timeout := time.NewTimer(250 * time.Millisecond)
+	defer timeout.Stop()
+	select {
+	case reg.statsCh <- ch:
+	case <-reg.quit:
+		return nil
+	case <-timeout.C:
+		return nil
+	}
+	select {
+	case s := <-ch:
+		return s
+	case <-timeout.C:
+		return nil
+	}
+}
+
 func (t *UDPv5) TopicSearch(topic topicindex.TopicID, opid uint64) enode.Iterator {
 	return t.topicSys.newSearchIterator(topic, opid)
 }
@@ -594,7 +625,7 @@ func (t *UDPv5) verifyResponseNode(c *callV5, r *enr.Record, distances []uint, s
 // regtopic sends REGTOPIC to node n and waits for responses.
 // regtopic sends REGTOPIC and waits for responses. The call returns early
 // with errClosed if quit is closed before all responses arrive.
-func (t *UDPv5) regtopic(quit <-chan struct{}, n *enode.Node, topic topicindex.TopicID, ticket []byte, buckets []uint, opid uint64) topicRegResult {
+func (t *UDPv5) regtopic(quit <-chan struct{}, n *enode.Node, topic topicindex.TopicID, ticket []byte, buckets []uint, opid uint64, renewal bool) topicRegResult {
 	req := &v5wire.Regtopic{
 		Topic:   topic,
 		Ticket:  ticket,
@@ -602,6 +633,8 @@ func (t *UDPv5) regtopic(quit <-chan struct{}, n *enode.Node, topic topicindex.T
 		Buckets: buckets,
 		OpID:    opid,
 	}
+	t.wireStats.markRenewal(req, renewal)
+	defer t.wireStats.markRenewal(req, false)
 	c := t.callToNode(n, 0, req) // responseType=0 accepts any response type
 	defer t.callDone(c)
 
@@ -940,7 +973,7 @@ func (t *UDPv5) send(toID enode.ID, toAddr netip.AddrPort, packet v5wire.Packet,
 	}
 
 	_, err = t.conn.WriteToUDPAddrPort(enc, toAddr)
-	t.wireStats.countTx(packet.Name(), len(enc))
+	t.wireStats.countTx(t.wireStats.txName(packet), len(enc))
 	t.log.Trace(">> "+packet.Name(), t.logcontext...)
 	return nonce, err
 }
@@ -997,7 +1030,13 @@ func (t *UDPv5) handlePacket(rawpacket []byte, fromAddr netip.AddrPort) error {
 		t.log.Debug("Bad discv5 packet", "id", fromID, "addr", addr, "err", err)
 		return err
 	}
-	t.wireStats.countRx(wireStatsName(packet), len(rawpacket))
+	if t.wireStats != nil {
+		name := wireStatsName(packet)
+		if r, ok := packet.(*v5wire.Regtopic); ok && t.topicTable.WasAdmitted(fromID, r.Topic) {
+			name = renewalRegtopicName
+		}
+		t.wireStats.countRx(name, len(rawpacket))
+	}
 	if fromNode != nil {
 		// Handshake succeeded, add to table.
 		t.tab.addInboundNode(fromNode)
