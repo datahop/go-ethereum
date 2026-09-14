@@ -23,49 +23,49 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
-const resultFilterLimit = 5000
+const searchFilterLimit = 5000
 
-// ResultFilter remembers the nodes returned by a topic search, so that later
+// SearchFilter remembers the nodes returned by a topic search, so that later
 // search passes don't return them again until AdLifetime has passed or the
 // node record has been updated.
-type ResultFilter struct {
+type SearchFilter struct {
 	clock mclock.Clock
 	ttl   time.Duration
 	limit int
-	seen  map[enode.ID]resultFilterEntry
-	queue []resultFilterItem // in insertion order
+	seen  map[enode.ID]searchFilterEntry
+	queue []searchFilterItem // in insertion order
 }
 
-type resultFilterEntry struct {
+type searchFilterEntry struct {
 	seq    uint64
 	expiry mclock.AbsTime
 }
 
-type resultFilterItem struct {
+type searchFilterItem struct {
 	id     enode.ID
 	expiry mclock.AbsTime
 }
 
-// NewResultFilter creates an empty filter.
-func NewResultFilter(cfg Config) *ResultFilter {
+// NewSearchFilter creates an empty filter.
+func NewSearchFilter(cfg Config) *SearchFilter {
 	cfg = cfg.withDefaults()
-	return &ResultFilter{
+	return &SearchFilter{
 		clock: cfg.Clock,
 		ttl:   cfg.AdLifetime,
-		limit: resultFilterLimit,
-		seen:  make(map[enode.ID]resultFilterEntry),
+		limit: searchFilterLimit,
+		seen:  make(map[enode.ID]searchFilterEntry),
 	}
 }
 
 // Seen reports whether n was returned recently with the same or a newer record.
-func (f *ResultFilter) Seen(n *enode.Node) bool {
+func (f *SearchFilter) Seen(n *enode.Node) bool {
 	f.expire()
 	e, ok := f.seen[n.ID()]
 	return ok && n.Seq() <= e.seq
 }
 
 // Add records that n was returned.
-func (f *ResultFilter) Add(n *enode.Node) {
+func (f *SearchFilter) Add(n *enode.Node) {
 	f.expire()
 	id := n.ID()
 	if _, ok := f.seen[id]; !ok {
@@ -74,11 +74,11 @@ func (f *ResultFilter) Add(n *enode.Node) {
 		}
 	}
 	expiry := f.clock.Now().Add(f.ttl)
-	f.seen[id] = resultFilterEntry{seq: n.Seq(), expiry: expiry}
-	f.queue = append(f.queue, resultFilterItem{id: id, expiry: expiry})
+	f.seen[id] = searchFilterEntry{seq: n.Seq(), expiry: expiry}
+	f.queue = append(f.queue, searchFilterItem{id: id, expiry: expiry})
 }
 
-func (f *ResultFilter) expire() {
+func (f *SearchFilter) expire() {
 	now := f.clock.Now()
 	for len(f.queue) > 0 && f.queue[0].expiry <= now {
 		f.pop()
@@ -86,7 +86,7 @@ func (f *ResultFilter) expire() {
 }
 
 // pop removes the oldest queue item. The entry is kept if it was re-added later.
-func (f *ResultFilter) pop() {
+func (f *SearchFilter) pop() {
 	it := f.queue[0]
 	f.queue = f.queue[1:]
 	if e, ok := f.seen[it.id]; ok && e.expiry == it.expiry {

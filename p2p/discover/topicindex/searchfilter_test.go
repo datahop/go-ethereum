@@ -24,9 +24,9 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
-func TestResultFilterExpiry(t *testing.T) {
+func TestSearchFilterExpiry(t *testing.T) {
 	clock := new(mclock.Simulated)
-	f := NewResultFilter(Config{AdLifetime: time.Minute, Clock: clock})
+	f := NewSearchFilter(Config{AdLifetime: time.Minute, Clock: clock})
 	n := newNode()
 
 	if f.Seen(n) {
@@ -46,9 +46,9 @@ func TestResultFilterExpiry(t *testing.T) {
 	}
 }
 
-func TestResultFilterNewerRecord(t *testing.T) {
+func TestSearchFilterNewerRecord(t *testing.T) {
 	clock := new(mclock.Simulated)
-	f := NewResultFilter(Config{AdLifetime: time.Minute, Clock: clock})
+	f := NewSearchFilter(Config{AdLifetime: time.Minute, Clock: clock})
 	id := newNode().ID()
 	old, updated := nodeWithSeq(id, intIP(1), 1), nodeWithSeq(id, intIP(1), 2)
 
@@ -72,8 +72,8 @@ func TestResultFilterNewerRecord(t *testing.T) {
 	}
 }
 
-func TestResultFilterLimit(t *testing.T) {
-	f := NewResultFilter(Config{Clock: new(mclock.Simulated)})
+func TestSearchFilterLimit(t *testing.T) {
+	f := NewSearchFilter(Config{Clock: new(mclock.Simulated)})
 	f.limit = 3
 	nodes := []*enode.Node{newNode(), newNode(), newNode(), newNode()}
 	for _, n := range nodes {

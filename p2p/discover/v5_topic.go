@@ -374,7 +374,7 @@ type topicSearch struct {
 	queryCh     chan topicQueryJob
 	queryRespCh chan topicQueryResult
 	resultCh    chan *enode.Node
-	returned    *topicindex.ResultFilter
+	returned    *topicindex.SearchFilter
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -387,7 +387,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 		opid:     opid,
 		quit:     make(chan struct{}),
 		resultCh: out,
-		returned: topicindex.NewResultFilter(sys.config),
+		returned: topicindex.NewSearchFilter(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
