@@ -483,6 +483,7 @@ func (srv *Server) setupDiscovery() error {
 	}
 	if srv.Config.DiscoveryV5 {
 		cfg := discover.Config{
+			Topic:       srv.DiscoveryV5Topic,
 			PrivateKey:  srv.PrivateKey,
 			NetRestrict: srv.NetRestrict,
 			Bootnodes:   srv.BootstrapNodesV5,

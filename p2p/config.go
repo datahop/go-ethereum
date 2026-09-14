@@ -20,6 +20,7 @@ import (
 	"crypto/ecdsa"
 	"encoding"
 	"fmt"
+	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/log"
@@ -58,6 +59,8 @@ type Config struct {
 	// DiscoveryV5 specifies whether the new topic-discovery based V5 discovery
 	// protocol should be started or not.
 	DiscoveryV5 bool `toml:",omitempty"`
+	// DiscoveryV5Topic configures topic discovery on the discv5 listener.
+	DiscoveryV5Topic topicindex.Config `toml:"-"`
 
 	// Name sets the node name of this server.
 	Name string `toml:"-"`
