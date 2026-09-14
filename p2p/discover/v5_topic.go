@@ -374,6 +374,7 @@ type topicSearch struct {
 	queryCh     chan topicQueryJob
 	queryRespCh chan topicQueryResult
 	resultCh    chan *enode.Node
+	returned    *topicindex.ResultFilter
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -386,6 +387,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 		opid:     opid,
 		quit:     make(chan struct{}),
 		resultCh: out,
+		returned: topicindex.NewResultFilter(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -482,6 +484,10 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			}
 		}
 		if n := state.PeekResult(); n != nil {
+			if s.returned.Seen(n) {
+				state.PopResult()
+				continue
+			}
 			result = n
 			resultCh = s.resultCh
 		}
@@ -517,6 +523,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 
 		case resultCh <- result:
 			nresults++
+			s.returned.Add(result)
 			state.PopResult()
 			result, resultCh = nil, nil
 		}
