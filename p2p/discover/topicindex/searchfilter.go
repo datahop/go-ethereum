@@ -17,6 +17,7 @@
 package topicindex
 
 import (
+	"container/list"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -32,17 +33,13 @@ type SearchFilter struct {
 	clock mclock.Clock
 	ttl   time.Duration
 	limit int
-	seen  map[enode.ID]searchFilterEntry
-	queue []searchFilterItem // in insertion order
+	seen  map[enode.ID]*list.Element
+	order *list.List // of *searchFilterEntry, oldest expiry first
 }
 
 type searchFilterEntry struct {
-	seq    uint64
-	expiry mclock.AbsTime
-}
-
-type searchFilterItem struct {
 	id     enode.ID
+	seq    uint64
 	expiry mclock.AbsTime
 }
 
@@ -53,43 +50,43 @@ func NewSearchFilter(cfg Config) *SearchFilter {
 		clock: cfg.Clock,
 		ttl:   cfg.AdLifetime,
 		limit: searchFilterLimit,
-		seen:  make(map[enode.ID]searchFilterEntry),
+		seen:  make(map[enode.ID]*list.Element),
+		order: list.New(),
 	}
 }
 
 // Seen reports whether n was returned recently with the same or a newer record.
 func (f *SearchFilter) Seen(n *enode.Node) bool {
 	f.expire()
-	e, ok := f.seen[n.ID()]
-	return ok && n.Seq() <= e.seq
+	el, ok := f.seen[n.ID()]
+	return ok && n.Seq() <= el.Value.(*searchFilterEntry).seq
 }
 
-// Add records that n was returned.
+// Add records that n was returned. Every ID keeps a single entry, so the
+// filter never holds more than limit entries.
 func (f *SearchFilter) Add(n *enode.Node) {
 	f.expire()
-	id := n.ID()
-	if _, ok := f.seen[id]; !ok {
-		for len(f.seen) >= f.limit && len(f.queue) > 0 {
-			f.pop()
-		}
-	}
 	expiry := f.clock.Now().Add(f.ttl)
-	f.seen[id] = searchFilterEntry{seq: n.Seq(), expiry: expiry}
-	f.queue = append(f.queue, searchFilterItem{id: id, expiry: expiry})
+	if el, ok := f.seen[n.ID()]; ok {
+		e := el.Value.(*searchFilterEntry)
+		e.seq, e.expiry = n.Seq(), expiry
+		f.order.MoveToBack(el)
+		return
+	}
+	for len(f.seen) >= f.limit {
+		f.remove(f.order.Front())
+	}
+	f.seen[n.ID()] = f.order.PushBack(&searchFilterEntry{id: n.ID(), seq: n.Seq(), expiry: expiry})
 }
 
 func (f *SearchFilter) expire() {
 	now := f.clock.Now()
-	for len(f.queue) > 0 && f.queue[0].expiry <= now {
-		f.pop()
+	for el := f.order.Front(); el != nil && el.Value.(*searchFilterEntry).expiry <= now; el = f.order.Front() {
+		f.remove(el)
 	}
 }
 
-// pop removes the oldest queue item. The entry is kept if it was re-added later.
-func (f *SearchFilter) pop() {
-	it := f.queue[0]
-	f.queue = f.queue[1:]
-	if e, ok := f.seen[it.id]; ok && e.expiry == it.expiry {
-		delete(f.seen, it.id)
-	}
+func (f *SearchFilter) remove(el *list.Element) {
+	delete(f.seen, el.Value.(*searchFilterEntry).id)
+	f.order.Remove(el)
 }
