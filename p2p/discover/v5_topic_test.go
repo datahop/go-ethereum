@@ -100,7 +100,7 @@ func TestTopicSearchNoRepeats(t *testing.T) {
 	node0 := startLocalhostV5(t, Config{})
 	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
 	node2 := startLocalhostV5(t, Config{
-		Bootnodes: []*enode.Node{node0.Self()},
+		Bootnodes: []*enode.Node{node0.Self(), node1.Self()},
 		Topic:     topicindex.Config{AdLifetime: lifetime},
 	})
 	defer func() {
