@@ -392,10 +392,23 @@ type topicSearch struct {
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
 
-	// contacts counts TOPICQUERY requests and distinct nodes queried.
+	// contacts counts TOPICQUERY requests and distinct nodes queried; stats the
+	// rest of the search's progress.
 	contactsMu sync.Mutex
 	queries    int
 	contacted  map[enode.ID]struct{}
+	stats      TopicSearchStats
+}
+
+// TopicSearchStats counts a topic search's work since it started.
+type TopicSearchStats struct {
+	Passes    int `json:"passes"`    // passes started over the search table
+	Queries   int `json:"queries"`   // TOPICQUERY requests sent
+	Contacted int `json:"contacted"` // distinct nodes queried
+	Received  int `json:"received"`  // registrants in TOPICNODES replies
+	Duplicate int `json:"duplicate"` // received results already seen in the same pass
+	Filtered  int `json:"filtered"`  // results dropped as recently returned
+	Yielded   int `json:"yielded"`   // results handed to the iterator
 }
 
 func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.Node, opid uint64) *topicSearch {
@@ -450,6 +463,9 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		}
 		shuffleNodes(nodes)
 		state.AddNodes(nil, nodes)
+		s.contactsMu.Lock()
+		s.stats.Passes++
+		s.contactsMu.Unlock()
 
 		if exit := s.run(sys, state); exit {
 			return
@@ -508,6 +524,9 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		if n := state.PeekResult(); n != nil {
 			if s.returned.Seen(n) {
 				state.PopResult()
+				s.contactsMu.Lock()
+				s.stats.Filtered++
+				s.contactsMu.Unlock()
 				continue
 			}
 			result = n
@@ -543,12 +562,20 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
-				state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
+				topicNodes := filterTopicDiscovery(resp.topicNodes)
+				added := state.AddQueryResults(resp.src, topicNodes)
+				s.contactsMu.Lock()
+				s.stats.Received += len(topicNodes)
+				s.stats.Duplicate += len(topicNodes) - added
+				s.contactsMu.Unlock()
 			}
 			queryCh = nil
 
 		case resultCh <- result:
 			nresults++
+			s.contactsMu.Lock()
+			s.stats.Yielded++
+			s.contactsMu.Unlock()
 			s.returned.Add(result)
 			state.PopResult()
 			result, resultCh = nil, nil
@@ -617,6 +644,15 @@ func (tsi *topicSearchIterator) Contacts() (queries, nodes int) {
 	tsi.search.contactsMu.Lock()
 	defer tsi.search.contactsMu.Unlock()
 	return tsi.search.queries, len(tsi.search.contacted)
+}
+
+// Stats reports the search's progress counters.
+func (tsi *topicSearchIterator) Stats() TopicSearchStats {
+	tsi.search.contactsMu.Lock()
+	defer tsi.search.contactsMu.Unlock()
+	st := tsi.search.stats
+	st.Queries, st.Contacted = tsi.search.queries, len(tsi.search.contacted)
+	return st
 }
 
 func (tsi *topicSearchIterator) Close() {

@@ -226,7 +226,8 @@ func (s *Search) QueryTarget() *enode.Node {
 }
 
 // AddQueryResults adds the response nodes for a topic query to the table.
-func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
+// AddQueryResults returns how many results were new to this search.
+func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) int {
 	b := s.bucket(from.ID())
 	b.setAsked(from)
 	b.numRequests++
@@ -253,6 +254,7 @@ func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 		provQueriedDHT.Add(1)
 		provAdsDHT.Add(int64(newAds))
 	}
+	return newAds
 }
 
 // PeekResult returns a node from the result set.

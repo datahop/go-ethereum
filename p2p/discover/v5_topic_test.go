@@ -127,6 +127,10 @@ func TestTopicSearchNoRepeats(t *testing.T) {
 	if d := time.Since(first); d < lifetime-regloopMinTime {
 		t.Fatalf("node returned again after %v, want at least %v", d, lifetime-regloopMinTime)
 	}
+	st := it.(*topicSearchIterator).Stats()
+	if st.Passes < 2 || st.Yielded < 2 || st.Filtered < 1 || st.Queries < st.Passes || st.Contacted < 1 || st.Received < st.Yielded {
+		t.Fatalf("inconsistent search stats %+v", st)
+	}
 }
 
 func seedTopicTable(t *testing.T, node *UDPv5, topic topicindex.TopicID, regs ...*enode.Node) {
