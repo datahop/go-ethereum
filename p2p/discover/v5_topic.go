@@ -384,10 +384,10 @@ type topicSearch struct {
 	wg   sync.WaitGroup
 	quit chan struct{}
 
-	queryCh     chan topicQueryJob
-	queryRespCh chan topicQueryResult
-	resultCh    chan *enode.Node
-	returned    *topicindex.SearchFilter
+	queryCh      chan topicQueryJob
+	queryRespCh  chan topicQueryResult
+	resultCh     chan *enode.Node
+	resultFilter *topicindex.SearchFilter
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -413,12 +413,12 @@ type TopicSearchStats struct {
 
 func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.Node, opid uint64) *topicSearch {
 	s := &topicSearch{
-		topic:    topic,
-		config:   sys.config,
-		opid:     opid,
-		quit:     make(chan struct{}),
-		resultCh: out,
-		returned: topicindex.NewSearchFilter(sys.config),
+		topic:        topic,
+		config:       sys.config,
+		opid:         opid,
+		quit:         make(chan struct{}),
+		resultCh:     out,
+		resultFilter: topicindex.NewSearchFilter(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -522,7 +522,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			}
 		}
 		if n := state.PeekResult(); n != nil {
-			if s.returned.Seen(n) {
+			if s.resultFilter.Seen(n) {
 				state.PopResult()
 				s.contactsMu.Lock()
 				s.stats.Filtered++
@@ -576,7 +576,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			s.contactsMu.Lock()
 			s.stats.Yielded++
 			s.contactsMu.Unlock()
-			s.returned.Add(result)
+			s.resultFilter.Add(result)
 			state.PopResult()
 			result, resultCh = nil, nil
 		}
