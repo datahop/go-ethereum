@@ -371,9 +371,10 @@ type topicSearch struct {
 	wg   sync.WaitGroup
 	quit chan struct{}
 
-	queryCh     chan topicQueryJob
-	queryRespCh chan topicQueryResult
-	resultCh    chan *enode.Node
+	queryCh      chan topicQueryJob
+	queryRespCh  chan topicQueryResult
+	resultCh     chan *enode.Node
+	resultFilter *topicindex.SearchFilter
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -381,11 +382,12 @@ type topicSearch struct {
 
 func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.Node, opid uint64) *topicSearch {
 	s := &topicSearch{
-		topic:    topic,
-		config:   sys.config,
-		opid:     opid,
-		quit:     make(chan struct{}),
-		resultCh: out,
+		topic:        topic,
+		config:       sys.config,
+		opid:         opid,
+		quit:         make(chan struct{}),
+		resultCh:     out,
+		resultFilter: topicindex.NewSearchFilter(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -482,6 +484,10 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			}
 		}
 		if n := state.PeekResult(); n != nil {
+			if s.resultFilter.Seen(n) {
+				state.PopResult()
+				continue
+			}
 			result = n
 			resultCh = s.resultCh
 		}
@@ -517,6 +523,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 
 		case resultCh <- result:
 			nresults++
+			s.resultFilter.Add(result)
 			state.PopResult()
 			result, resultCh = nil, nil
 		}
