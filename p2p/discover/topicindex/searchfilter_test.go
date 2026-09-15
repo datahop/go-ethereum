@@ -41,8 +41,8 @@ func TestSearchFilterExpiry(t *testing.T) {
 	if f.Seen(n) {
 		t.Fatal("node seen after expiry")
 	}
-	if len(f.seen) != 0 || len(f.queue) != 0 {
-		t.Fatalf("filter not empty after expiry: %d entries, %d queued", len(f.seen), len(f.queue))
+	if len(f.seen) != 0 || f.order.Len() != 0 {
+		t.Fatalf("filter not empty after expiry: %d entries, %d queued", len(f.seen), f.order.Len())
 	}
 }
 
