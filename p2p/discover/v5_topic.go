@@ -375,6 +375,7 @@ type topicSearch struct {
 	queryRespCh  chan topicQueryResult
 	resultCh     chan *enode.Node
 	resultFilter *topicindex.SearchFilter
+	activeBucket int // where the last adaptive pass settled
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -422,6 +423,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		time = s.config.Clock.Now()
 
 		state := topicindex.NewSearch(s.topic, s.config)
+		state.SetActiveBucket(s.activeBucket)
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
@@ -429,7 +431,9 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		shuffleNodes(nodes)
 		state.AddNodes(nil, nodes)
 
-		if exit := s.run(sys, state); exit {
+		exit := s.run(sys, state)
+		s.activeBucket = state.ActiveBucket()
+		if exit {
 			return
 		}
 	}
