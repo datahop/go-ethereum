@@ -46,7 +46,7 @@ const (
 	findnodeResultLimit     = 16 // applies in FINDNODE handler
 	totalNodesResponseLimit = 5  // applies in waitForNodes
 	regtopicNodesLimit      = 8
-	topicNodesResultLimit   = 16 // applies in TOPICQUERY handler
+	topicNodesResultLimit   = topicindex.TopicNodesLimit // applies in TOPICQUERY handler
 )
 
 // codecV5 is implemented by v5wire.Codec (and testCodec).
