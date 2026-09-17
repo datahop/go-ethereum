@@ -785,21 +785,30 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check fun
 		want[dist] = struct{}{}
 	}
 
-	// Single pass over the table: take the first checked node at each wanted
-	// distance and drop that distance so it is filled only once.
-	var nodes []*enode.Node
-loop:
-	for bi := 0; bi < len(tab.buckets) && len(want) > 0; bi++ {
+	// Single pass over the table, reservoir-sampling one checked node per
+	// wanted distance. A random pick, rather than the first entry, means the
+	// requester learns a different node each time it asks, so a search can
+	// walk a distance through many registrars instead of being handed the
+	// same few nodes by all of them.
+	pick := make(map[uint]*enode.Node, len(want))
+	seen := make(map[uint]int, len(want))
+	for bi := 0; bi < len(tab.buckets); bi++ {
 		for _, n := range tab.buckets[bi].entries {
-			if len(want) == 0 {
-				break loop
-			}
 			d := uint(enode.LogDist(target, n.ID()))
 			if _, ok := want[d]; !ok || !check(n.Node) {
 				continue
 			}
-			nodes = append(nodes, n.Node)
-			delete(want, d)
+			seen[d]++
+			if tab.rand.Intn(seen[d]) == 0 {
+				pick[d] = n.Node
+			}
+		}
+	}
+	nodes := make([]*enode.Node, 0, len(pick))
+	for _, dist := range distances {
+		if n, ok := pick[dist]; ok {
+			nodes = append(nodes, n)
+			delete(pick, dist)
 		}
 	}
 	return nodes

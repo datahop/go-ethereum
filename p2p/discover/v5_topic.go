@@ -375,7 +375,8 @@ type topicSearch struct {
 	queryRespCh  chan topicQueryResult
 	resultCh     chan *enode.Node
 	resultFilter *topicindex.SearchFilter
-	activeBucket int // where the last adaptive pass settled
+	activeBucket int                      // where the last adaptive pass settled
+	askedFilter  *topicindex.SearchFilter // nodes adaptive passes have queried
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -389,6 +390,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 		quit:         make(chan struct{}),
 		resultCh:     out,
 		resultFilter: topicindex.NewSearchFilter(sys.config),
+		askedFilter:  topicindex.NewSearchFilter(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -424,6 +426,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 
 		state := topicindex.NewSearch(s.topic, s.config)
 		state.SetActiveBucket(s.activeBucket)
+		state.SetAskedFilter(s.askedFilter)
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
