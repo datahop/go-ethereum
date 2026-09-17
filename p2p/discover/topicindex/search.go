@@ -57,6 +57,16 @@ type Search struct {
 	// bucket closer to the topic, so a reply's ad count from one bucket says
 	// how many buckets away the floor is met.
 	active int
+	// asked holds the nodes an adaptive search has queried. They leave the
+	// table so their slots refill with aux nodes, and stay out until the
+	// ad lifetime has passed, so the search walks its bucket once instead
+	// of re-asking the same nodes every pass.
+	asked *SearchFilter
+	// spare holds already-asked nodes offered to this pass. When nothing
+	// unasked is left, one of them is asked again, once per pass, only for
+	// the aux nodes its reply carries: the walk resumes from those.
+	spare     map[enode.ID]*enode.Node
+	spareUsed bool
 
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
@@ -81,6 +91,8 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		log:         cfg.Log.New("topic", topic),
 		topic:       topic,
 		resultSeen:  make(map[enode.ID]struct{}),
+		asked:       NewSearchFilter(cfg),
+		spare:       make(map[enode.ID]*enode.Node),
 		bucketCheck: make(map[int]struct{}, searchTableDepth),
 	}
 	dist := 256
@@ -114,6 +126,11 @@ func (s *Search) SetActiveBucket(i int) {
 	s.active = max(0, min(i, len(s.buckets)-1))
 }
 
+// SetAskedFilter shares the record of queried nodes between search passes.
+func (s *Search) SetAskedFilter(f *SearchFilter) {
+	s.asked = f
+}
+
 // IsDone reports when the search table peers are all consumed. When it returns true,
 // this search state should be abandoned and a new search started using a
 // fresh Search instance.
@@ -137,8 +154,16 @@ func (s *Search) IsDone() bool {
 			return false
 		}
 	}
+	if s.adaptive() && !s.spareUsed && len(s.spare) > 0 {
+		return false
+	}
 	// No unasked nodes remain and no results are buffered: the search is
-	// done. There is no more nodes to query.
+	// done. There is no more nodes to query. An adaptive search that walked
+	// everything it could reach continues one bucket closer next pass, where
+	// the ads are denser and the nodes are different ones.
+	if s.adaptive() && s.active < len(s.buckets)-1 {
+		s.active++
+	}
 	return true
 }
 
@@ -180,6 +205,10 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
 
+		if s.adaptive() && s.asked.Seen(n) {
+			s.spare[id] = n
+			continue
+		}
 		if b.contains(id) || b.count() >= s.cfg.SearchBucketSize {
 			continue
 		}
@@ -272,6 +301,13 @@ func (s *Search) adaptiveTarget() *enode.Node {
 			}
 		}
 	}
+	if !s.spareUsed {
+		for id, n := range s.spare {
+			s.spareUsed = true
+			delete(s.spare, id)
+			return n
+		}
+	}
 	return nil
 }
 
@@ -311,6 +347,8 @@ func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 	b.numRequests++
 	if s.adaptive() {
 		s.observe(s.bucketIndex(from.ID()), len(results))
+		s.asked.Add(from)
+		s.removeNode(from.ID())
 	}
 
 	for _, n := range results {
