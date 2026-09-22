@@ -388,6 +388,8 @@ type topicSearch struct {
 	queryRespCh  chan topicQueryResult
 	resultCh     chan *enode.Node
 	resultFilter *topicindex.SearchFilter
+	activeBucket int                      // where the last adaptive pass settled
+	askedFilter  *topicindex.SearchFilter // nodes adaptive passes have queried
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -398,6 +400,7 @@ type topicSearch struct {
 	queries    int
 	contacted  map[enode.ID]struct{}
 	stats      TopicSearchStats
+	started    mclock.AbsTime
 }
 
 // TopicSearchStats counts a topic search's work since it started.
@@ -409,6 +412,19 @@ type TopicSearchStats struct {
 	Duplicate int `json:"duplicate"` // received results already seen in the same pass
 	Filtered  int `json:"filtered"`  // results dropped as recently returned
 	Yielded   int `json:"yielded"`   // results handed to the iterator
+
+	// QueriesByBucket counts TOPICQUERY requests by the search-table bucket of
+	// the queried node, index 0 the farthest from the topic. ActiveTrace records
+	// every move of an adaptive search's active bucket, and the bucket each
+	// pass starts in, in milliseconds since the search began.
+	QueriesByBucket []int        `json:"queriesByBucket,omitempty"`
+	ActiveTrace     []BucketStep `json:"activeTrace,omitempty"`
+}
+
+// BucketStep is one point of TopicSearchStats.ActiveTrace.
+type BucketStep struct {
+	AtMs   int64 `json:"atMs"`
+	Bucket int   `json:"bucket"`
 }
 
 func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.Node, opid uint64) *topicSearch {
@@ -419,6 +435,8 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 		quit:         make(chan struct{}),
 		resultCh:     out,
 		resultFilter: topicindex.NewSearchFilter(sys.config),
+		askedFilter:  topicindex.NewSearchFilter(sys.config),
+		started:      sys.config.Clock.Now(),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -457,6 +475,8 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		state := topicindex.NewSearch(s.topic, s.config)
 		state.SetCycle(cycle)
 		cycle++
+		state.SetActiveBucket(s.activeBucket)
+		state.SetAskedFilter(s.askedFilter)
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
@@ -465,9 +485,12 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		state.AddNodes(nil, nodes)
 		s.contactsMu.Lock()
 		s.stats.Passes++
+		s.recordActive(state.ActiveBucket())
 		s.contactsMu.Unlock()
 
-		if exit := s.run(sys, state); exit {
+		exit := s.run(sys, state)
+		s.activeBucket = state.ActiveBucket()
+		if exit {
 			return
 		}
 	}
@@ -507,6 +530,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		result    *enode.Node
 		nresults  int
 	)
+	lastActive := state.ActiveBucket()
 
 	for {
 		if state.IsDone() {
@@ -541,6 +565,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			s.contactsMu.Lock()
 			s.queries++
 			s.contacted[nextQuery.dst.ID()] = struct{}{}
+			s.countQueryBucket(state.BucketIndex(nextQuery.dst.ID()), state.NumBuckets())
 			s.contactsMu.Unlock()
 		case resp := <-s.queryRespCh:
 			switch {
@@ -567,6 +592,10 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				s.contactsMu.Lock()
 				s.stats.Received += len(topicNodes)
 				s.stats.Duplicate += len(topicNodes) - added
+				if a := state.ActiveBucket(); a != lastActive {
+					lastActive = a
+					s.recordActive(a)
+				}
 				s.contactsMu.Unlock()
 			}
 			queryCh = nil
@@ -581,6 +610,22 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			result, resultCh = nil, nil
 		}
 	}
+}
+
+// countQueryBucket and recordActive are called with contactsMu held.
+func (s *topicSearch) countQueryBucket(bi, n int) {
+	if bi < 0 {
+		return
+	}
+	for len(s.stats.QueriesByBucket) < n {
+		s.stats.QueriesByBucket = append(s.stats.QueriesByBucket, 0)
+	}
+	s.stats.QueriesByBucket[bi]++
+}
+
+func (s *topicSearch) recordActive(bi int) {
+	at := int64(s.config.Clock.Now().Sub(s.started) / time.Millisecond)
+	s.stats.ActiveTrace = append(s.stats.ActiveTrace, BucketStep{AtMs: at, Bucket: bi})
 }
 
 func (s *topicSearch) closeDown() {
@@ -652,6 +697,8 @@ func (tsi *topicSearchIterator) Stats() TopicSearchStats {
 	defer tsi.search.contactsMu.Unlock()
 	st := tsi.search.stats
 	st.Queries, st.Contacted = tsi.search.queries, len(tsi.search.contacted)
+	st.QueriesByBucket = append([]int(nil), st.QueriesByBucket...)
+	st.ActiveTrace = append([]BucketStep(nil), st.ActiveTrace...)
 	return st
 }
 

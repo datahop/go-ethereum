@@ -91,6 +91,41 @@ func TestTopicSearch(t *testing.T) {
 	}
 }
 
+// TestTopicSearchAdaptive runs the search with an adaptive distance: the
+// registrar sits in one bucket only, so the search has to find it through the
+// helper path and still return every registrant.
+func TestTopicSearchAdaptive(t *testing.T) {
+	node0 := startLocalhostV5(t, Config{})
+	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+	node2 := startLocalhostV5(t, Config{
+		Bootnodes: []*enode.Node{node0.Self(), node1.Self()},
+		Topic:     topicindex.Config{SearchYieldFloor: 4},
+	})
+	node3 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+	defer func() {
+		for _, n := range []*UDPv5{node0, node1, node2, node3} {
+			n.Close()
+		}
+	}()
+	seedTopicTable(t, node1, testTopic1, node0.Self(), node3.Self())
+
+	it := node2.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	timeout := time.AfterFunc(30*time.Second, it.Close)
+	defer timeout.Stop()
+	found := enode.ReadNodes(it, 2)
+	sortByID(found)
+
+	want := []*enode.Node{node0.Self(), node3.Self()}
+	sortByID(want)
+	if len(found) != len(want) {
+		t.Fatalf("got %d results, want %d", len(found), len(want))
+	}
+	if err := checkNodesEqual(found, want); err != nil {
+		t.Error(err)
+	}
+}
+
 // seedTopicTable registers the given nodes for a topic in t's local topic
 // table. The work runs on the dispatch goroutine, which owns the table.
 // TestTopicSearchNoRepeats checks that a search doesn't return a node again

@@ -52,6 +52,17 @@ type Config struct {
 	TopicNodesLimit int
 	AuxNodesLimit   int
 
+	// SearchYieldFloor makes the search adapt its distance to the topic: it
+	// queries the farthest bucket whose replies still carry at least this many
+	// ads, moving closer when they carry fewer and farther when they are full.
+	// Zero queries every bucket.
+	SearchYieldFloor int
+
+	// SearchAuxRadius limits the distances an adaptive search asks aux nodes
+	// for to the active bucket and its neighbours within this many buckets;
+	// zero asks for every bucket with free space.
+	SearchAuxRadius int
+
 	// These settings are exposed for testing purposes.
 	Clock mclock.Clock
 	Log   log.Logger
