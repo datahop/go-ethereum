@@ -284,7 +284,7 @@ func TestSearchBucketsWithFreeSpace(t *testing.T) {
 	// On a fresh table, every bucket has free space, covering the full
 	// distance range 256 .. 256-searchTableDepth+1.
 	dists := s.BucketsWithFreeSpace(nil)
-	if len(dists) != searchTableDepth {
+	if len(dists) != len(s.buckets) {
 		t.Fatalf("fresh table reports %d buckets with free space, want %d", len(dists), searchTableDepth)
 	}
 	seen := make(map[uint]bool, len(dists))
@@ -305,7 +305,7 @@ func TestSearchBucketsWithFreeSpace(t *testing.T) {
 		t.Fatalf("setup: bucket[0] holds %d nodes, want %d", got, s.cfg.SearchBucketSize)
 	}
 	dists = s.BucketsWithFreeSpace(nil)
-	if len(dists) != searchTableDepth-1 {
+	if len(dists) != len(s.buckets)-1 {
 		t.Fatalf("got %d buckets with free space, want %d", len(dists), searchTableDepth-1)
 	}
 	for _, d := range dists {
@@ -323,6 +323,8 @@ func TestSearchBucketsWithFreeSpace(t *testing.T) {
 		}
 	}
 }
+
+const topicNodesLimit = 16
 
 func adaptiveSearch(t *testing.T) *Search {
 	config := testConfig(t)
@@ -378,8 +380,8 @@ func TestSearchAdaptiveAdvance(t *testing.T) {
 func TestSearchAdaptiveRetreat(t *testing.T) {
 	s := adaptiveSearch(t)
 	s.SetActiveBucket(6)
-	reply(t, s, 6, TopicNodesLimit)
-	reply(t, s, 6, TopicNodesLimit)
+	reply(t, s, 6, topicNodesLimit)
+	reply(t, s, 6, topicNodesLimit)
 	if s.ActiveBucket() != 5 {
 		t.Fatalf("active bucket %d after full replies, want 5", s.ActiveBucket())
 	}
@@ -389,7 +391,7 @@ func TestSearchAdaptiveRetreat(t *testing.T) {
 		t.Fatalf("active bucket %d after replies at the floor, want 5", s.ActiveBucket())
 	}
 	s.SetActiveBucket(8)
-	reply(t, s, 8, TopicNodesLimit)
+	reply(t, s, 8, topicNodesLimit)
 	reply(t, s, 8, 2)
 	if s.ActiveBucket() != 8 {
 		t.Fatalf("active bucket %d after one full and one short reply, want 8", s.ActiveBucket())
@@ -404,7 +406,7 @@ func TestSearchAdaptiveLiar(t *testing.T) {
 	s := adaptiveSearch(t)
 	s.SetActiveBucket(4)
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 252, 2, 100))
-	reply(t, s, 4, TopicNodesLimit)
+	reply(t, s, 4, topicNodesLimit)
 	reply(t, s, 4, 1)
 	if s.ActiveBucket() != 4 {
 		t.Fatalf("active bucket %d after (full, 1), want 4", s.ActiveBucket())
@@ -438,7 +440,7 @@ func TestSearchAdaptiveHelper(t *testing.T) {
 	// Aux nodes are requested around the active bucket first, then at every
 	// other distance with free space.
 	dists := s.BucketsWithFreeSpace(nil)
-	if len(dists) != searchTableDepth || dists[0] != 252 || dists[1] != 251 || dists[2] != 250 || dists[3] != 256 {
+	if len(dists) != len(s.buckets) || dists[0] != 252 || dists[1] != 251 || dists[2] != 250 || dists[3] != 256 {
 		t.Fatalf("aux distances %v, want [252 251 250 256 ...]", dists)
 	}
 	n := s.QueryTarget()
