@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -71,7 +72,7 @@ var zeroIP = netip.IPv6Unspecified()
 // DB is the node database, storing previously seen nodes and any collected metadata about
 // them for QoS purposes.
 type DB struct {
-	lvl    *leveldb.DB   // Interface to the database itself
+	lvl    kvStore       // Interface to the database itself
 	runner sync.Once     // Ensures we can start at most one expirer
 	quit   chan struct{} // Channel to signal the expiring thread to stop
 }
@@ -86,6 +87,86 @@ func OpenDB(path string) (*DB, error) {
 }
 
 // newMemoryDB creates a new in-memory node database without a persistent backend.
+// kvStore is what DB needs from its backing store: leveldb, or a plain
+// in-memory table for simulated nodes.
+type kvStore interface {
+	Get(key []byte, ro *opt.ReadOptions) ([]byte, error)
+	Put(key, value []byte, wo *opt.WriteOptions) error
+	Delete(key []byte, wo *opt.WriteOptions) error
+	NewIterator(slice *util.Range, ro *opt.ReadOptions) iterator.Iterator
+	Close() error
+}
+
+// mapKV backs a DB with a Go map, for nodes simulated in one process. A
+// leveldb per node preallocates a 4 MiB memtable and keeps every rewritten
+// peer entry until compaction, and goleveldb's memdb keeps old value bytes
+// too; thousands of nodes rewriting peer entries on every revalidation grew
+// without bound with either. A map overwrites in place.
+type mapKV struct {
+	mu sync.RWMutex
+	m  map[string][]byte
+}
+
+func (k *mapKV) Get(key []byte, _ *opt.ReadOptions) ([]byte, error) {
+	k.mu.RLock()
+	v, ok := k.m[string(key)]
+	k.mu.RUnlock()
+	if !ok {
+		return nil, errors.ErrNotFound
+	}
+	return append([]byte(nil), v...), nil
+}
+
+func (k *mapKV) Put(key, value []byte, _ *opt.WriteOptions) error {
+	k.mu.Lock()
+	k.m[string(key)] = append([]byte(nil), value...)
+	k.mu.Unlock()
+	return nil
+}
+
+func (k *mapKV) Delete(key []byte, _ *opt.WriteOptions) error {
+	k.mu.Lock()
+	delete(k.m, string(key))
+	k.mu.Unlock()
+	return nil
+}
+
+// NewIterator iterates a sorted snapshot of the keys in the range.
+func (k *mapKV) NewIterator(slice *util.Range, _ *opt.ReadOptions) iterator.Iterator {
+	k.mu.RLock()
+	snap := make(sortedKV, 0, len(k.m))
+	for key, v := range k.m {
+		if slice != nil && (slice.Start != nil && key < string(slice.Start) || slice.Limit != nil && key >= string(slice.Limit)) {
+			continue
+		}
+		snap = append(snap, kvPair{key, v})
+	}
+	k.mu.RUnlock()
+	sort.Slice(snap, func(i, j int) bool { return snap[i].k < snap[j].k })
+	return iterator.NewArrayIterator(snap)
+}
+
+func (k *mapKV) Close() error { return nil }
+
+type kvPair struct {
+	k string
+	v []byte
+}
+
+type sortedKV []kvPair
+
+func (a sortedKV) Len() int { return len(a) }
+func (a sortedKV) Search(key []byte) int {
+	return sort.Search(len(a), func(i int) bool { return a[i].k >= string(key) })
+}
+func (a sortedKV) Index(i int) (key, value []byte) { return []byte(a[i].k), a[i].v }
+
+// OpenMemoryDB opens a node database backed by a map, for nodes simulated
+// in one process.
+func OpenMemoryDB() *DB {
+	return &DB{lvl: &mapKV{m: make(map[string][]byte)}, quit: make(chan struct{})}
+}
+
 func newMemoryDB() (*DB, error) {
 	db, err := leveldb.Open(storage.NewMemStorage(), nil)
 	if err != nil {
@@ -285,7 +366,7 @@ func (db *DB) DeleteNode(id ID) {
 	deleteRange(db.lvl, nodeKey(id))
 }
 
-func deleteRange(db *leveldb.DB, prefix []byte) {
+func deleteRange(db kvStore, prefix []byte) {
 	it := db.NewIterator(util.BytesPrefix(prefix), nil)
 	defer it.Release()
 	for it.Next() {
