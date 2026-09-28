@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
 // Registrar-side wait-time sampling. Off by default; the testbed enables it to
@@ -77,6 +78,53 @@ func recordWaitQuote(topic topicindex.TopicID, quote, cumulative time.Duration) 
 	if len(st.QuotedMs) < st.sampleCap {
 		st.QuotedMs = append(st.QuotedMs, quote.Milliseconds())
 	}
+}
+
+// AdmissionEvent is one REGTOPIC handled by a local registrar: what the
+// registrar required, what the advertiser had waited, and the outcome.
+type AdmissionEvent struct {
+	AtMs       int64    `json:"atMs"`
+	Registrar  enode.ID `json:"registrar"`
+	Advertiser enode.ID `json:"advertiser"`
+	Topic      string   `json:"topic"` // topic hash, hex
+	RecordIP   string   `json:"recordIp"`
+	FromIP     string   `json:"fromIp"`
+	RequiredMs int64    `json:"requiredMs"` // wait the registrar computed for this advertiser and topic
+	WaitedMs   int64    `json:"waitedMs"`   // cumulative wait the ticket proved
+	QuoteMs    int64    `json:"quoteMs"`    // wait quoted back; 0 when admitted
+	Admitted   bool     `json:"admitted"`
+	Renewal    bool     `json:"renewal"` // the advertiser already held an ad for the topic
+	Held       int      `json:"held"`    // ads in the cache before the decision
+	TopicHeld  int      `json:"topicHeld"`
+}
+
+const admissionEventCap = 200000
+
+var (
+	admissionMu     sync.Mutex
+	admissionEvents = make(map[enode.ID][]AdmissionEvent)
+)
+
+func recordAdmission(ev AdmissionEvent) {
+	if !waitStatsOn {
+		return
+	}
+	admissionMu.Lock()
+	if len(admissionEvents[ev.Registrar]) < admissionEventCap {
+		admissionEvents[ev.Registrar] = append(admissionEvents[ev.Registrar], ev)
+	}
+	admissionMu.Unlock()
+}
+
+// AdmissionEvents returns every REGTOPIC decision a local registrar made, or
+// nil when sampling is not enabled.
+func AdmissionEvents(registrar enode.ID) []AdmissionEvent {
+	if !waitStatsOn {
+		return nil
+	}
+	admissionMu.Lock()
+	defer admissionMu.Unlock()
+	return append([]AdmissionEvent(nil), admissionEvents[registrar]...)
 }
 
 // WaitTimeStatsSnapshot returns the per-topic quoted-wait samples collected so

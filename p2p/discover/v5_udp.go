@@ -353,6 +353,33 @@ func (t *UDPv5) TopicCacheOccupancy() (held, capacity int, byTopic map[topicinde
 }
 
 // LocalTopicNodes returns all locally-registered nodes for a topic.
+// TopicAd is one advertisement a local registrar holds and how long it stays.
+type TopicAd struct {
+	Node      *enode.Node
+	ExpiresIn time.Duration
+}
+
+// LocalTopicAds returns the advertisements held for a topic with their
+// remaining lifetime, or nil when the dispatch loop does not answer.
+func (t *UDPv5) LocalTopicAds(topic topicindex.TopicID) []TopicAd {
+	done := make(chan []TopicAd, 1)
+	fn := func() {
+		now := t.clock.Now()
+		ads := t.topicTable.Ads(topic)
+		out := make([]TopicAd, len(ads))
+		for i, ad := range ads {
+			out[i] = TopicAd{Node: ad.Node, ExpiresIn: ad.Expiry.Sub(now)}
+		}
+		done <- out
+	}
+	select {
+	case t.onDispatchCh <- fn:
+		return <-done
+	case <-t.closeCtx.Done():
+		return nil
+	}
+}
+
 func (t *UDPv5) LocalTopicNodes(topic topicindex.TopicID) []*enode.Node {
 	done := make(chan []*enode.Node, 1)
 	fn := func() { done <- t.topicTable.Nodes(topic) }
@@ -1385,8 +1412,22 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 	responseCount := uint8(1 + len(nodesResponses))
 
 	// Attempt to register.
+	var ev AdmissionEvent
+	if waitStatsOn {
+		ev = AdmissionEvent{AtMs: time.Now().UnixMilli(), Registrar: t.Self().ID(), Advertiser: fromID, Topic: ticket.Topic.String(),
+			FromIP: fromAddr.Addr().Unmap().String(), WaitedMs: waitTime.Milliseconds(), Renewal: t.topicTable.IsRegistered(n, ticket.Topic),
+			RequiredMs: t.topicTable.WaitTime(n, ticket.Topic).Milliseconds(), TopicHeld: t.topicTable.TopicSize(ticket.Topic)}
+		if a := n.IPAddr(); a.IsValid() {
+			ev.RecordIP = a.Unmap().String()
+		}
+		ev.Held, _ = t.topicTable.Occupancy()
+	}
 	newTime := t.topicTable.Register(n, ticket.Topic, waitTime)
 	recordWaitQuote(ticket.Topic, newTime, waitTime)
+	if waitStatsOn {
+		ev.QuoteMs, ev.Admitted = newTime.Milliseconds(), newTime == 0
+		recordAdmission(ev)
+	}
 
 	// Build confirmation.
 	confirmation := &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: responseCount}

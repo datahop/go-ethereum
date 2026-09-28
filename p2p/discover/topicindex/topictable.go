@@ -106,6 +106,38 @@ func (tab *TopicTable) Nodes(topic TopicID) []*enode.Node {
 	return nodes
 }
 
+// Ad is one held advertisement and when it expires.
+type Ad struct {
+	Node   *enode.Node
+	Expiry mclock.AbsTime
+}
+
+// Ads returns every advertisement held for a topic with its expiry, including
+// entries past their expiry that Expire has not swept yet, so a caller can
+// tell how long an expired ad lingers.
+func (tab *TopicTable) Ads(topic TopicID) []Ad {
+	reglist := tab.reg[topic]
+	if reglist == nil {
+		return nil
+	}
+	ads := make([]Ad, 0, reglist.Len())
+	for e := reglist.Front(); e != nil; e = e.Next() {
+		reg := e.Value.(*topicTableEntry)
+		ads = append(ads, Ad{Node: reg.node, Expiry: reg.exp})
+	}
+	return ads
+}
+
+// IsRegistered reports whether n currently holds an ad for topic t.
+func (tab *TopicTable) IsRegistered(n *enode.Node, t TopicID) bool {
+	return tab.isRegistered(n, t)
+}
+
+// TopicSize reports the number of ads held for a topic.
+func (tab *TopicTable) TopicSize(t TopicID) int {
+	return tab.topicSize(t)
+}
+
 // RandomNodes returns n random nodes registered for a topic.
 // It only collects nodes for which the 'check' function returns true.
 func (tab *TopicTable) RandomNodes(topic TopicID, n int, check func(*enode.Node) bool) []*enode.Node {

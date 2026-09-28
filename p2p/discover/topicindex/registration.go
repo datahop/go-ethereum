@@ -58,6 +58,15 @@ type BucketStats struct {
 	Waiting    int `json:"waiting"`
 	Standby    int `json:"standby"`
 	Target     int `json:"target"`
+	// Nodes lists the registrars the bucket is registered with or waiting on.
+	Nodes []BucketNode `json:"nodes,omitempty"`
+}
+
+// BucketNode is one registrar in a registration bucket.
+type BucketNode struct {
+	ID    enode.ID `json:"id"`
+	IP    string   `json:"ip"`
+	State string   `json:"state"`
 }
 
 // BucketStats reports every bucket, ordered far to close.
@@ -65,6 +74,16 @@ func (r *Registration) BucketStats() []BucketStats {
 	out := make([]BucketStats, len(r.buckets))
 	for i, b := range r.buckets {
 		out[i] = BucketStats{Dist: b.dist, Registered: b.count[Registered], Waiting: b.count[Waiting], Standby: b.count[Standby], Target: r.cfg.RegBucketSize}
+		for id, att := range b.att {
+			if att.State == Standby {
+				continue
+			}
+			ip := ""
+			if a := att.Node.IPAddr(); a.IsValid() {
+				ip = a.String()
+			}
+			out[i].Nodes = append(out[i].Nodes, BucketNode{ID: id, IP: ip, State: att.State.String()})
+		}
 	}
 	return out
 }

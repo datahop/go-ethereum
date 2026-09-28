@@ -59,8 +59,12 @@ type OpKey struct {
 // responses and handshake challenges they received, and the distinct nodes asked.
 type OpCounter struct {
 	WireCounter
-	Nodes int `json:"nodes"`
+	Nodes   int        `json:"nodes"`
+	NodeIDs []enode.ID `json:"nodeIds,omitempty"` // the distinct nodes asked, up to opNodeIDCap
 }
+
+// opNodeIDCap bounds the node ids an operation snapshot lists.
+const opNodeIDCap = 4096
 
 // TopicLoad holds the topic requests a node received for one topic, and the
 // responses it sent to them.
@@ -272,7 +276,14 @@ func (t *UDPv5) OpStats() map[OpKey]OpCounter {
 	defer t.wireStats.mu.Unlock()
 	out := make(map[OpKey]OpCounter, len(t.wireStats.ops))
 	for k, v := range t.wireStats.ops {
-		out[k] = OpCounter{WireCounter: v.WireCounter, Nodes: len(v.nodes)}
+		c := OpCounter{WireCounter: v.WireCounter, Nodes: len(v.nodes)}
+		for id := range v.nodes {
+			if len(c.NodeIDs) >= opNodeIDCap {
+				break
+			}
+			c.NodeIDs = append(c.NodeIDs, id)
+		}
+		out[k] = c
 	}
 	return out
 }

@@ -413,6 +413,9 @@ type TopicSearchStats struct {
 	Filtered  int `json:"filtered"`  // results dropped as recently returned
 	Yielded   int `json:"yielded"`   // results handed to the iterator
 
+	MaxTopicPerReply int `json:"maxTopicPerReply"` // most registrants in one TOPICNODES reply
+	MaxAuxPerReply   int `json:"maxAuxPerReply"`   // most neighbours in one NODES reply to a query
+
 	// QueriesByBucket counts TOPICQUERY requests by the search-table bucket of
 	// the queried node, index 0 the farthest from the topic. ActiveTrace records
 	// every move of an adaptive search's active bucket, and the bucket each
@@ -592,6 +595,8 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				s.contactsMu.Lock()
 				s.stats.Received += len(topicNodes)
 				s.stats.Duplicate += len(topicNodes) - added
+				s.stats.MaxTopicPerReply = max(s.stats.MaxTopicPerReply, len(resp.topicNodes))
+				s.stats.MaxAuxPerReply = max(s.stats.MaxAuxPerReply, len(resp.auxNodes))
 				if a := state.ActiveBucket(); a != lastActive {
 					lastActive = a
 					s.recordActive(a)
