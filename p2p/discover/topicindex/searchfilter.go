@@ -24,7 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
-const searchFilterLimit = 5000
+const searchFilterLimit = 50000
 
 // SearchFilter remembers the nodes returned by a topic search, so that later
 // search passes don't return them again until AdLifetime has passed or the
