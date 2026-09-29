@@ -41,10 +41,8 @@ type Config struct {
 	// Search settings.
 	SearchBucketSize int // number of nodes in search buckets
 
-	// SearchYieldFloor makes the search adapt its distance to the topic: it
-	// queries the farthest bucket whose replies still carry at least this many
-	// ads, moving closer when they carry fewer and farther when they are full.
-	// Zero queries every bucket.
+	// SearchYieldFloor is the number of ads per reply below which the search
+	// moves closer to the topic. Zero disables the adaptive distance.
 	SearchYieldFloor int
 
 	// These settings are exposed for testing purposes.
