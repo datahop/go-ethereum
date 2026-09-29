@@ -179,7 +179,7 @@ func NewRegistration(topic TopicID, cfg Config) *Registration {
 	for i := range r.buckets {
 		r.buckets[i] = regBucket{
 			att:  make(map[enode.ID]*RegAttempt),
-			dist: dist - (len(r.buckets) - 1) + i,
+			dist: dist - i,
 			ips:  netutil.DistinctNetSet{Subnet: regBucketSubnet, Limit: regBucketIPLimit},
 		}
 	}
