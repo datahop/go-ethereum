@@ -37,8 +37,7 @@ const (
 	// IP subnet limit.
 	searchBucketSubnet, searchBucketIPLimit = 24, 1
 
-	// Adaptive distance: replies per bucket that estimate its ad density,
-	// and the most buckets one estimate may move the search.
+	// Adaptive distance: replies kept per bucket, and the largest jump.
 	searchYieldWindow = 4
 	searchMaxJump     = 4
 )
@@ -52,19 +51,12 @@ type Search struct {
 	// Note: search buckets are ordered far -> close.
 	buckets [searchTableDepth]searchBucket
 
-	// active is the bucket queried when SearchYieldFloor is set. Ads are
-	// placed in every bucket, and their density per node doubles with each
-	// bucket closer to the topic, so a reply's ad count from one bucket says
-	// how many buckets away the floor is met.
+	// active is the bucket queried when SearchYieldFloor is set.
 	active int
-	// asked holds the nodes an adaptive search has queried. They leave the
-	// table so their slots refill with aux nodes, and stay out until the
-	// ad lifetime has passed, so the search walks its bucket once instead
-	// of re-asking the same nodes every pass.
+	// asked holds the nodes queried within the last ad lifetime.
 	asked *SearchFilter
-	// spare holds already-asked nodes offered to this pass. When nothing
-	// unasked is left, one of them is asked again, once per pass, only for
-	// the aux nodes its reply carries: the walk resumes from those.
+	// spare holds already-asked nodes. One is asked again per pass when
+	// nothing unasked is left.
 	spare     map[enode.ID]*enode.Node
 	spareUsed bool
 
@@ -120,8 +112,7 @@ func (s *Search) ActiveBucket() int {
 	return s.active
 }
 
-// SetActiveBucket sets the bucket to query first, so a new search pass can
-// start where the previous one settled.
+// SetActiveBucket sets the bucket to query first.
 func (s *Search) SetActiveBucket(i int) {
 	s.active = max(0, min(i, len(s.buckets)-1))
 }
@@ -139,10 +130,8 @@ func (s *Search) IsDone() bool {
 	if len(s.resultBuffer) > 0 {
 		return false
 	}
-	// An adaptive pass ends when the active bucket has been worked through
-	// and had enough replies to decide where the next pass goes. A bucket
-	// too sparse to decide falls through: the search keeps asking the
-	// nearest populated buckets until one of them settles it.
+	// An adaptive pass ends when the active bucket is exhausted and has
+	// enough replies to place the next pass.
 	if s.adaptive() {
 		if b := &s.buckets[s.active]; len(b.new) == 0 && len(b.yield) >= 2 {
 			return true
@@ -158,9 +147,8 @@ func (s *Search) IsDone() bool {
 		return false
 	}
 	// No unasked nodes remain and no results are buffered: the search is
-	// done. There is no more nodes to query. An adaptive search that walked
-	// everything it could reach continues one bucket closer next pass, where
-	// the ads are denser and the nodes are different ones.
+	// done. There is no more nodes to query. The next adaptive pass starts
+	// one bucket closer.
 	if s.adaptive() && s.active < len(s.buckets)-1 {
 		s.active++
 	}
@@ -169,8 +157,7 @@ func (s *Search) IsDone() bool {
 
 // BucketsWithFreeSpace gives n distances from the topic at which
 // the table has space available. An adaptive search lists the distances
-// around its active bucket first: registrars answer the first few requested
-// distances only, and those are the ones the next pass needs filled.
+// around its active bucket first.
 func (s *Search) BucketsWithFreeSpace(dists []uint) []uint {
 	free := func(i int) bool { return s.buckets[i].count() < s.cfg.SearchBucketSize }
 	if s.adaptive() {
@@ -287,9 +274,8 @@ func (s *Search) QueryTarget() *enode.Node {
 	return nil
 }
 
-// adaptiveTarget picks an unasked node in the active bucket. While that bucket
-// has no candidates, it asks the nearest bucket that has some, farther side
-// first: the reply carries nodes at the active distance.
+// adaptiveTarget picks an unasked node in the active bucket, or in the
+// nearest bucket that has one.
 func (s *Search) adaptiveTarget() *enode.Node {
 	for d := 0; d < len(s.buckets); d++ {
 		for _, i := range [2]int{s.active - d, s.active + d} {
@@ -311,10 +297,8 @@ func (s *Search) adaptiveTarget() *enode.Node {
 	return nil
 }
 
-// observe records a reply's ad count for the bucket it came from and moves
-// the active bucket once the bucket has two samples: one closer to the topic
-// per halving of the density needed to reach the floor, one farther when
-// replies are full. Medians keep a single lying reply from steering.
+// observe records the ad count of a reply and moves the active bucket by
+// the median of the recent replies from that bucket.
 func (s *Search) observe(bi int, ads int) {
 	b := &s.buckets[bi]
 	b.yield = append(b.yield, ads)
