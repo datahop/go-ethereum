@@ -18,6 +18,7 @@ package topicindex
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -323,6 +324,27 @@ func TestSearchBucketsWithFreeSpace(t *testing.T) {
 	}
 }
 
+// An adaptive search asks to refill only the buckets within SearchAuxRadius
+// of its active bucket; a negative radius lists every bucket with free space.
+func TestSearchAdaptiveFreeSpaceRadius(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(3)
+	dists := s.BucketsWithFreeSpace(nil)
+	if want := []uint{254, 253, 252}; !slices.Equal(dists, want) {
+		t.Fatalf("radius 1 lists %v, want %v", dists, want)
+	}
+
+	config := testConfig(t)
+	config.SearchYieldFloor = 4
+	config.SearchAuxRadius = -1
+	s = NewSearch(topic1, config)
+	s.SetActiveBucket(3)
+	dists = s.BucketsWithFreeSpace(nil)
+	if len(dists) != searchTableDepth || dists[0] != 254 || dists[2] != 252 {
+		t.Fatalf("negative radius lists %v, want the neighbourhood first and all %d buckets", dists, searchTableDepth)
+	}
+}
+
 func adaptiveSearch(t *testing.T) *Search {
 	config := testConfig(t)
 	config.SearchYieldFloor = 4
@@ -434,11 +456,10 @@ func TestSearchAdaptiveHelper(t *testing.T) {
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 249, 1, 2)) // bucket 7
 	s.SetActiveBucket(5)
 
-	// Aux nodes are requested around the active bucket first, then at every
-	// other distance with free space.
+	// Aux nodes are requested around the active bucket only.
 	dists := s.BucketsWithFreeSpace(nil)
-	if len(dists) != searchTableDepth || dists[0] != 252 || dists[1] != 251 || dists[2] != 250 || dists[3] != 256 {
-		t.Fatalf("aux distances %v, want [252 251 250 256 ...]", dists)
+	if want := []uint{252, 251, 250}; !slices.Equal(dists, want) {
+		t.Fatalf("aux distances %v, want %v", dists, want)
 	}
 	n := s.QueryTarget()
 	if n == nil || s.bucketIndex(n.ID()) != 7 {
