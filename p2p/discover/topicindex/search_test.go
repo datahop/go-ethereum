@@ -526,18 +526,22 @@ func TestSearchAdaptiveExplores(t *testing.T) {
 		t.Fatal("full active bucket listed as having free space")
 	}
 	asked := reply(t, s, 0, 1)
+	other := nodes[0]
+	if asked.ID() == other.ID() {
+		other = nodes[1]
+	}
 	if s.buckets[0].contains(asked.ID()) {
 		t.Fatal("asked node still in the table")
 	}
 	if dists := s.BucketsWithFreeSpace(nil); len(dists) == 0 || dists[0] != 256 {
 		t.Fatalf("aux distances %v, want the active distance first", dists)
 	}
-	s.AddNodes(nodes[1], []*enode.Node{asked})
+	s.AddNodes(other, []*enode.Node{asked})
 	if s.buckets[0].contains(asked.ID()) {
 		t.Fatal("asked node re-admitted within the pass")
 	}
 	fresh := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 50)
-	s.AddNodes(nodes[1], fresh)
+	s.AddNodes(other, fresh)
 	if !s.buckets[0].contains(fresh[0].ID()) {
 		t.Fatal("aux node not admitted into the freed slot")
 	}
@@ -548,7 +552,7 @@ func TestSearchAdaptiveExplores(t *testing.T) {
 	if next.buckets[0].contains(asked.ID()) {
 		t.Fatal("asked node re-admitted by the next pass")
 	}
-	if !next.buckets[0].contains(nodes[1].ID()) {
+	if !next.buckets[0].contains(other.ID()) {
 		t.Fatal("unasked node not admitted by the next pass")
 	}
 }
