@@ -67,7 +67,10 @@ func TestTopicSearch(t *testing.T) {
 	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
 	// The searcher bootstraps from the registrar directly. Via node0 alone, it can
 	// only learn node1 from node0's aux nodes, which carry one node per distance.
-	node2 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self(), node1.Self()}})
+	node2 := startLocalhostV5(t, Config{
+		Bootnodes: []*enode.Node{node0.Self(), node1.Self()},
+		Topic:     topicindex.Config{SearchYieldFloor: -1},
+	})
 	node3 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
 	defer func() {
 		for _, n := range []*UDPv5{node0, node1, node2, node3} {
@@ -140,7 +143,7 @@ func TestTopicSearchNoRepeats(t *testing.T) {
 	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
 	node2 := startLocalhostV5(t, Config{
 		Bootnodes: []*enode.Node{node0.Self(), node1.Self()},
-		Topic:     topicindex.Config{AdLifetime: lifetime},
+		Topic:     topicindex.Config{AdLifetime: lifetime, SearchYieldFloor: -1, SearchPassBackoff: -1},
 	})
 	defer func() {
 		for _, n := range []*UDPv5{node0, node1, node2} {
@@ -204,6 +207,31 @@ func TestTopicStopRegister(t *testing.T) {
 	node.RegisterTopic(topic, 2)
 	time.Sleep(100 * time.Millisecond)
 	node.StopRegisterTopic(topic)
+}
+
+// TestTopicSearchPassGap checks the gap between passes: the minimum after a
+// pass with results, doubling from it after every empty pass up to
+// SearchPassBackoff.
+func TestTopicSearchPassGap(t *testing.T) {
+	s := &topicSearch{config: topicindex.Config{SearchPassBackoff: 9 * time.Second}}
+	want := []time.Duration{4 * time.Second, 8 * time.Second, 9 * time.Second, 9 * time.Second}
+	for i, w := range want {
+		if got := s.passGap(0); got != w {
+			t.Fatalf("empty pass %d: gap %v, want %v", i+1, got, w)
+		}
+	}
+	if got := s.passGap(3); got != regloopMinTime {
+		t.Fatalf("pass with results: gap %v, want %v", got, regloopMinTime)
+	}
+	if got := s.passGap(0); got != 4*time.Second {
+		t.Fatalf("empty pass after a reset: gap %v, want 4s", got)
+	}
+	s = &topicSearch{config: topicindex.Config{SearchPassBackoff: -1}}
+	for i := 0; i < 3; i++ {
+		if got := s.passGap(0); got != regloopMinTime {
+			t.Fatalf("back-off disabled: gap %v, want %v", got, regloopMinTime)
+		}
+	}
 }
 
 // TestTopicSearchIteratorClose verifies that closing the search iterator
