@@ -157,14 +157,19 @@ func (s *Search) IsDone() bool {
 
 // BucketsWithFreeSpace gives n distances from the topic at which
 // the table has space available. An adaptive search lists the distances
-// around its active bucket first.
+// within SearchAuxRadius of its active bucket, and only those unless the
+// radius is negative.
 func (s *Search) BucketsWithFreeSpace(dists []uint) []uint {
 	free := func(i int) bool { return s.buckets[i].count() < s.cfg.SearchBucketSize }
 	if s.adaptive() {
-		for i := max(0, s.active-1); i <= min(len(s.buckets)-1, s.active+1); i++ {
+		r := max(1, s.cfg.SearchAuxRadius)
+		for i := max(0, s.active-r); i <= min(len(s.buckets)-1, s.active+r); i++ {
 			if free(i) {
 				dists = append(dists, uint(s.buckets[i].dist))
 			}
+		}
+		if s.cfg.SearchAuxRadius > 0 {
+			return dists
 		}
 	}
 	for i := range s.buckets {
