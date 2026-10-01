@@ -345,6 +345,23 @@ func TestSearchAdaptiveFreeSpaceRadius(t *testing.T) {
 	}
 }
 
+// The end of a pass moves the active bucket once, however often IsDone is
+// asked. The search loop asks again after it hands out held results.
+func TestSearchAdaptiveIsDoneOnce(t *testing.T) {
+	config := testConfig(t)
+	config.SearchYieldFloor = 4
+	s := NewSearch(topic1, config)
+	s.SetActiveBucket(3)
+	for i := 0; i < 3; i++ {
+		if !s.IsDone() {
+			t.Fatal("empty search not done")
+		}
+	}
+	if got := s.ActiveBucket(); got != 4 {
+		t.Fatalf("active bucket %d after the pass, want 4", got)
+	}
+}
+
 func adaptiveSearch(t *testing.T) *Search {
 	config := testConfig(t)
 	config.SearchYieldFloor = 4
