@@ -59,6 +59,7 @@ type Search struct {
 	// nothing unasked is left.
 	spare     map[enode.ID]*enode.Node
 	spareUsed bool
+	advanced  bool // the pass moved the active bucket at its end
 
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
@@ -149,8 +150,9 @@ func (s *Search) IsDone() bool {
 	// No unasked nodes remain and no results are buffered: the search is
 	// done. There is no more nodes to query. The next adaptive pass starts
 	// one bucket closer.
-	if s.adaptive() && s.active < len(s.buckets)-1 {
+	if s.adaptive() && !s.advanced && s.active < len(s.buckets)-1 {
 		s.active++
+		s.advanced = true
 	}
 	return true
 }
