@@ -468,6 +468,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		resultCh  chan<- *enode.Node
 		result    *enode.Node
 		nresults  int
+		released  bool // the pass is over and its held results are handed out
 	)
 
 	for {
@@ -475,12 +476,13 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			// The pass is over: hand out what the registrar limit held back.
 			if held := s.resultFilter.Release(); len(held) > 0 {
 				state.AddResults(held)
+				released = true
 				continue
 			}
 			s.config.Log.Debug("Topic search rollover", "topic", s.topic, "nres", nresults)
 			return false
 		}
-		if queryCh == nil {
+		if queryCh == nil && !released {
 			target := state.QueryTarget()
 			if target != nil {
 				queryCh = s.queryCh
