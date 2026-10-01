@@ -333,11 +333,18 @@ func (s *Search) observe(bi int, ads int) {
 
 // AddQueryResults adds the response nodes for a topic query to the table.
 func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
+	s.AddReply(from, results, len(results))
+}
+
+// AddReply adds the results taken from a topic query response. ads is the
+// number of ads the response carried, which can be more than the results
+// taken from it. It is the density sample of an adaptive search.
+func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) {
 	b := s.bucket(from.ID())
 	b.setAsked(from)
 	b.numRequests++
 	if s.adaptive() {
-		s.observe(s.bucketIndex(from.ID()), len(results))
+		s.observe(s.bucketIndex(from.ID()), ads)
 		s.asked.Add(from)
 		s.removeNode(from.ID())
 	}
