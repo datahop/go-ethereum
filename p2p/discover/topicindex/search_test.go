@@ -362,6 +362,24 @@ func TestSearchAdaptiveIsDoneOnce(t *testing.T) {
 	}
 }
 
+// The density sample of a reply is the number of ads it carried, not the
+// number of results taken from it: a full reply moves the search farther out
+// even when the registrar limit took only part of it.
+func TestSearchAdaptiveReplySize(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(3)
+	for i := 0; i < 2; i++ {
+		n := s.QueryTarget()
+		if n == nil || s.bucketIndex(n.ID()) != 3 {
+			t.Fatalf("query %d did not go to bucket 3", i)
+		}
+		s.AddReply(n, nodesAtDistanceFrom(enode.ID(topic1), 100, 6, 300+10*i), TopicNodesLimit)
+	}
+	if got := s.ActiveBucket(); got != 2 {
+		t.Fatalf("active bucket %d after two full replies, want 2", got)
+	}
+}
+
 func adaptiveSearch(t *testing.T) *Search {
 	config := testConfig(t)
 	config.SearchYieldFloor = 4

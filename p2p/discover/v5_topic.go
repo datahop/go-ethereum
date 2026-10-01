@@ -547,8 +547,8 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
-				results := s.resultFilter.Take(resp.src.ID(), filterTopicDiscovery(resp.topicNodes))
-				state.AddQueryResults(resp.src, results)
+				ads := filterTopicDiscovery(resp.topicNodes)
+				state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(ads))
 			}
 			queryCh = nil
 
