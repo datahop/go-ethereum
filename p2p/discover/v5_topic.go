@@ -472,6 +472,11 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 
 	for {
 		if state.IsDone() {
+			// The pass is over: hand out what the registrar limit held back.
+			if held := s.resultFilter.Release(); len(held) > 0 {
+				state.AddResults(held)
+				continue
+			}
 			s.config.Log.Debug("Topic search rollover", "topic", s.topic, "nres", nresults)
 			return false
 		}
@@ -517,7 +522,8 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
-				state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
+				results := s.resultFilter.Take(resp.src.ID(), filterTopicDiscovery(resp.topicNodes))
+				state.AddQueryResults(resp.src, results)
 			}
 			queryCh = nil
 

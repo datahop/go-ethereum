@@ -91,3 +91,75 @@ func TestSearchFilterLimit(t *testing.T) {
 		}
 	}
 }
+
+func newNodes(n int) []*enode.Node {
+	nodes := make([]*enode.Node, n)
+	for i := range nodes {
+		nodes[i] = newNode()
+	}
+	return nodes
+}
+
+// A registrar contributes SearchRegistrarLimit results; the rest are held
+// until Release, and its allowance comes back after the ad lifetime.
+func TestSearchFilterRegistrarLimit(t *testing.T) {
+	clock := new(mclock.Simulated)
+	f := NewSearchFilter(Config{AdLifetime: time.Minute, SearchRegistrarLimit: 6, Clock: clock})
+	regA, regB := newNode().ID(), newNode().ID()
+	adsA, adsB := newNodes(16), newNodes(16)
+
+	if got := f.Take(regA, adsA); len(got) != 6 {
+		t.Fatalf("first reply gave %d results, want 6", len(got))
+	}
+	if got := f.Take(regB, adsB); len(got) != 6 {
+		t.Fatalf("second registrar gave %d results, want 6", len(got))
+	}
+	// The allowance of a registrar does not come back in a later reply.
+	if got := f.Take(regA, newNodes(4)); len(got) != 0 {
+		t.Fatalf("registrar over its limit gave %d results, want 0", len(got))
+	}
+	if got := f.Release(); len(got) != 10+10+4 {
+		t.Fatalf("released %d results, want 24", len(got))
+	}
+	if got := f.Release(); len(got) != 0 {
+		t.Fatalf("second release gave %d results, want 0", len(got))
+	}
+	clock.Run(time.Minute)
+	if got := f.Take(regA, newNodes(16)); len(got) != 6 {
+		t.Fatalf("reply after the ad lifetime gave %d results, want 6", len(got))
+	}
+}
+
+// A held result that another registrar returns is taken from that registrar
+// and is not released a second time. Results returned recently are dropped.
+func TestSearchFilterRegistrarLimitShared(t *testing.T) {
+	f := NewSearchFilter(Config{SearchRegistrarLimit: 2, Clock: new(mclock.Simulated)})
+	regA, regB := newNode().ID(), newNode().ID()
+	ads := newNodes(4)
+
+	got := f.Take(regA, ads)
+	if len(got) != 2 || got[0] != ads[0] || got[1] != ads[1] {
+		t.Fatalf("first reply gave %d results, want the first 2", len(got))
+	}
+	f.Add(ads[0])
+	// regB returns one result that was handed out and one that regA holds.
+	got = f.Take(regB, []*enode.Node{ads[0], ads[2]})
+	if len(got) != 1 || got[0] != ads[2] {
+		t.Fatalf("second registrar gave %d results, want the held one", len(got))
+	}
+	got = f.Release()
+	if len(got) != 1 || got[0] != ads[3] {
+		t.Fatalf("released %d results, want only the one still held", len(got))
+	}
+}
+
+// A negative limit hands out every result.
+func TestSearchFilterRegistrarLimitDisabled(t *testing.T) {
+	f := NewSearchFilter(Config{SearchRegistrarLimit: -1, Clock: new(mclock.Simulated)})
+	if got := f.Take(newNode().ID(), newNodes(16)); len(got) != 16 {
+		t.Fatalf("reply gave %d results, want 16", len(got))
+	}
+	if got := f.Release(); len(got) != 0 {
+		t.Fatalf("released %d results, want 0", len(got))
+	}
+}
