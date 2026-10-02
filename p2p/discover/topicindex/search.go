@@ -226,6 +226,16 @@ func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 	}
 }
 
+// AddResults adds nodes to the result set.
+func (s *Search) AddResults(nodes []*enode.Node) {
+	for _, n := range nodes {
+		if _, seen := s.resultSeen[n.ID()]; !seen && n.ID() != s.cfg.Self {
+			s.resultSeen[n.ID()] = struct{}{}
+			s.resultBuffer = append(s.resultBuffer, n)
+		}
+	}
+}
+
 // PeekResult returns a node from the result set.
 // When no result is available, it returns nil.
 func (s *Search) PeekResult() *enode.Node {

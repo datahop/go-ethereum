@@ -97,6 +97,42 @@ func TestTopicSearch(t *testing.T) {
 
 // seedTopicTable registers the given nodes for a topic in t's local topic
 // table. The work runs on the dispatch goroutine, which owns the table.
+// TestTopicSearchNoRepeats checks that a search doesn't return a node again
+// in later passes until the ad lifetime has passed.
+func TestTopicSearchNoRepeats(t *testing.T) {
+	const lifetime = 3 * regloopMinTime
+	node0 := startLocalhostV5(t, Config{})
+	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+	node2 := startLocalhostV5(t, Config{
+		Bootnodes: []*enode.Node{node0.Self(), node1.Self()},
+		Topic:     topicindex.Config{AdLifetime: lifetime},
+	})
+	defer func() {
+		for _, n := range []*UDPv5{node0, node1, node2} {
+			n.Close()
+		}
+	}()
+	seedTopicTable(t, node1, testTopic1, node0.Self())
+
+	it := node2.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	timeout := time.AfterFunc(30*time.Second, it.Close)
+	defer timeout.Stop()
+	if !it.Next() {
+		t.Fatal("search ended without results")
+	}
+	first := time.Now()
+	if !it.Next() {
+		t.Fatal("search ended without second result")
+	}
+	if it.Node().ID() != node0.Self().ID() {
+		t.Fatalf("unexpected result %v", it.Node().ID())
+	}
+	if d := time.Since(first); d < lifetime-regloopMinTime {
+		t.Fatalf("node returned again after %v, want at least %v", d, lifetime-regloopMinTime)
+	}
+}
+
 func seedTopicTable(t *testing.T, node *UDPv5, topic topicindex.TopicID, regs ...*enode.Node) {
 	t.Helper()
 	done := make(chan struct{})

@@ -371,9 +371,10 @@ type topicSearch struct {
 	wg   sync.WaitGroup
 	quit chan struct{}
 
-	queryCh     chan topicQueryJob
-	queryRespCh chan topicQueryResult
-	resultCh    chan *enode.Node
+	queryCh      chan topicQueryJob
+	queryRespCh  chan topicQueryResult
+	resultCh     chan *enode.Node
+	resultFilter *topicindex.SearchFilter
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -381,11 +382,12 @@ type topicSearch struct {
 
 func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.Node, opid uint64) *topicSearch {
 	s := &topicSearch{
-		topic:    topic,
-		config:   sys.config,
-		opid:     opid,
-		quit:     make(chan struct{}),
-		resultCh: out,
+		topic:        topic,
+		config:       sys.config,
+		opid:         opid,
+		quit:         make(chan struct{}),
+		resultCh:     out,
+		resultFilter: topicindex.NewSearchFilter(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -466,14 +468,21 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		resultCh  chan<- *enode.Node
 		result    *enode.Node
 		nresults  int
+		released  bool // the pass is over and its waiting results are handed out
 	)
 
 	for {
 		if state.IsDone() {
+			// The pass is over: hand out the results that still wait in the filter.
+			if held := s.resultFilter.Release(); len(held) > 0 {
+				state.AddResults(held)
+				released = true
+				continue
+			}
 			s.config.Log.Debug("Topic search rollover", "topic", s.topic, "nres", nresults)
 			return false
 		}
-		if queryCh == nil {
+		if queryCh == nil && !released {
 			target := state.QueryTarget()
 			if target != nil {
 				queryCh = s.queryCh
@@ -482,6 +491,10 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			}
 		}
 		if n := state.PeekResult(); n != nil {
+			if s.resultFilter.Seen(n) {
+				state.PopResult()
+				continue
+			}
 			result = n
 			resultCh = s.resultCh
 		}
@@ -511,12 +524,14 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
-				state.AddQueryResults(resp.src, filterTopicDiscovery(resp.topicNodes))
+				results := s.resultFilter.Take(resp.src.ID(), filterTopicDiscovery(resp.topicNodes))
+				state.AddQueryResults(resp.src, results)
 			}
 			queryCh = nil
 
 		case resultCh <- result:
 			nresults++
+			s.resultFilter.Add(result)
 			state.PopResult()
 			result, resultCh = nil, nil
 		}
