@@ -90,6 +90,31 @@ func rbContainsAll(b regBucket, nodes []*enode.Node) bool {
 // This checks that the one-per-source-per-bucket rule is applied within a single
 // AddNodes call. The source must be a registrar in the table (the rule is
 // tracked on its attempt), which mirrors production.
+// A bucket reports the distance of the nodes it holds.
+func TestRegistrationBucketDistance(t *testing.T) {
+	cfg := testConfig(t)
+	r := NewRegistration(topic1, cfg)
+
+	for _, d := range []int{256, 255, 256 - (regTableDepth - 1)} {
+		n := nodeAtDistance(enode.ID(topic1), d, intIP(d))
+		if b := r.buckets[r.bucketIndex(n.ID())]; b.dist != d {
+			t.Fatalf("node at distance %d is in the bucket for distance %d", d, b.dist)
+		}
+	}
+
+	// Fill the farthest bucket. Its distance must leave the list, the others stay.
+	for i := 0; r.buckets[0].count[Standby] < r.cfg.RegBucketStandbyLimit; i++ {
+		r.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1000+i))
+		if i > 10*r.cfg.RegBucketStandbyLimit {
+			t.Fatal("farthest bucket does not fill")
+		}
+	}
+	dists := r.BucketsWithFreeSpace(nil)
+	if len(dists) != regTableDepth-1 || dists[0] != 255 {
+		t.Fatalf("wrong free distances: %v", dists)
+	}
+}
+
 func TestRegistrationOnePerBucketCheck(t *testing.T) {
 	cfg := testConfig(t)
 	r := NewRegistration(topic1, cfg)
