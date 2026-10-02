@@ -52,13 +52,6 @@ type Config struct {
 	TopicNodesLimit int
 	AuxNodesLimit   int
 
-	// SearchRegistrarLimit is the number of results one registrar contributes
-	// to a search within an ad lifetime before the results of other
-	// registrars. The rest of its results follow at the end of the pass, so no
-	// single registrar can fill the peer set of the caller. Zero selects the
-	// default of 6. A negative value disables the limit.
-	SearchRegistrarLimit int
-
 	// SearchYieldFloor is the number of ads per reply below which the search
 	// moves closer to the topic. Zero selects the default of 8. A negative
 	// value disables the adaptive distance.
@@ -115,9 +108,6 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.AuxNodesLimit == 0 {
 		cfg.AuxNodesLimit = 8
-	}
-	if cfg.SearchRegistrarLimit == 0 {
-		cfg.SearchRegistrarLimit = 6
 	}
 	if cfg.SearchYieldFloor == 0 {
 		cfg.SearchYieldFloor = 8
