@@ -100,57 +100,80 @@ func newNodes(n int) []*enode.Node {
 	return nodes
 }
 
-// A registrar contributes searchRegistrarLimit results; the rest are held
-// until Release, and its allowance comes back after the ad lifetime.
-func TestSearchFilterRegistrarLimit(t *testing.T) {
-	clock := new(mclock.Simulated)
-	f := NewSearchFilter(Config{AdLifetime: time.Minute, Clock: clock})
-	regA, regB := newNode().ID(), newNode().ID()
-	adsA, adsB := newNodes(16), newNodes(16)
-	limit, held := searchRegistrarLimit, 16-searchRegistrarLimit
+// Results are handed out one registrar at a time, once searchMixRegistrars
+// registrars have results waiting.
+func TestSearchFilterMix(t *testing.T) {
+	f := NewSearchFilter(Config{Clock: new(mclock.Simulated)})
+	regs := newNodes(searchMixRegistrars)
+	ads := make([][]*enode.Node, len(regs))
+	for i := range regs {
+		ads[i] = newNodes(16)
+	}
+	for i, reg := range regs[:len(regs)-1] {
+		if got := f.Take(reg.ID(), ads[i]); len(got) != 0 {
+			t.Fatalf("reply %d gave %d results, want 0", i, len(got))
+		}
+	}
+	last := len(regs) - 1
+	got := f.Take(regs[last].ID(), ads[last])
+	if len(got) != 16*len(regs) {
+		t.Fatalf("got %d results, want %d", len(got), 16*len(regs))
+	}
+	for i, n := range got {
+		if want := ads[i%len(regs)][i/len(regs)]; n != want {
+			t.Fatalf("result %d is not from registrar %d", i, i%len(regs))
+		}
+	}
+	if got := f.Release(); len(got) != 0 {
+		t.Fatalf("released %d results, want 0", len(got))
+	}
+}
 
-	if got := f.Take(regA, adsA); len(got) != limit {
-		t.Fatalf("first reply gave %d results, want %d", len(got), limit)
+// Results of fewer registrars wait until Release. The hand-out stops when
+// fewer than the wanted number of registrars have results left.
+func TestSearchFilterMixRelease(t *testing.T) {
+	f := NewSearchFilter(Config{Clock: new(mclock.Simulated)})
+	f.mixRegistrars = 3
+	regA, regB, regC := newNode().ID(), newNode().ID(), newNode().ID()
+	adsA, adsB, adsC := newNodes(3), newNodes(3), newNodes(1)
+
+	if got := f.Take(regA, adsA); len(got) != 0 {
+		t.Fatalf("first reply gave %d results, want 0", len(got))
 	}
-	if got := f.Take(regB, adsB); len(got) != limit {
-		t.Fatalf("second registrar gave %d results, want %d", len(got), limit)
+	if got := f.Take(regB, adsB); len(got) != 0 {
+		t.Fatalf("second reply gave %d results, want 0", len(got))
 	}
-	// The allowance of a registrar does not come back in a later reply.
-	if got := f.Take(regA, newNodes(4)); len(got) != 0 {
-		t.Fatalf("registrar over its limit gave %d results, want 0", len(got))
+	got := f.Take(regC, adsC)
+	if len(got) != 3 || got[0] != adsA[0] || got[1] != adsB[0] || got[2] != adsC[0] {
+		t.Fatalf("third reply gave %d results, want one of each registrar", len(got))
 	}
-	if got := f.Release(); len(got) != held+held+4 {
-		t.Fatalf("released %d results, want %d", len(got), held+held+4)
+	got = f.Release()
+	want := []*enode.Node{adsA[1], adsB[1], adsA[2], adsB[2]}
+	if len(got) != len(want) {
+		t.Fatalf("released %d results, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("released result %d out of order", i)
+		}
 	}
 	if got := f.Release(); len(got) != 0 {
 		t.Fatalf("second release gave %d results, want 0", len(got))
 	}
-	clock.Run(time.Minute)
-	if got := f.Take(regA, newNodes(16)); len(got) != limit {
-		t.Fatalf("reply after the ad lifetime gave %d results, want %d", len(got), limit)
-	}
 }
 
-// A held result that another registrar returns is taken from that registrar
-// and is not released a second time. Results returned recently are dropped.
-func TestSearchFilterRegistrarLimitShared(t *testing.T) {
+// A result that two registrars return is handed out once. Results returned
+// recently are dropped.
+func TestSearchFilterMixShared(t *testing.T) {
 	f := NewSearchFilter(Config{Clock: new(mclock.Simulated)})
-	f.registrarLimit = 2
 	regA, regB := newNode().ID(), newNode().ID()
-	ads := newNodes(4)
+	ads := newNodes(3)
 
-	got := f.Take(regA, ads)
-	if len(got) != 2 || got[0] != ads[0] || got[1] != ads[1] {
-		t.Fatalf("first reply gave %d results, want the first 2", len(got))
-	}
 	f.Add(ads[0])
-	// regB returns one result that was handed out and one that regA holds.
-	got = f.Take(regB, []*enode.Node{ads[0], ads[2]})
-	if len(got) != 1 || got[0] != ads[2] {
-		t.Fatalf("second registrar gave %d results, want the held one", len(got))
-	}
-	got = f.Release()
-	if len(got) != 1 || got[0] != ads[3] {
-		t.Fatalf("released %d results, want only the one still held", len(got))
+	f.Take(regA, []*enode.Node{ads[0], ads[1]})
+	f.Take(regB, []*enode.Node{ads[1], ads[2]})
+	got := f.Release()
+	if len(got) != 2 || got[0] != ads[1] || got[1] != ads[2] {
+		t.Fatalf("released %d results, want the two that were not returned before", len(got))
 	}
 }
