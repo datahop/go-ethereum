@@ -17,7 +17,9 @@
 package topicindex
 
 import (
+	"math"
 	"math/rand"
+	"slices"
 
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -34,6 +36,10 @@ const (
 
 	// IP subnet limit.
 	searchBucketSubnet, searchBucketIPLimit = 24, 1
+
+	// Adaptive distance: replies kept per bucket, and the largest jump.
+	searchYieldWindow = 4
+	searchMaxJump     = 4
 )
 
 // Search is the state associated with searching for a single topic.
@@ -45,6 +51,16 @@ type Search struct {
 	// Note: search buckets are ordered far -> close.
 	buckets [searchTableDepth]searchBucket
 
+	// active is the bucket queried when SearchYieldFloor is set.
+	active int
+	// asked holds the nodes queried within the last ad lifetime.
+	asked *SearchFilter
+	// spare holds already-asked nodes. One is asked again per pass when
+	// nothing unasked is left.
+	spare     map[enode.ID]*enode.Node
+	spareUsed bool
+	advanced  bool // the pass moved the active bucket at its end
+
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
 	resultSeen   map[enode.ID]struct{}
@@ -55,6 +71,7 @@ type searchBucket struct {
 	new         map[enode.ID]*enode.Node
 	asked       map[enode.ID]*enode.Node
 	numRequests int
+	yield       []int // ad counts of the last searchYieldWindow replies
 
 	ips netutil.DistinctNetSet
 }
@@ -67,6 +84,8 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		log:         cfg.Log.New("topic", topic),
 		topic:       topic,
 		resultSeen:  make(map[enode.ID]struct{}),
+		asked:       NewSearchFilter(cfg),
+		spare:       make(map[enode.ID]*enode.Node),
 		bucketCheck: make(map[int]struct{}, searchTableDepth),
 	}
 	dist := 256
@@ -85,6 +104,25 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 	return s
 }
 
+func (s *Search) adaptive() bool {
+	return s.cfg.SearchYieldFloor > 0
+}
+
+// ActiveBucket returns the bucket an adaptive search queries.
+func (s *Search) ActiveBucket() int {
+	return s.active
+}
+
+// SetActiveBucket sets the bucket to query first.
+func (s *Search) SetActiveBucket(i int) {
+	s.active = max(0, min(i, len(s.buckets)-1))
+}
+
+// SetAskedFilter shares the record of queried nodes between search passes.
+func (s *Search) SetAskedFilter(f *SearchFilter) {
+	s.asked = f
+}
+
 // IsDone reports when the search table peers are all consumed. When it returns true,
 // this search state should be abandoned and a new search started using a
 // fresh Search instance.
@@ -93,23 +131,52 @@ func (s *Search) IsDone() bool {
 	if len(s.resultBuffer) > 0 {
 		return false
 	}
+	// An adaptive pass ends when the active bucket is exhausted and has
+	// enough replies to place the next pass.
+	if s.adaptive() {
+		if b := &s.buckets[s.active]; len(b.new) == 0 && len(b.yield) >= 2 {
+			return true
+		}
+	}
 	// The search cannot be done while there are still nodes that could be asked.
 	for _, b := range s.buckets {
 		if len(b.new) > 0 {
 			return false
 		}
 	}
+	if s.adaptive() && !s.spareUsed && len(s.spare) > 0 {
+		return false
+	}
 	// No unasked nodes remain and no results are buffered: the search is
-	// done. There is no more nodes to query.
+	// done. There is no more nodes to query. The next adaptive pass starts
+	// one bucket closer.
+	if s.adaptive() && !s.advanced && s.active < len(s.buckets)-1 {
+		s.active++
+		s.advanced = true
+	}
 	return true
 }
 
 // BucketsWithFreeSpace gives n distances from the topic at which
-// the table has space available.
+// the table has space available. An adaptive search lists the distances
+// within SearchAuxRadius of its active bucket, and only those unless the
+// radius is negative.
 func (s *Search) BucketsWithFreeSpace(dists []uint) []uint {
-	for _, b := range s.buckets {
-		if b.count() < s.cfg.SearchBucketSize {
-			dists = append(dists, uint(b.dist))
+	free := func(i int) bool { return s.buckets[i].count() < s.cfg.SearchBucketSize }
+	if s.adaptive() {
+		r := max(1, s.cfg.SearchAuxRadius)
+		for i := max(0, s.active-r); i <= min(len(s.buckets)-1, s.active+r); i++ {
+			if free(i) {
+				dists = append(dists, uint(s.buckets[i].dist))
+			}
+		}
+		if s.cfg.SearchAuxRadius > 0 {
+			return dists
+		}
+	}
+	for i := range s.buckets {
+		if free(i) && !slices.Contains(dists, uint(s.buckets[i].dist)) {
+			dists = append(dists, uint(s.buckets[i].dist))
 		}
 	}
 	return dists
@@ -132,6 +199,10 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
 
+		if s.adaptive() && s.asked.Seen(n) {
+			s.spare[id] = n
+			continue
+		}
 		if b.contains(id) || b.count() >= s.cfg.SearchBucketSize {
 			continue
 		}
@@ -185,6 +256,9 @@ func (s *Search) removeNode(id enode.ID) {
 // that have received at least one response, plus the next unqueried bucket
 // with candidates, join the random pool.
 func (s *Search) QueryTarget() *enode.Node {
+	if s.adaptive() {
+		return s.adaptiveTarget()
+	}
 	// Collect buckets with new nodes.
 	withnew := make([]*searchBucket, 0, searchTableDepth)
 	for i := range s.buckets {
@@ -207,11 +281,73 @@ func (s *Search) QueryTarget() *enode.Node {
 	return nil
 }
 
+// adaptiveTarget picks an unasked node in the active bucket, or in the
+// nearest bucket that has one.
+func (s *Search) adaptiveTarget() *enode.Node {
+	for d := 0; d < len(s.buckets); d++ {
+		for _, i := range [2]int{s.active - d, s.active + d} {
+			if i < 0 || i >= len(s.buckets) {
+				continue
+			}
+			for _, n := range s.buckets[i].new {
+				return n
+			}
+		}
+	}
+	if !s.spareUsed {
+		for id, n := range s.spare {
+			s.spareUsed = true
+			delete(s.spare, id)
+			return n
+		}
+	}
+	return nil
+}
+
+// observe records the ad count of a reply and moves the active bucket by
+// the median of the recent replies from that bucket.
+func (s *Search) observe(bi int, ads int) {
+	b := &s.buckets[bi]
+	b.yield = append(b.yield, ads)
+	if len(b.yield) > searchYieldWindow {
+		b.yield = b.yield[1:]
+	}
+	if len(b.yield) < 2 {
+		return
+	}
+	sorted := append([]int(nil), b.yield...)
+	slices.Sort(sorted)
+	lower, upper := sorted[(len(sorted)-1)/2], sorted[len(sorted)/2]
+	switch {
+	case lower >= TopicNodesLimit:
+		s.active = max(0, bi-1)
+	case upper >= s.cfg.SearchYieldFloor:
+		s.active = bi
+	case upper == 0:
+		s.active = min(len(s.buckets)-1, bi+searchMaxJump)
+	default:
+		jump := int(math.Ceil(math.Log2(float64(s.cfg.SearchYieldFloor) / float64(upper))))
+		s.active = min(len(s.buckets)-1, bi+min(jump, searchMaxJump))
+	}
+}
+
 // AddQueryResults adds the response nodes for a topic query to the table.
 func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
+	s.AddReply(from, results, len(results))
+}
+
+// AddReply adds the results taken from a topic query response. ads is the
+// number of ads the response carried, which can be more than the results
+// taken from it. It is the density sample of an adaptive search.
+func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) {
 	b := s.bucket(from.ID())
 	b.setAsked(from)
 	b.numRequests++
+	if s.adaptive() {
+		s.observe(s.bucketIndex(from.ID()), ads)
+		s.asked.Add(from)
+		s.removeNode(from.ID())
+	}
 
 	for _, n := range results {
 		if n.ID() == s.cfg.Self {
