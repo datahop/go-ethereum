@@ -100,11 +100,11 @@ func newNodes(n int) []*enode.Node {
 	return nodes
 }
 
-// A registrar contributes SearchRegistrarLimit results; the rest are held
+// A registrar contributes searchRegistrarLimit results; the rest are held
 // until Release, and its allowance comes back after the ad lifetime.
 func TestSearchFilterRegistrarLimit(t *testing.T) {
 	clock := new(mclock.Simulated)
-	f := NewSearchFilter(Config{AdLifetime: time.Minute, SearchRegistrarLimit: 6, Clock: clock})
+	f := NewSearchFilter(Config{AdLifetime: time.Minute, Clock: clock})
 	regA, regB := newNode().ID(), newNode().ID()
 	adsA, adsB := newNodes(16), newNodes(16)
 
@@ -133,7 +133,8 @@ func TestSearchFilterRegistrarLimit(t *testing.T) {
 // A held result that another registrar returns is taken from that registrar
 // and is not released a second time. Results returned recently are dropped.
 func TestSearchFilterRegistrarLimitShared(t *testing.T) {
-	f := NewSearchFilter(Config{SearchRegistrarLimit: 2, Clock: new(mclock.Simulated)})
+	f := NewSearchFilter(Config{Clock: new(mclock.Simulated)})
+	f.registrarLimit = 2
 	regA, regB := newNode().ID(), newNode().ID()
 	ads := newNodes(4)
 
@@ -150,16 +151,5 @@ func TestSearchFilterRegistrarLimitShared(t *testing.T) {
 	got = f.Release()
 	if len(got) != 1 || got[0] != ads[3] {
 		t.Fatalf("released %d results, want only the one still held", len(got))
-	}
-}
-
-// A negative limit hands out every result.
-func TestSearchFilterRegistrarLimitDisabled(t *testing.T) {
-	f := NewSearchFilter(Config{SearchRegistrarLimit: -1, Clock: new(mclock.Simulated)})
-	if got := f.Take(newNode().ID(), newNodes(16)); len(got) != 16 {
-		t.Fatalf("reply gave %d results, want 16", len(got))
-	}
-	if got := f.Release(); len(got) != 0 {
-		t.Fatalf("released %d results, want 0", len(got))
 	}
 }

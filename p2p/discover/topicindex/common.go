@@ -41,10 +41,6 @@ type Config struct {
 	// Search settings.
 	SearchBucketSize int // number of nodes in search buckets
 
-	// SearchRegistrarLimit is the number of results a search takes from one
-	// registrar per ad lifetime. Zero selects 6, a negative value disables it.
-	SearchRegistrarLimit int
-
 	// These settings are exposed for testing purposes.
 	Clock mclock.Clock
 	Log   log.Logger
@@ -73,9 +69,6 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.SearchBucketSize == 0 {
 		cfg.SearchBucketSize = 8
-	}
-	if cfg.SearchRegistrarLimit == 0 {
-		cfg.SearchRegistrarLimit = 6
 	}
 
 	if cfg.Log == nil {

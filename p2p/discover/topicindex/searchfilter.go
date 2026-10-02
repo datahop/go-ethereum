@@ -24,7 +24,13 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
-const searchFilterLimit = 50000
+const (
+	searchFilterLimit = 50000
+
+	// searchRegistrarLimit is the number of results a search takes from one
+	// registrar per ad lifetime.
+	searchRegistrarLimit = 6
+)
 
 // SearchFilter remembers the nodes returned by a topic search, so that later
 // search passes don't return them again until AdLifetime has passed or the
@@ -65,7 +71,7 @@ func NewSearchFilter(cfg Config) *SearchFilter {
 		seen:  make(map[enode.ID]*list.Element),
 		order: list.New(),
 
-		registrarLimit: cfg.SearchRegistrarLimit,
+		registrarLimit: searchRegistrarLimit,
 		registrars:     make(map[enode.ID]*registrarCount),
 		heldSet:        make(map[enode.ID]struct{}),
 	}
@@ -73,13 +79,10 @@ func NewSearchFilter(cfg Config) *SearchFilter {
 
 // Take returns the results of a registrar's reply that can be handed out now.
 // Results returned recently are dropped. A registrar contributes at most
-// SearchRegistrarLimit results within an ad lifetime; the rest are held until
+// searchRegistrarLimit results within an ad lifetime; the rest are held until
 // Release. A held result that another registrar returns is taken from that
 // registrar instead.
 func (f *SearchFilter) Take(registrar enode.ID, results []*enode.Node) []*enode.Node {
-	if f.registrarLimit <= 0 {
-		return results
-	}
 	now := f.clock.Now()
 	rc := f.registrars[registrar]
 	if rc == nil || rc.expiry <= now {
