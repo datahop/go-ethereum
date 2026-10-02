@@ -18,6 +18,7 @@ package topicindex
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -324,6 +325,103 @@ func TestSearchBucketsWithFreeSpace(t *testing.T) {
 	}
 }
 
+// An adaptive search asks to refill only the buckets within SearchAuxRadius
+// of its active bucket; a negative radius lists every bucket with free space.
+func TestSearchAdaptiveFreeSpaceRadius(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(3)
+	dists := s.BucketsWithFreeSpace(nil)
+	if want := []uint{254, 253, 252}; !slices.Equal(dists, want) {
+		t.Fatalf("radius 1 lists %v, want %v", dists, want)
+	}
+
+	config := testConfig(t)
+	config.SearchYieldFloor = 4
+	config.SearchAuxRadius = -1
+	s = NewSearch(topic1, config)
+	s.SetActiveBucket(3)
+	dists = s.BucketsWithFreeSpace(nil)
+	if len(dists) != len(s.buckets) || dists[0] != 254 || dists[2] != 252 {
+		t.Fatalf("negative radius lists %v, want the neighbourhood first and all %d buckets", dists, len(s.buckets))
+	}
+}
+
+// The end of a pass moves the active bucket once, however often IsDone is
+// asked. The search loop asks again after it hands out held results.
+func TestSearchAdaptiveIsDoneOnce(t *testing.T) {
+	config := testConfig(t)
+	config.SearchYieldFloor = 4
+	s := NewSearch(topic1, config)
+	s.SetActiveBucket(3)
+	for i := 0; i < 3; i++ {
+		if !s.IsDone() {
+			t.Fatal("empty search not done")
+		}
+	}
+	if got := s.ActiveBucket(); got != 4 {
+		t.Fatalf("active bucket %d after the pass, want 4", got)
+	}
+}
+
+// The density sample of a reply is the number of ads it carried, not the
+// number of results taken from it: a full reply moves the search farther out
+// even when the registrar limit took only part of it.
+func TestSearchAdaptiveReplySize(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(3)
+	for i := 0; i < 2; i++ {
+		n := s.QueryTarget()
+		if n == nil || s.bucketIndex(n.ID()) != 3 {
+			t.Fatalf("query %d did not go to bucket 3", i)
+		}
+		if added := s.AddReply(n, nodesAtDistanceFrom(enode.ID(topic1), 100, 6, 300+10*i), s.cfg.TopicNodesLimit); added != 6 {
+			t.Fatalf("reply %d added %d results, want 6", i, added)
+		}
+	}
+	if got := s.ActiveBucket(); got != 2 {
+		t.Fatalf("active bucket %d after two full replies, want 2", got)
+	}
+}
+
+// A full reply is one of the configured size, not of the default 16.
+func TestSearchAdaptiveReplySizeConfigured(t *testing.T) {
+	config := testConfig(t)
+	config.SearchYieldFloor = 4
+	config.TopicNodesLimit = 32
+	s := NewSearch(topic1, config)
+	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 253, 4, 1))
+	s.SetActiveBucket(3)
+	for i, ads := range []int{16, 16, 32, 32, 32} {
+		s.AddReply(s.QueryTarget(), nil, ads)
+		if want := map[bool]int{false: 3, true: 2}[i == 4]; s.ActiveBucket() != want {
+			t.Fatalf("active bucket %d after reply %d, want %d", s.ActiveBucket(), i, want)
+		}
+		s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 253, 1, 50+i))
+	}
+}
+
+// AddResults hands in held results once and never the local node.
+func TestSearchAddResults(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+	nodes := nodesAtDistanceFrom(enode.ID(topic1), 100, 3, 400)
+	if added := s.AddResults(nodes); added != 3 {
+		t.Fatalf("added %d results, want 3", added)
+	}
+	if added := s.AddResults(nodes[:2]); added != 0 {
+		t.Fatalf("added %d results a second time, want 0", added)
+	}
+	if s.IsDone() {
+		t.Fatal("search done with results in the buffer")
+	}
+	for i := 0; i < 3; i++ {
+		if s.PeekResult() != nodes[i] {
+			t.Fatalf("result %d out of order", i)
+		}
+		s.PopResult()
+	}
+}
+
 const topicNodesLimit = 16
 
 func adaptiveSearch(t *testing.T) *Search {
@@ -437,11 +535,10 @@ func TestSearchAdaptiveHelper(t *testing.T) {
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 249, 1, 2)) // bucket 7
 	s.SetActiveBucket(5)
 
-	// Aux nodes are requested around the active bucket first, then at every
-	// other distance with free space.
+	// Aux nodes are requested around the active bucket only.
 	dists := s.BucketsWithFreeSpace(nil)
-	if len(dists) != len(s.buckets) || dists[0] != 252 || dists[1] != 251 || dists[2] != 250 || dists[3] != 256 {
-		t.Fatalf("aux distances %v, want [252 251 250 256 ...]", dists)
+	if want := []uint{252, 251, 250}; !slices.Equal(dists, want) {
+		t.Fatalf("aux distances %v, want %v", dists, want)
 	}
 	n := s.QueryTarget()
 	if n == nil || s.bucketIndex(n.ID()) != 7 {
@@ -508,18 +605,22 @@ func TestSearchAdaptiveExplores(t *testing.T) {
 		t.Fatal("full active bucket listed as having free space")
 	}
 	asked := reply(t, s, 0, 1)
+	other := nodes[0]
+	if asked.ID() == other.ID() {
+		other = nodes[1]
+	}
 	if s.buckets[0].contains(asked.ID()) {
 		t.Fatal("asked node still in the table")
 	}
 	if dists := s.BucketsWithFreeSpace(nil); len(dists) == 0 || dists[0] != 256 {
 		t.Fatalf("aux distances %v, want the active distance first", dists)
 	}
-	s.AddNodes(nodes[1], []*enode.Node{asked})
+	s.AddNodes(other, []*enode.Node{asked})
 	if s.buckets[0].contains(asked.ID()) {
 		t.Fatal("asked node re-admitted within the pass")
 	}
 	fresh := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 50)
-	s.AddNodes(nodes[1], fresh)
+	s.AddNodes(other, fresh)
 	if !s.buckets[0].contains(fresh[0].ID()) {
 		t.Fatal("aux node not admitted into the freed slot")
 	}
@@ -530,7 +631,7 @@ func TestSearchAdaptiveExplores(t *testing.T) {
 	if next.buckets[0].contains(asked.ID()) {
 		t.Fatal("asked node re-admitted by the next pass")
 	}
-	if !next.buckets[0].contains(nodes[1].ID()) {
+	if !next.buckets[0].contains(other.ID()) {
 		t.Fatal("unasked node not admitted by the next pass")
 	}
 }

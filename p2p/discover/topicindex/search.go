@@ -62,6 +62,8 @@ type Search struct {
 	// the aux nodes its reply carries: the walk resumes from those.
 	spare     map[enode.ID]*enode.Node
 	spareUsed bool
+	advanced  bool // the pass moved the active bucket at its end
+	sampled   bool // the pass added its bucket occupancy to the statistics
 
 	bucketCheck  map[int]struct{}
 	cycle        int               // search-cycle index, set by runLoop each rollover
@@ -158,23 +160,28 @@ func (s *Search) IsDone() bool {
 	}
 	// No unasked nodes remain and no results are buffered: the search is
 	// done. There is no more nodes to query.
-	for i := range s.buckets {
-		provBucketOcc[i].Add(int64(s.buckets[i].count()))
+	if !s.sampled {
+		s.sampled = true
+		for i := range s.buckets {
+			provBucketOcc[i].Add(int64(s.buckets[i].count()))
+		}
+		provBucketCount.Store(int64(len(s.buckets)))
+		provBucketSamples.Add(1)
 	}
-	provBucketCount.Store(int64(len(s.buckets)))
-	provBucketSamples.Add(1)
 	// An adaptive search that walked everything it could reach continues one
 	// bucket closer next pass, where the ads are denser and the nodes differ.
-	if s.adaptive() && s.active < len(s.buckets)-1 {
+	// IsDone can be asked again after held results are handed out: move once.
+	if s.adaptive() && !s.advanced && s.active < len(s.buckets)-1 {
 		s.active++
+		s.advanced = true
 	}
 	return true
 }
 
 // BucketsWithFreeSpace gives n distances from the topic at which
 // the table has space available. An adaptive search lists the distances
-// around its active bucket first: registrars answer the first few requested
-// distances only, and those are the ones the next pass needs filled.
+// within SearchAuxRadius of its active bucket, and only those unless the
+// radius is negative.
 func (s *Search) BucketsWithFreeSpace(dists []uint) []uint {
 	free := func(i int) bool { return s.buckets[i].count() < s.cfg.SearchBucketSize }
 	if s.adaptive() {
@@ -365,12 +372,25 @@ func (s *Search) observe(bi int, ads int) {
 // AddQueryResults adds the response nodes for a topic query to the table.
 // AddQueryResults returns how many results were new to this search.
 func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) int {
+	s.RecordReach(from, results)
+	return s.AddReply(from, results, len(results))
+}
+
+// RecordReach records the ads of a registrar's reply (reach instrumentation).
+func (s *Search) RecordReach(from *enode.Node, ads []*enode.Node) {
+	recordReach(s.cfg.Self, from.ID(), s.cycle, ads)
+}
+
+// AddReply adds the results taken from a topic query response. ads is the
+// number of ads the response carried, which can be more than the results
+// taken from it. It is the density sample of an adaptive search. AddReply
+// returns how many results were new to this search.
+func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) int {
 	b := s.bucket(from.ID())
 	b.setAsked(from)
 	b.numRequests++
-	recordReach(s.cfg.Self, from.ID(), s.cycle, results)
 	if s.adaptive() {
-		s.observe(s.bucketIndex(from.ID()), len(results))
+		s.observe(s.bucketIndex(from.ID()), ads)
 		s.asked.Add(from)
 		s.removeNode(from.ID())
 	}
@@ -397,6 +417,19 @@ func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) int {
 		provAdsDHT.Add(int64(newAds))
 	}
 	return newAds
+}
+
+// AddResults adds nodes to the result set and returns how many were new.
+func (s *Search) AddResults(nodes []*enode.Node) int {
+	added := 0
+	for _, n := range nodes {
+		if _, seen := s.resultSeen[n.ID()]; !seen && n.ID() != s.cfg.Self {
+			s.resultSeen[n.ID()] = struct{}{}
+			s.resultBuffer = append(s.resultBuffer, n)
+			added++
+		}
+	}
+	return added
 }
 
 // PeekResult returns a node from the result set.

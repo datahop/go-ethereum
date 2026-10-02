@@ -52,16 +52,28 @@ type Config struct {
 	TopicNodesLimit int
 	AuxNodesLimit   int
 
-	// SearchYieldFloor makes the search adapt its distance to the topic: it
-	// queries the farthest bucket whose replies still carry at least this many
-	// ads, moving closer when they carry fewer and farther when they are full.
-	// Zero queries every bucket.
+	// SearchRegistrarLimit is the number of results one registrar contributes
+	// to a search within an ad lifetime before the results of other
+	// registrars. The rest of its results follow at the end of the pass, so no
+	// single registrar can fill the peer set of the caller. Zero selects the
+	// default of 6. A negative value disables the limit.
+	SearchRegistrarLimit int
+
+	// SearchYieldFloor is the number of ads per reply below which the search
+	// moves closer to the topic. Zero selects the default of 8. A negative
+	// value disables the adaptive distance.
 	SearchYieldFloor int
 
-	// SearchAuxRadius limits the distances an adaptive search asks aux nodes
-	// for to the active bucket and its neighbours within this many buckets;
-	// zero asks for every bucket with free space.
+	// SearchAuxRadius is the number of buckets on each side of the active one
+	// that a query asks to have refilled. Zero selects the default of 1. A
+	// negative value asks for every bucket with free space.
 	SearchAuxRadius int
+
+	// SearchPassBackoff caps the gap between search passes that returned
+	// nothing new. The gap starts at two seconds and doubles per empty pass.
+	// Zero selects the default of one minute. A negative value keeps the gap
+	// at two seconds.
+	SearchPassBackoff time.Duration
 
 	// These settings are exposed for testing purposes.
 	Clock mclock.Clock
@@ -104,6 +116,16 @@ func (cfg Config) withDefaults() Config {
 	if cfg.AuxNodesLimit == 0 {
 		cfg.AuxNodesLimit = 8
 	}
+	if cfg.SearchRegistrarLimit == 0 {
+		cfg.SearchRegistrarLimit = 6
+	}
+	if cfg.SearchYieldFloor == 0 {
+		cfg.SearchYieldFloor = 8
+	}
+	if cfg.SearchAuxRadius == 0 {
+		cfg.SearchAuxRadius = 1
+	}
+	cfg.SearchPassBackoff = cfg.PassBackoff()
 
 	if cfg.Log == nil {
 		cfg.Log = log.Root()
@@ -118,6 +140,15 @@ func (cfg Config) withDefaults() Config {
 func (cfg Config) ResponseLimits() (topicNodes, auxNodes int) {
 	cfg = cfg.withDefaults()
 	return cfg.TopicNodesLimit, cfg.AuxNodesLimit
+}
+
+// PassBackoff returns SearchPassBackoff with the default applied. The search
+// loop reads it here because it holds the config without defaults.
+func (cfg Config) PassBackoff() time.Duration {
+	if cfg.SearchPassBackoff == 0 {
+		return time.Minute
+	}
+	return cfg.SearchPassBackoff
 }
 
 // TopicID represents a topic.

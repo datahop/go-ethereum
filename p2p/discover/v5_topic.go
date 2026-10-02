@@ -389,6 +389,7 @@ type topicSearch struct {
 	resultCh     chan *enode.Node
 	resultFilter *topicindex.SearchFilter
 	activeBucket int                      // where the last adaptive pass settled
+	idlePasses   int                      // passes in a row that returned nothing new
 	askedFilter  *topicindex.SearchFilter // nodes adaptive passes have queried
 
 	newNodesCh  chan *enode.Node
@@ -466,10 +467,11 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 	defer s.closeDown()
 
 	time := mclock.AbsTime(-1)
+	gap := regloopMinTime
 	cycle := 0
 	for {
 		if time >= 0 {
-			if exit := s.pause(time); exit {
+			if exit := s.pause(time, gap); exit {
 				return
 			}
 		}
@@ -491,20 +493,36 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		s.recordActive(state.ActiveBucket())
 		s.contactsMu.Unlock()
 
-		exit := s.run(sys, state)
+		exit, nresults := s.run(sys, state)
 		s.activeBucket = state.ActiveBucket()
 		if exit {
 			return
 		}
+		gap = s.passGap(nresults)
 	}
 }
 
-// pause ensures that top-level search loop iterations take at least regLoopMinTime.
+// passGap is the minimum length of the next pass: regloopMinTime, doubling
+// after every pass that returned nothing new, up to SearchPassBackoff.
+func (s *topicSearch) passGap(nresults int) time.Duration {
+	backoff := s.config.PassBackoff()
+	if nresults > 0 || backoff <= 0 {
+		s.idlePasses = 0
+		return regloopMinTime
+	}
+	s.idlePasses++
+	if s.idlePasses >= 30 {
+		return backoff
+	}
+	return min(backoff, regloopMinTime<<s.idlePasses)
+}
+
+// pause ensures that top-level search loop iterations take at least gap.
 // This prevents the loop from running too hot when the local node table is very empty.
-func (s *topicSearch) pause(lastTime mclock.AbsTime) bool {
+func (s *topicSearch) pause(lastTime mclock.AbsTime, gap time.Duration) bool {
 	d := s.config.Clock.Now().Sub(lastTime)
-	if d < regloopMinTime {
-		sleep := s.config.Clock.NewTimer(regloopMinTime - d)
+	if d < gap {
+		sleep := s.config.Clock.NewTimer(gap - d)
 		defer sleep.Stop()
 		for {
 			select {
@@ -525,22 +543,31 @@ type topicQueryJob struct {
 	buckets []uint
 }
 
-func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool) {
+func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool, nresults int) {
 	var (
 		queryCh   chan<- topicQueryJob
 		nextQuery topicQueryJob
 		resultCh  chan<- *enode.Node
 		result    *enode.Node
-		nresults  int
+		released  bool // the pass is over and its held results are handed out
 	)
 	lastActive := state.ActiveBucket()
 
 	for {
 		if state.IsDone() {
+			// The pass is over: hand out what the registrar limit held back.
+			if held := s.resultFilter.Release(); len(held) > 0 {
+				added := state.AddResults(held)
+				s.contactsMu.Lock()
+				s.stats.Duplicate += len(held) - added
+				s.contactsMu.Unlock()
+				released = true
+				continue
+			}
 			s.config.Log.Debug("Topic search rollover", "topic", s.topic, "nres", nresults)
-			return false
+			return false, nresults
 		}
-		if queryCh == nil {
+		if queryCh == nil && !released {
 			target := state.QueryTarget()
 			if target != nil {
 				queryCh = s.queryCh
@@ -562,7 +589,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 
 		select {
 		case <-s.quit:
-			return true
+			return true, nresults
 
 		case queryCh <- nextQuery:
 			s.contactsMu.Lock()
@@ -591,10 +618,16 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				sys.transport.trackTopicRequest(resp.src, true)
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 				topicNodes := filterTopicDiscovery(resp.topicNodes)
-				added := state.AddQueryResults(resp.src, topicNodes)
+				state.RecordReach(resp.src, topicNodes)
+				dropped := s.resultFilter.Dropped()
+				taken := s.resultFilter.Take(resp.src.ID(), topicNodes)
+				dropped = s.resultFilter.Dropped() - dropped
+				// The density sample is the size of the reply, not what Take let through.
+				added := state.AddReply(resp.src, taken, len(topicNodes))
 				s.contactsMu.Lock()
 				s.stats.Received += len(topicNodes)
-				s.stats.Duplicate += len(topicNodes) - added
+				s.stats.Duplicate += len(taken) - added
+				s.stats.Filtered += dropped
 				s.stats.MaxTopicPerReply = max(s.stats.MaxTopicPerReply, len(resp.topicNodes))
 				s.stats.MaxAuxPerReply = max(s.stats.MaxAuxPerReply, len(resp.auxNodes))
 				if a := state.ActiveBucket(); a != lastActive {

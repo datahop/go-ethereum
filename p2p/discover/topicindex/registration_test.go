@@ -94,6 +94,7 @@ func rbContainsAll(b regBucket, nodes []*enode.Node) bool {
 func TestRegistrationBucketDistance(t *testing.T) {
 	cfg := testConfig(t)
 	r := NewRegistration(topic1, cfg)
+	regTableDepth := len(r.buckets)
 
 	for _, d := range []int{256, 255, 256 - (regTableDepth - 1)} {
 		n := nodeAtDistance(enode.ID(topic1), d, intIP(d))

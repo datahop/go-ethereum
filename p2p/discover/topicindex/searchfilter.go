@@ -28,13 +28,26 @@ const searchFilterLimit = 50000
 
 // SearchFilter remembers the nodes returned by a topic search, so that later
 // search passes don't return them again until AdLifetime has passed or the
-// node record has been updated.
+// node record has been updated. It also limits the results one registrar
+// contributes, so that the results of a search come from several registrars.
 type SearchFilter struct {
 	clock mclock.Clock
 	ttl   time.Duration
 	limit int
 	seen  map[enode.ID]*list.Element
 	order *list.List // of *searchFilterEntry, oldest expiry first
+
+	registrarLimit int
+	registrars     map[enode.ID]*registrarCount
+	held           []*enode.Node // results above the limit, in arrival order
+	heldSet        map[enode.ID]struct{}
+	dropped        int // results Take dropped as recently returned
+}
+
+// registrarCount is the number of results taken from one registrar.
+type registrarCount struct {
+	n      int
+	expiry mclock.AbsTime
 }
 
 type searchFilterEntry struct {
@@ -52,7 +65,70 @@ func NewSearchFilter(cfg Config) *SearchFilter {
 		limit: searchFilterLimit,
 		seen:  make(map[enode.ID]*list.Element),
 		order: list.New(),
+
+		registrarLimit: cfg.SearchRegistrarLimit,
+		registrars:     make(map[enode.ID]*registrarCount),
+		heldSet:        make(map[enode.ID]struct{}),
 	}
+}
+
+// Take returns the results of a registrar's reply that can be handed out now.
+// Results returned recently are dropped. A registrar contributes at most
+// SearchRegistrarLimit results within an ad lifetime; the rest are held until
+// Release. A held result that another registrar returns is taken from that
+// registrar instead.
+func (f *SearchFilter) Take(registrar enode.ID, results []*enode.Node) []*enode.Node {
+	if f.registrarLimit <= 0 {
+		return results
+	}
+	now := f.clock.Now()
+	rc := f.registrars[registrar]
+	if rc == nil || rc.expiry <= now {
+		rc = &registrarCount{expiry: now.Add(f.ttl)}
+		f.registrars[registrar] = rc
+	}
+	take := results[:0:0]
+	for _, n := range results {
+		if f.Seen(n) {
+			f.dropped++
+			continue
+		}
+		if rc.n >= f.registrarLimit {
+			if _, ok := f.heldSet[n.ID()]; !ok {
+				f.heldSet[n.ID()] = struct{}{}
+				f.held = append(f.held, n)
+			}
+			continue
+		}
+		rc.n++
+		delete(f.heldSet, n.ID())
+		take = append(take, n)
+	}
+	return take
+}
+
+// Dropped returns how many results Take has dropped as recently returned.
+func (f *SearchFilter) Dropped() int {
+	return f.dropped
+}
+
+// Release returns the results held back by Take. It is called at the end of a
+// search pass.
+func (f *SearchFilter) Release() []*enode.Node {
+	var out []*enode.Node
+	for _, n := range f.held {
+		if _, ok := f.heldSet[n.ID()]; ok && !f.Seen(n) {
+			out = append(out, n)
+		}
+	}
+	f.held, f.heldSet = nil, make(map[enode.ID]struct{})
+	now := f.clock.Now()
+	for id, rc := range f.registrars {
+		if rc.expiry <= now {
+			delete(f.registrars, id)
+		}
+	}
+	return out
 }
 
 // Seen reports whether n was returned recently with the same or a newer record.
