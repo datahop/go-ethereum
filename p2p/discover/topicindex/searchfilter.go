@@ -29,7 +29,7 @@ const (
 
 	// searchRegistrarLimit is the number of results a search takes from one
 	// registrar per ad lifetime.
-	searchRegistrarLimit = 6
+	searchRegistrarLimit = 5
 )
 
 // SearchFilter remembers the nodes returned by a topic search, so that later

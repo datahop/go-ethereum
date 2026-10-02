@@ -107,26 +107,27 @@ func TestSearchFilterRegistrarLimit(t *testing.T) {
 	f := NewSearchFilter(Config{AdLifetime: time.Minute, Clock: clock})
 	regA, regB := newNode().ID(), newNode().ID()
 	adsA, adsB := newNodes(16), newNodes(16)
+	limit, held := searchRegistrarLimit, 16-searchRegistrarLimit
 
-	if got := f.Take(regA, adsA); len(got) != 6 {
-		t.Fatalf("first reply gave %d results, want 6", len(got))
+	if got := f.Take(regA, adsA); len(got) != limit {
+		t.Fatalf("first reply gave %d results, want %d", len(got), limit)
 	}
-	if got := f.Take(regB, adsB); len(got) != 6 {
-		t.Fatalf("second registrar gave %d results, want 6", len(got))
+	if got := f.Take(regB, adsB); len(got) != limit {
+		t.Fatalf("second registrar gave %d results, want %d", len(got), limit)
 	}
 	// The allowance of a registrar does not come back in a later reply.
 	if got := f.Take(regA, newNodes(4)); len(got) != 0 {
 		t.Fatalf("registrar over its limit gave %d results, want 0", len(got))
 	}
-	if got := f.Release(); len(got) != 10+10+4 {
-		t.Fatalf("released %d results, want 24", len(got))
+	if got := f.Release(); len(got) != held+held+4 {
+		t.Fatalf("released %d results, want %d", len(got), held+held+4)
 	}
 	if got := f.Release(); len(got) != 0 {
 		t.Fatalf("second release gave %d results, want 0", len(got))
 	}
 	clock.Run(time.Minute)
-	if got := f.Take(regA, newNodes(16)); len(got) != 6 {
-		t.Fatalf("reply after the ad lifetime gave %d results, want 6", len(got))
+	if got := f.Take(regA, newNodes(16)); len(got) != limit {
+		t.Fatalf("reply after the ad lifetime gave %d results, want %d", len(got), limit)
 	}
 }
 
