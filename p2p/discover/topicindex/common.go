@@ -41,11 +41,8 @@ type Config struct {
 	// Search settings.
 	SearchBucketSize int // number of nodes in search buckets
 
-	// SearchRegistrarLimit is the number of results one registrar contributes
-	// to a search within an ad lifetime before the results of other
-	// registrars. The rest of its results follow at the end of the pass, so no
-	// single registrar can fill the peer set of the caller. Zero selects the
-	// default of 6. A negative value disables the limit.
+	// SearchRegistrarLimit is the number of results a search takes from one
+	// registrar per ad lifetime. Zero selects 6, a negative value disables it.
 	SearchRegistrarLimit int
 
 	// These settings are exposed for testing purposes.
