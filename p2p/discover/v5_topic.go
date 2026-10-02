@@ -468,12 +468,12 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		resultCh  chan<- *enode.Node
 		result    *enode.Node
 		nresults  int
-		released  bool // the pass is over and its held results are handed out
+		released  bool // the pass is over and its waiting results are handed out
 	)
 
 	for {
 		if state.IsDone() {
-			// The pass is over: hand out what the registrar limit held back.
+			// The pass is over: hand out the results that still wait in the filter.
 			if held := s.resultFilter.Release(); len(held) > 0 {
 				state.AddResults(held)
 				released = true

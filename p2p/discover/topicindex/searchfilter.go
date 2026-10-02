@@ -27,15 +27,15 @@ import (
 const (
 	searchFilterLimit = 50000
 
-	// searchRegistrarLimit is the number of results a search takes from one
-	// registrar per ad lifetime.
-	searchRegistrarLimit = 5
+	// searchMixRegistrars is the number of registrars a search mixes results
+	// from. Results are handed out while this many registrars have some waiting.
+	searchMixRegistrars = 5
 )
 
 // SearchFilter remembers the nodes returned by a topic search, so that later
 // search passes don't return them again until AdLifetime has passed or the
-// node record has been updated. It also limits the results one registrar
-// contributes, so that the results of a search come from several registrars.
+// node record has been updated. It also mixes the results of the registrars,
+// so that the results of a search come from several of them.
 type SearchFilter struct {
 	clock mclock.Clock
 	ttl   time.Duration
@@ -43,16 +43,15 @@ type SearchFilter struct {
 	seen  map[enode.ID]*list.Element
 	order *list.List // of *searchFilterEntry, oldest expiry first
 
-	registrarLimit int
-	registrars     map[enode.ID]*registrarCount
-	held           []*enode.Node // results above the limit, in arrival order
-	heldSet        map[enode.ID]struct{}
+	mixRegistrars int
+	queues        []*registrarQueue // in arrival order of the registrars
+	registrars    map[enode.ID]*registrarQueue
+	queued        map[enode.ID]struct{} // nodes waiting in a queue
 }
 
-// registrarCount is the number of results taken from one registrar.
-type registrarCount struct {
-	n      int
-	expiry mclock.AbsTime
+// registrarQueue holds the results of one registrar that wait to be handed out.
+type registrarQueue struct {
+	nodes []*enode.Node
 }
 
 type searchFilterEntry struct {
@@ -71,60 +70,69 @@ func NewSearchFilter(cfg Config) *SearchFilter {
 		seen:  make(map[enode.ID]*list.Element),
 		order: list.New(),
 
-		registrarLimit: searchRegistrarLimit,
-		registrars:     make(map[enode.ID]*registrarCount),
-		heldSet:        make(map[enode.ID]struct{}),
+		mixRegistrars: searchMixRegistrars,
+		registrars:    make(map[enode.ID]*registrarQueue),
+		queued:        make(map[enode.ID]struct{}),
 	}
 }
 
-// Take returns the results of a registrar's reply that can be handed out now.
-// Results returned recently are dropped. A registrar contributes at most
-// searchRegistrarLimit results within an ad lifetime; the rest are held until
-// Release. A held result that another registrar returns is taken from that
-// registrar instead.
+// Take queues the results of a registrar's reply and returns the results that
+// can be handed out now. Results returned recently are dropped. Results are
+// handed out one registrar at a time, and only while searchMixRegistrars
+// registrars have results waiting. The rest wait until Release.
 func (f *SearchFilter) Take(registrar enode.ID, results []*enode.Node) []*enode.Node {
-	now := f.clock.Now()
-	rc := f.registrars[registrar]
-	if rc == nil || rc.expiry <= now {
-		rc = &registrarCount{expiry: now.Add(f.ttl)}
-		f.registrars[registrar] = rc
-	}
-	take := results[:0:0]
+	q := f.registrars[registrar]
 	for _, n := range results {
 		if f.Seen(n) {
 			continue
 		}
-		if rc.n >= f.registrarLimit {
-			if _, ok := f.heldSet[n.ID()]; !ok {
-				f.heldSet[n.ID()] = struct{}{}
-				f.held = append(f.held, n)
-			}
+		if _, ok := f.queued[n.ID()]; ok {
 			continue
 		}
-		rc.n++
-		delete(f.heldSet, n.ID())
-		take = append(take, n)
+		if q == nil {
+			q = new(registrarQueue)
+			f.registrars[registrar] = q
+			f.queues = append(f.queues, q)
+		}
+		f.queued[n.ID()] = struct{}{}
+		q.nodes = append(q.nodes, n)
 	}
-	return take
+	return f.mix(false)
 }
 
-// Release returns the results held back by Take. It is called at the end of a
-// search pass.
+// Release returns the results that still wait, one registrar at a time. It is
+// called at the end of a search pass.
 func (f *SearchFilter) Release() []*enode.Node {
+	out := f.mix(true)
+	f.queues, f.registrars = nil, make(map[enode.ID]*registrarQueue)
+	return out
+}
+
+// mix takes one result from every registrar that has results waiting, and
+// repeats this while enough registrars have some. With all set, it takes
+// every waiting result.
+func (f *SearchFilter) mix(all bool) []*enode.Node {
 	var out []*enode.Node
-	for _, n := range f.held {
-		if _, ok := f.heldSet[n.ID()]; ok && !f.Seen(n) {
+	for {
+		ready := 0
+		for _, q := range f.queues {
+			if len(q.nodes) > 0 {
+				ready++
+			}
+		}
+		if ready == 0 || (ready < f.mixRegistrars && !all) {
+			return out
+		}
+		for _, q := range f.queues {
+			if len(q.nodes) == 0 {
+				continue
+			}
+			n := q.nodes[0]
+			q.nodes = q.nodes[1:]
+			delete(f.queued, n.ID())
 			out = append(out, n)
 		}
 	}
-	f.held, f.heldSet = nil, make(map[enode.ID]struct{})
-	now := f.clock.Now()
-	for id, rc := range f.registrars {
-		if rc.expiry <= now {
-			delete(f.registrars, id)
-		}
-	}
-	return out
 }
 
 // Seen reports whether n was returned recently with the same or a newer record.
