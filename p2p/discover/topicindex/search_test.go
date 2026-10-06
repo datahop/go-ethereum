@@ -563,3 +563,8 @@ func TestSearchAdaptiveSpare(t *testing.T) {
 		t.Fatalf("walk did not resume from the aux node, got %v", n)
 	}
 }
+
+// AddQueryResults adds a response whose ads are all taken as results.
+func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
+	s.AddReply(from, results, len(results))
+}
