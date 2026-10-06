@@ -785,11 +785,7 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check fun
 		want[dist] = struct{}{}
 	}
 
-	// Single pass over the table, reservoir-sampling one checked node per
-	// wanted distance. A random pick, rather than the first entry, means the
-	// requester learns a different node each time it asks, so a search can
-	// walk a distance through many registrars instead of being handed the
-	// same few nodes by all of them.
+	// Pick a random node per distance so repeated queries walk different nodes.
 	pick := make(map[uint]*enode.Node, len(want))
 	seen := make(map[uint]int, len(want))
 	for bi := 0; bi < len(tab.buckets); bi++ {

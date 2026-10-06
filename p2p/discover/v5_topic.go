@@ -220,9 +220,7 @@ func shuffleNodes(nodes []*enode.Node) {
 }
 
 const (
-	regloopMinTime = 2 * time.Second
-	// searchPassBackoff caps the gap between search passes that returned
-	// nothing new.
+	regloopMinTime    = 2 * time.Second
 	searchPassBackoff = time.Minute
 )
 
@@ -380,9 +378,9 @@ type topicSearch struct {
 	queryRespCh  chan topicQueryResult
 	resultCh     chan *enode.Node
 	resultFilter *topicindex.SearchFilter
-	activeBucket int                      // where the last adaptive pass settled
-	idlePasses   int                      // passes in a row that returned nothing new
-	askedFilter  *topicindex.SearchFilter // nodes adaptive passes have queried
+	activeBucket int
+	idlePasses   int // passes in a row that returned nothing new
+	askedFilter  *topicindex.SearchFilter
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -551,8 +549,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				}
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
-				// The reply frees the node's slot first, so an aux node at its
-				// distance can take it.
+				// AddReply first frees the node's slot for an aux node.
 				ads := filterTopicDiscovery(resp.topicNodes)
 				state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(resp.topicNodes))
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
