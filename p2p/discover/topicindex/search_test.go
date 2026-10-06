@@ -427,7 +427,8 @@ func TestSearchAdaptiveHelper(t *testing.T) {
 
 // TestSearchAdaptiveIsDone checks that an adaptive pass ends once the bucket
 // the search settled in is exhausted, even though other buckets still hold
-// unasked nodes, and not while results are buffered.
+// unasked nodes, and not while results are buffered. No query goes out once
+// the bucket is exhausted.
 func TestSearchAdaptiveIsDone(t *testing.T) {
 	s := adaptiveSearch(t)
 	s.SetActiveBucket(3)
@@ -438,6 +439,9 @@ func TestSearchAdaptiveIsDone(t *testing.T) {
 	reply(t, s, 3, 8)
 	if s.IsDone() {
 		t.Fatal("done while results are buffered")
+	}
+	if n := s.QueryTarget(); n != nil {
+		t.Fatalf("query to %v after the active bucket was exhausted; the pass would end with it in flight", n.ID())
 	}
 	for s.PeekResult() != nil {
 		s.PopResult()
