@@ -219,7 +219,10 @@ func shuffleNodes(nodes []*enode.Node) {
 	})
 }
 
-const regloopMinTime = 2 * time.Second
+const (
+	regloopMinTime    = 2 * time.Second
+	searchPassBackoff = time.Minute
+)
 
 // pause ensures that top-level registration loop iterations take at least regLoopMinTime.
 // This prevents the loop from running too hot when the local node table is very empty.
@@ -375,6 +378,9 @@ type topicSearch struct {
 	queryRespCh  chan topicQueryResult
 	resultCh     chan *enode.Node
 	resultFilter *topicindex.SearchFilter
+	activeBucket int
+	idlePasses   int // passes in a row that returned nothing new
+	askedFilter  *topicindex.SearchFilter
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -388,6 +394,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 		quit:         make(chan struct{}),
 		resultCh:     out,
 		resultFilter: topicindex.NewSearchFilter(sys.config),
+		askedFilter:  topicindex.NewSearchFilter(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -413,15 +420,18 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 	defer s.closeDown()
 
 	time := mclock.AbsTime(-1)
+	gap := regloopMinTime
 	for {
 		if time >= 0 {
-			if exit := s.pause(time); exit {
+			if exit := s.pause(time, gap); exit {
 				return
 			}
 		}
 		time = s.config.Clock.Now()
 
 		state := topicindex.NewSearch(s.topic, s.config)
+		state.SetActiveBucket(s.activeBucket)
+		state.SetAskedFilter(s.askedFilter)
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
@@ -429,18 +439,35 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		shuffleNodes(nodes)
 		state.AddNodes(nil, nodes)
 
-		if exit := s.run(sys, state); exit {
+		exit, nresults := s.run(sys, state)
+		s.activeBucket = state.ActiveBucket()
+		if exit {
 			return
 		}
+		gap = s.passGap(nresults)
 	}
 }
 
-// pause ensures that top-level search loop iterations take at least regLoopMinTime.
+// passGap is the minimum length of the next pass: regloopMinTime, doubling
+// after every pass that returned nothing new, up to searchPassBackoff.
+func (s *topicSearch) passGap(nresults int) time.Duration {
+	if nresults > 0 {
+		s.idlePasses = 0
+		return regloopMinTime
+	}
+	s.idlePasses++
+	if s.idlePasses >= 30 {
+		return searchPassBackoff
+	}
+	return min(searchPassBackoff, regloopMinTime<<s.idlePasses)
+}
+
+// pause ensures that top-level search loop iterations take at least gap.
 // This prevents the loop from running too hot when the local node table is very empty.
-func (s *topicSearch) pause(lastTime mclock.AbsTime) bool {
+func (s *topicSearch) pause(lastTime mclock.AbsTime, gap time.Duration) bool {
 	d := s.config.Clock.Now().Sub(lastTime)
-	if d < regloopMinTime {
-		sleep := s.config.Clock.NewTimer(regloopMinTime - d)
+	if d < gap {
+		sleep := s.config.Clock.NewTimer(gap - d)
 		defer sleep.Stop()
 		for {
 			select {
@@ -461,18 +488,17 @@ type topicQueryJob struct {
 	buckets []uint
 }
 
-func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool) {
+func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool, nresults int) {
 	var (
 		queryCh   chan<- topicQueryJob
 		nextQuery topicQueryJob
 		resultCh  chan<- *enode.Node
 		result    *enode.Node
-		nresults  int
 		released  bool // the pass is over and its waiting results are handed out
 	)
 
 	for {
-		if state.IsDone() {
+		if queryCh == nil && state.IsDone() {
 			// The pass is over: hand out the results that still wait in the filter.
 			if held := s.resultFilter.Release(); len(held) > 0 {
 				state.AddResults(held)
@@ -480,7 +506,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				continue
 			}
 			s.config.Log.Debug("Topic search rollover", "topic", s.topic, "nres", nresults)
-			return false
+			return false, nresults
 		}
 		if queryCh == nil && !released {
 			target := state.QueryTarget()
@@ -501,7 +527,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 
 		select {
 		case <-s.quit:
-			return true
+			return true, nresults
 
 		case queryCh <- nextQuery:
 		case resp := <-s.queryRespCh:
@@ -523,9 +549,10 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				}
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
+				// AddReply first frees the node's slot for an aux node.
+				ads := filterTopicDiscovery(resp.topicNodes)
+				state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(resp.topicNodes))
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
-				results := s.resultFilter.Take(resp.src.ID(), filterTopicDiscovery(resp.topicNodes))
-				state.AddQueryResults(resp.src, results)
 			}
 			queryCh = nil
 

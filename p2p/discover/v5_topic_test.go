@@ -171,6 +171,25 @@ func TestTopicStopRegister(t *testing.T) {
 	node.StopRegisterTopic(topic)
 }
 
+// TestTopicSearchPassGap checks the gap between passes: the minimum after a
+// pass with results, doubling from it after every empty pass up to
+// searchPassBackoff.
+func TestTopicSearchPassGap(t *testing.T) {
+	s := new(topicSearch)
+	want := []time.Duration{4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, searchPassBackoff, searchPassBackoff}
+	for i, w := range want {
+		if got := s.passGap(0); got != w {
+			t.Fatalf("empty pass %d: gap %v, want %v", i+1, got, w)
+		}
+	}
+	if got := s.passGap(3); got != regloopMinTime {
+		t.Fatalf("pass with results: gap %v, want %v", got, regloopMinTime)
+	}
+	if got := s.passGap(0); got != 4*time.Second {
+		t.Fatalf("empty pass after a reset: gap %v, want 4s", got)
+	}
+}
+
 // TestTopicSearchIteratorClose verifies that closing the search iterator
 // doesn't leak goroutines.
 func TestTopicSearchIteratorClose(t *testing.T) {
