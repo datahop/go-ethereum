@@ -273,11 +273,6 @@ func (s *Search) observe(bi int, ads int) {
 	}
 }
 
-// AddQueryResults adds the response nodes for a topic query to the table.
-func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
-	s.AddReply(from, results, len(results))
-}
-
 // AddReply adds the results of a topic query response. ads is the number of
 // ads the response carried, the density sample that moves the active bucket.
 func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) {

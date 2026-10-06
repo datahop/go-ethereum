@@ -586,3 +586,8 @@ func TestSearchResultNewerRecord(t *testing.T) {
 		t.Fatal("older record returned again")
 	}
 }
+
+// AddQueryResults adds a response whose ads are all taken as results.
+func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
+	s.AddReply(from, results, len(results))
+}
