@@ -384,9 +384,8 @@ func TestTopicTableEviction(t *testing.T) {
 
 func testConfig(t *testing.T) Config {
 	return Config{
-		AdCacheSize:      20,
-		SearchYieldFloor: -1,
-		Log:              testlog.Logger(t, log.LvlTrace),
+		AdCacheSize: 20,
+		Log:         testlog.Logger(t, log.LvlTrace),
 	}
 }
 

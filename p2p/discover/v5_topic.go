@@ -219,7 +219,12 @@ func shuffleNodes(nodes []*enode.Node) {
 	})
 }
 
-const regloopMinTime = 2 * time.Second
+const (
+	regloopMinTime = 2 * time.Second
+	// searchPassBackoff caps the gap between search passes that returned
+	// nothing new.
+	searchPassBackoff = time.Minute
+)
 
 // pause ensures that top-level registration loop iterations take at least regLoopMinTime.
 // This prevents the loop from running too hot when the local node table is very empty.
@@ -446,17 +451,17 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 }
 
 // passGap is the minimum length of the next pass: regloopMinTime, doubling
-// after every pass that returned nothing new, up to SearchPassBackoff.
+// after every pass that returned nothing new, up to searchPassBackoff.
 func (s *topicSearch) passGap(nresults int) time.Duration {
-	if nresults > 0 || s.config.SearchPassBackoff <= 0 {
+	if nresults > 0 {
 		s.idlePasses = 0
 		return regloopMinTime
 	}
 	s.idlePasses++
 	if s.idlePasses >= 30 {
-		return s.config.SearchPassBackoff
+		return searchPassBackoff
 	}
-	return min(s.config.SearchPassBackoff, regloopMinTime<<s.idlePasses)
+	return min(searchPassBackoff, regloopMinTime<<s.idlePasses)
 }
 
 // pause ensures that top-level search loop iterations take at least gap.

@@ -95,11 +95,9 @@ func TestSearchIsDone(t *testing.T) {
 	}
 }
 
-// TestSearchQueryTarget checks how QueryTarget selects nodes: picks come
-// from the farthest bucket holding unasked candidates (empty buckets are
-// skipped), closer buckets become eligible only after that bucket has
-// received a response, and QueryTarget returns nil exactly when every node
-// has been asked.
+// TestSearchQueryTarget checks that QueryTarget picks from the populated
+// bucket nearest the active one, asks every node once, and returns nil once
+// every node has been asked.
 func TestSearchQueryTarget(t *testing.T) {
 	config := testConfig(t)
 	s := NewSearch(topic1, config)
@@ -110,26 +108,15 @@ func TestSearchQueryTarget(t *testing.T) {
 	}
 
 	// Populate buckets 3 (logdist 253) and 7 (logdist 249) with two nodes
-	// each. Buckets 0-2 and 4-6 stay empty.
+	// each. The active bucket 0 is empty, so the first pick comes from the
+	// nearest populated bucket, 3.
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 253, 2, 1))
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 249, 2, 10))
-
-	// Before any response, every pick must come from bucket 3: it is the
-	// farthest bucket with candidates (the empty buckets before it are
-	// skipped), and while it has no response yet it gates the walk,
-	// keeping bucket 7 out of the pool.
-	for i := 0; i < 20; i++ {
-		n := s.QueryTarget()
-		if n == nil {
-			t.Fatal("QueryTarget returned nil on a populated table")
-		}
-		if bi := s.bucketIndex(n.ID()); bi != 3 {
-			t.Fatalf("pick from bucket[%d] before any response, want bucket[3]", bi)
-		}
+	if n := s.QueryTarget(); n == nil || s.bucketIndex(n.ID()) != 3 {
+		t.Fatalf("first pick %v, want a bucket[3] node", n)
 	}
 
-	// Drain the table, responding to every query. The first response warms
-	// bucket 3, letting bucket 7 join the pool. Every node must be picked
+	// Drain the table, responding to every query. Every node must be picked
 	// exactly once, and QueryTarget must return nil only at exhaustion.
 	asked := make(map[enode.ID]bool)
 	for {
@@ -199,14 +186,14 @@ func TestSearchHandleErrorResponse(t *testing.T) {
 		t.Fatal("replacement with the failed node's IP was not admitted")
 	}
 
-	// The failure did not count as a response: bucket 0 still has candidates
-	// and no response yet, so it keeps gating the walk.
+	// The failure did not move the search: it keeps picking from the active
+	// bucket 0 while that has candidates.
 	if n := s.QueryTarget(); n == nil || !s.buckets[0].contains(n.ID()) {
-		t.Fatalf("QueryTarget should keep picking from unwarmed bucket[0], got %v", n)
+		t.Fatalf("QueryTarget should keep picking from bucket[0], got %v", n)
 	}
 
-	// Failing all of bucket 0 empties it; the empty bucket no longer blocks
-	// the walk, so QueryTarget advances to bucket 5.
+	// Failing all of bucket 0 empties it, so QueryTarget moves on to the
+	// nearest populated bucket, 5.
 	s.HandleErrorResponse(far[1], errors.New("timeout"))
 	s.HandleErrorResponse(replacement, errors.New("timeout"))
 	target := s.QueryTarget()
@@ -224,32 +211,23 @@ func TestSearchHandleErrorResponse(t *testing.T) {
 	}
 }
 
-// TestSearchRemoveAskedNodeFreesIP verifies that removing a node that has moved
-// to the 'asked' set (it responded before being removed) still releases its
-// IP-limit entry, so a same-/24 replacement is admitted.
-func TestSearchRemoveAskedNodeFreesIP(t *testing.T) {
+// TestSearchRepliedNodeFreesIP verifies that a node that replied leaves the
+// table and releases its IP-limit entry, so a same-/24 replacement is admitted.
+func TestSearchRepliedNodeFreesIP(t *testing.T) {
 	config := testConfig(t)
 	s := NewSearch(topic1, config)
 
 	nodes := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
 	n := nodes[0]
 	s.AddNodes(nil, nodes)
-
-	// Move n into the 'asked' set by recording a query response from it.
 	s.AddQueryResults(n, nil)
-	if _, inAsked := s.buckets[0].asked[n.ID()]; !inAsked {
-		t.Fatal("node was not moved to the asked set")
-	}
-
-	// Removing it now must free the IP-limit slot even though it is in 'asked'.
-	s.HandleErrorResponse(n, errors.New("timeout"))
 	if s.buckets[0].contains(n.ID()) {
-		t.Fatal("removed asked-node still present")
+		t.Fatal("node still in the table after its reply")
 	}
 	replacement := nodeAtDistance(enode.ID(topic1), 256, n.IP())
 	s.AddNodes(nil, []*enode.Node{replacement})
 	if !s.buckets[0].contains(replacement.ID()) {
-		t.Fatal("replacement with the asked node's IP was not admitted (IP slot leaked)")
+		t.Fatal("replacement with the replied node's IP was not admitted (IP slot leaked)")
 	}
 }
 
@@ -274,74 +252,17 @@ func TestSearchResultsTracking(t *testing.T) {
 	}
 }
 
-// TestSearchBucketsWithFreeSpace verifies that BucketsWithFreeSpace reports
-// the topic distance of every bucket with room left, that a full bucket
-// drops out of the list, and that asked nodes keep occupying their slot.
+// TestSearchBucketsWithFreeSpace checks that a query asks to refill only the
+// buckets within searchAuxRadius of the active one.
 func TestSearchBucketsWithFreeSpace(t *testing.T) {
-	config := testConfig(t)
-	s := NewSearch(topic1, config)
-
-	// On a fresh table, every bucket has free space, covering the full
-	// distance range 256 .. 256-searchTableDepth+1.
-	dists := s.BucketsWithFreeSpace(nil)
-	if len(dists) != searchTableDepth {
-		t.Fatalf("fresh table reports %d buckets with free space, want %d", len(dists), searchTableDepth)
-	}
-	seen := make(map[uint]bool, len(dists))
-	for _, d := range dists {
-		seen[d] = true
-	}
-	for d := uint(256); d > uint(256-searchTableDepth); d-- {
-		if !seen[d] {
-			t.Fatalf("distance %d missing from free-space list %v", d, dists)
-		}
-	}
-
-	// Fill bucket 0 (distance 256) to capacity: it must drop out of the
-	// list while all other buckets remain.
-	full := nodesAtDistanceFrom(enode.ID(topic1), 256, s.cfg.SearchBucketSize, 1)
-	s.AddNodes(nil, full)
-	if got := s.buckets[0].count(); got != s.cfg.SearchBucketSize {
-		t.Fatalf("setup: bucket[0] holds %d nodes, want %d", got, s.cfg.SearchBucketSize)
-	}
-	dists = s.BucketsWithFreeSpace(nil)
-	if len(dists) != searchTableDepth-1 {
-		t.Fatalf("got %d buckets with free space, want %d", len(dists), searchTableDepth-1)
-	}
-	for _, d := range dists {
-		if d == 256 {
-			t.Fatal("full bucket[0] (distance 256) still reported as having free space")
-		}
-	}
-
-	// Querying a node moves it from `new` to `asked`, but it keeps
-	// occupying its slot: the bucket must remain full.
-	s.AddQueryResults(full[0], nil)
-	for _, d := range s.BucketsWithFreeSpace(nil) {
-		if d == 256 {
-			t.Fatal("bucket[0] reported free after a response; asked nodes must keep their slot")
-		}
-	}
-}
-
-// An adaptive search asks to refill only the buckets within SearchAuxRadius
-// of its active bucket; a negative radius lists every bucket with free space.
-func TestSearchAdaptiveFreeSpaceRadius(t *testing.T) {
 	s := adaptiveSearch(t)
 	s.SetActiveBucket(3)
-	dists := s.BucketsWithFreeSpace(nil)
-	if want := []uint{254, 253, 252}; !slices.Equal(dists, want) {
-		t.Fatalf("radius 1 lists %v, want %v", dists, want)
+	if dists, want := s.BucketsWithFreeSpace(nil), []uint{254, 253, 252}; !slices.Equal(dists, want) {
+		t.Fatalf("active bucket 3 lists %v, want %v", dists, want)
 	}
-
-	config := testConfig(t)
-	config.SearchYieldFloor = 4
-	config.SearchAuxRadius = -1
-	s = NewSearch(topic1, config)
-	s.SetActiveBucket(3)
-	dists = s.BucketsWithFreeSpace(nil)
-	if len(dists) != searchTableDepth || dists[0] != 254 || dists[2] != 252 {
-		t.Fatalf("negative radius lists %v, want the neighbourhood first and all %d buckets", dists, searchTableDepth)
+	s.SetActiveBucket(0)
+	if dists, want := s.BucketsWithFreeSpace(nil), []uint{256, 255}; !slices.Equal(dists, want) {
+		t.Fatalf("active bucket 0 lists %v, want %v", dists, want)
 	}
 }
 
@@ -349,7 +270,6 @@ func TestSearchAdaptiveFreeSpaceRadius(t *testing.T) {
 // asked. The search loop asks again after it hands out held results.
 func TestSearchAdaptiveIsDoneOnce(t *testing.T) {
 	config := testConfig(t)
-	config.SearchYieldFloor = 4
 	s := NewSearch(topic1, config)
 	s.SetActiveBucket(3)
 	for i := 0; i < 3; i++ {
@@ -382,7 +302,6 @@ func TestSearchAdaptiveReplySize(t *testing.T) {
 
 func adaptiveSearch(t *testing.T) *Search {
 	config := testConfig(t)
-	config.SearchYieldFloor = 4
 	s := NewSearch(topic1, config)
 	// Two candidates in every bucket the tests move through.
 	for bi := 0; bi <= 12; bi++ {
@@ -407,7 +326,7 @@ func reply(t *testing.T, s *Search, bi int, n int) *enode.Node {
 
 // TestSearchAdaptiveAdvance checks that an adaptive search moves toward the
 // topic by the number of density doublings needed to meet the floor: one ad
-// per reply at floor 4 is two buckets, and empty replies are the maximum jump.
+// per reply at floor 8 is three buckets, and empty replies are the maximum jump.
 func TestSearchAdaptiveAdvance(t *testing.T) {
 	s := adaptiveSearch(t)
 	if s.ActiveBucket() != 0 {
@@ -418,13 +337,13 @@ func TestSearchAdaptiveAdvance(t *testing.T) {
 		t.Fatal("moved on a single sample")
 	}
 	reply(t, s, 0, 1)
-	if s.ActiveBucket() != 2 {
-		t.Fatalf("active bucket %d after two replies of 1 ad, want 2", s.ActiveBucket())
+	if s.ActiveBucket() != 3 {
+		t.Fatalf("active bucket %d after two replies of 1 ad, want 3", s.ActiveBucket())
 	}
-	reply(t, s, 2, 0)
-	reply(t, s, 2, 0)
-	if s.ActiveBucket() != 2+searchMaxJump {
-		t.Fatalf("active bucket %d after empty replies, want %d", s.ActiveBucket(), 2+searchMaxJump)
+	reply(t, s, 3, 0)
+	reply(t, s, 3, 0)
+	if s.ActiveBucket() != 3+searchMaxJump {
+		t.Fatalf("active bucket %d after empty replies, want %d", s.ActiveBucket(), 3+searchMaxJump)
 	}
 }
 
@@ -439,8 +358,8 @@ func TestSearchAdaptiveRetreat(t *testing.T) {
 	if s.ActiveBucket() != 5 {
 		t.Fatalf("active bucket %d after full replies, want 5", s.ActiveBucket())
 	}
-	reply(t, s, 5, 5)
-	reply(t, s, 5, 6)
+	reply(t, s, 5, 8)
+	reply(t, s, 5, 9)
 	if s.ActiveBucket() != 5 {
 		t.Fatalf("active bucket %d after replies at the floor, want 5", s.ActiveBucket())
 	}
@@ -466,13 +385,13 @@ func TestSearchAdaptiveLiar(t *testing.T) {
 		t.Fatalf("active bucket %d after (full, 1), want 4", s.ActiveBucket())
 	}
 	reply(t, s, 4, 1)
-	if s.ActiveBucket() != 6 {
-		t.Fatalf("active bucket %d after (full, 1, 1), want 6", s.ActiveBucket())
+	if s.ActiveBucket() != 7 {
+		t.Fatalf("active bucket %d after (full, 1, 1), want 7", s.ActiveBucket())
 	}
 
 	s.SetActiveBucket(2)
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 254, 2, 100))
-	for _, n := range []int{0, 4, 4, 4} {
+	for _, n := range []int{0, 8, 8, 8} {
 		reply(t, s, 2, n)
 		if s.ActiveBucket() != 2 {
 			t.Fatalf("active bucket %d, want 2: one empty reply must not advance the search", s.ActiveBucket())
@@ -485,7 +404,6 @@ func TestSearchAdaptiveLiar(t *testing.T) {
 // requests aux nodes only around the active distance.
 func TestSearchAdaptiveHelper(t *testing.T) {
 	config := testConfig(t)
-	config.SearchYieldFloor = 4
 	s := NewSearch(topic1, config)
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 254, 1, 1)) // bucket 2
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 249, 1, 2)) // bucket 7
@@ -516,8 +434,8 @@ func TestSearchAdaptiveIsDone(t *testing.T) {
 	if s.IsDone() {
 		t.Fatal("done before the active bucket was asked")
 	}
-	reply(t, s, 3, 4)
-	reply(t, s, 3, 4)
+	reply(t, s, 3, 8)
+	reply(t, s, 3, 8)
 	if s.IsDone() {
 		t.Fatal("done while results are buffered")
 	}
@@ -552,7 +470,6 @@ func TestSearchAdaptiveIsDone(t *testing.T) {
 // the asked filter.
 func TestSearchAdaptiveExplores(t *testing.T) {
 	config := testConfig(t)
-	config.SearchYieldFloor = 4
 	config.SearchBucketSize = 2
 	s := NewSearch(topic1, config)
 	nodes := nodesAtDistanceFrom(enode.ID(topic1), 256, 2, 1)
@@ -596,7 +513,6 @@ func TestSearchAdaptiveExplores(t *testing.T) {
 // moves one bucket closer for its next pass, and stops at the closest one.
 func TestSearchAdaptiveWalkedDry(t *testing.T) {
 	config := testConfig(t)
-	config.SearchYieldFloor = 4
 	s := NewSearch(topic1, config)
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1))
 	reply(t, s, 0, 0)
@@ -617,7 +533,6 @@ func TestSearchAdaptiveWalkedDry(t *testing.T) {
 // unasked node those bring.
 func TestSearchAdaptiveSpare(t *testing.T) {
 	config := testConfig(t)
-	config.SearchYieldFloor = 4
 	s := NewSearch(topic1, config)
 	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 2, 1)
 	s.AddNodes(nil, seeds)
