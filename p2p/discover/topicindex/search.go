@@ -36,10 +36,7 @@ const (
 	// IP subnet limit.
 	searchBucketSubnet, searchBucketIPLimit = 24, 1
 
-	// Adaptive distance. The search moves closer to the topic while replies
-	// carry fewer than searchYieldFloor ads, by at most searchMaxJump buckets,
-	// judged on the last searchYieldWindow replies of a bucket. A query asks
-	// for aux nodes within searchAuxRadius buckets of the active one.
+	// Adaptive distance.
 	searchYieldFloor  = 8
 	searchYieldWindow = 4
 	searchMaxJump     = 4
@@ -55,13 +52,9 @@ type Search struct {
 	// Note: search buckets are ordered far -> close.
 	buckets [searchTableDepth]searchBucket
 
-	// active is the bucket the search queries.
-	active int
-	// asked holds the nodes queried within the last ad lifetime.
-	asked *SearchFilter
-	// spare holds already-asked nodes. One is asked again per pass when
-	// nothing unasked is left.
-	spare     map[enode.ID]*enode.Node
+	active    int
+	asked     *SearchFilter            // nodes queried within the last ad lifetime
+	spare     map[enode.ID]*enode.Node // asked nodes, one re-asked per pass if nothing else is left
 	spareUsed bool
 	advanced  bool // the pass moved the active bucket at its end
 
@@ -140,9 +133,7 @@ func (s *Search) IsDone() bool {
 	if !s.spareUsed && len(s.spare) > 0 {
 		return false
 	}
-	// No unasked nodes remain and no results are buffered: the search is
-	// done. There is no more nodes to query. The next pass starts one bucket
-	// closer.
+	// Nothing left to ask: the next pass starts one bucket closer.
 	if !s.advanced && s.active < len(s.buckets)-1 {
 		s.active++
 		s.advanced = true
@@ -150,8 +141,7 @@ func (s *Search) IsDone() bool {
 	return true
 }
 
-// activeDone reports whether the active bucket is exhausted and has enough
-// replies to place the next pass, which ends the pass.
+// activeDone reports whether the active bucket is exhausted, ending the pass.
 func (s *Search) activeDone() bool {
 	b := &s.buckets[s.active]
 	return len(b.new) == 0 && len(b.yield) >= 2
@@ -219,8 +209,7 @@ func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.removeNode(from.ID())
 }
 
-// removeNode drops a node from the search table and releases its IP-limit
-// entry.
+// removeNode drops a node and releases its IP-limit entry.
 func (s *Search) removeNode(id enode.ID) {
 	b := s.bucket(id)
 	if n, ok := b.new[id]; ok {
@@ -289,9 +278,8 @@ func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 	s.AddReply(from, results, len(results))
 }
 
-// AddReply adds the results taken from a topic query response. ads is the
-// number of ads the response carried, which can be more than the results
-// taken from it. It is the density sample that moves the active bucket.
+// AddReply adds the results of a topic query response. ads is the number of
+// ads the response carried, the density sample that moves the active bucket.
 func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) {
 	s.observe(s.bucketIndex(from.ID()), ads)
 	s.asked.Add(from)
