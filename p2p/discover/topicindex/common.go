@@ -41,22 +41,6 @@ type Config struct {
 	// Search settings.
 	SearchBucketSize int // number of nodes in search buckets
 
-	// SearchYieldFloor is the number of ads per reply below which the search
-	// moves closer to the topic. Zero selects the default of 8. A negative
-	// value disables the adaptive distance.
-	SearchYieldFloor int
-
-	// SearchAuxRadius is the number of buckets on each side of the active one
-	// that a query asks to have refilled. Zero selects the default of 1. A
-	// negative value asks for every bucket with free space.
-	SearchAuxRadius int
-
-	// SearchPassBackoff caps the gap between search passes that returned
-	// nothing new. The gap starts at two seconds and doubles per empty pass.
-	// Zero selects the default of one minute. A negative value keeps the gap
-	// at two seconds.
-	SearchPassBackoff time.Duration
-
 	// These settings are exposed for testing purposes.
 	Clock mclock.Clock
 	Log   log.Logger
@@ -85,15 +69,6 @@ func (cfg Config) withDefaults() Config {
 	}
 	if cfg.SearchBucketSize == 0 {
 		cfg.SearchBucketSize = 8
-	}
-	if cfg.SearchYieldFloor == 0 {
-		cfg.SearchYieldFloor = 8
-	}
-	if cfg.SearchAuxRadius == 0 {
-		cfg.SearchAuxRadius = 1
-	}
-	if cfg.SearchPassBackoff == 0 {
-		cfg.SearchPassBackoff = time.Minute
 	}
 
 	if cfg.Log == nil {
