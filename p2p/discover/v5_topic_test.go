@@ -95,8 +95,6 @@ func TestTopicSearch(t *testing.T) {
 	}
 }
 
-// seedTopicTable registers the given nodes for a topic in t's local topic
-// table. The work runs on the dispatch goroutine, which owns the table.
 // TestTopicSearchNoRepeats checks that a search doesn't return a node again
 // in later passes until the ad lifetime has passed.
 func TestTopicSearchNoRepeats(t *testing.T) {
@@ -133,6 +131,8 @@ func TestTopicSearchNoRepeats(t *testing.T) {
 	}
 }
 
+// seedTopicTable registers the given nodes for a topic in t's local topic
+// table. The work runs on the dispatch goroutine, which owns the table.
 func seedTopicTable(t *testing.T, node *UDPv5, topic topicindex.TopicID, regs ...*enode.Node) {
 	t.Helper()
 	done := make(chan struct{})
