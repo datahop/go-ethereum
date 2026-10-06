@@ -554,7 +554,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 	lastActive := state.ActiveBucket()
 
 	for {
-		if state.IsDone() {
+		if queryCh == nil && state.IsDone() {
 			// The pass is over: hand out what the registrar limit held back.
 			if held := s.resultFilter.Release(); len(held) > 0 {
 				added := state.AddResults(held)
@@ -616,14 +616,15 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				}
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
-				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 				topicNodes := filterTopicDiscovery(resp.topicNodes)
 				state.RecordReach(resp.src, topicNodes)
 				dropped := s.resultFilter.Dropped()
 				taken := s.resultFilter.Take(resp.src.ID(), topicNodes)
 				dropped = s.resultFilter.Dropped() - dropped
 				// The density sample is the size of the reply, not what Take let through.
-				added := state.AddReply(resp.src, taken, len(topicNodes))
+				added := state.AddReply(resp.src, taken, len(resp.topicNodes))
+				// AddReply first frees the node's slot for an aux node.
+				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 				s.contactsMu.Lock()
 				s.stats.Received += len(topicNodes)
 				s.stats.Duplicate += len(taken) - added

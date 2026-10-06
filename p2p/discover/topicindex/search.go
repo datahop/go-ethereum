@@ -144,10 +144,8 @@ func (s *Search) IsDone() bool {
 	// and had enough replies to decide where the next pass goes. A bucket
 	// too sparse to decide falls through: the search keeps asking the
 	// nearest populated buckets until one of them settles it.
-	if s.adaptive() {
-		if b := &s.buckets[s.active]; len(b.new) == 0 && len(b.yield) >= 2 {
-			return true
-		}
+	if s.adaptive() && s.activeDone() {
+		return true
 	}
 	// The search cannot be done while there are still nodes that could be asked.
 	for _, b := range s.buckets {
@@ -176,6 +174,12 @@ func (s *Search) IsDone() bool {
 		s.advanced = true
 	}
 	return true
+}
+
+// activeDone reports whether the active bucket is exhausted, ending the pass.
+func (s *Search) activeDone() bool {
+	b := &s.buckets[s.active]
+	return len(b.new) == 0 && len(b.yield) >= 2
 }
 
 // BucketsWithFreeSpace gives n distances from the topic at which
@@ -320,6 +324,9 @@ func (s *Search) QueryTarget() *enode.Node {
 // has no candidates, it asks the nearest bucket that has some, farther side
 // first: the reply carries nodes at the active distance.
 func (s *Search) adaptiveTarget() *enode.Node {
+	if s.activeDone() {
+		return nil
+	}
 	for d := 0; d < len(s.buckets); d++ {
 		for _, i := range [2]int{s.active - d, s.active + d} {
 			if i < 0 || i >= len(s.buckets) {
