@@ -128,9 +128,7 @@ func (s *Search) IsDone() bool {
 	if len(s.resultBuffer) > 0 {
 		return false
 	}
-	// A pass ends when the active bucket is exhausted and has enough replies
-	// to place the next pass.
-	if b := &s.buckets[s.active]; len(b.new) == 0 && len(b.yield) >= 2 {
+	if s.activeDone() {
 		return true
 	}
 	// The search cannot be done while there are still nodes that could be asked.
@@ -150,6 +148,13 @@ func (s *Search) IsDone() bool {
 		s.advanced = true
 	}
 	return true
+}
+
+// activeDone reports whether the active bucket is exhausted and has enough
+// replies to place the next pass, which ends the pass.
+func (s *Search) activeDone() bool {
+	b := &s.buckets[s.active]
+	return len(b.new) == 0 && len(b.yield) >= 2
 }
 
 // BucketsWithFreeSpace gives the distances from the topic within
@@ -227,8 +232,11 @@ func (s *Search) removeNode(id enode.ID) {
 }
 
 // QueryTarget picks an unasked node in the active bucket, or in the nearest
-// bucket that has one.
+// bucket that has one. It returns nil once the pass is over.
 func (s *Search) QueryTarget() *enode.Node {
+	if s.activeDone() {
+		return nil
+	}
 	for d := 0; d < len(s.buckets); d++ {
 		for _, i := range [2]int{s.active - d, s.active + d} {
 			if i < 0 || i >= len(s.buckets) {

@@ -500,7 +500,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 	)
 
 	for {
-		if state.IsDone() {
+		if queryCh == nil && state.IsDone() {
 			// The pass is over: hand out the results that still wait in the filter.
 			if held := s.resultFilter.Release(); len(held) > 0 {
 				state.AddResults(held)
@@ -551,9 +551,11 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				}
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
-				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
+				// The reply frees the node's slot first, so an aux node at its
+				// distance can take it.
 				ads := filterTopicDiscovery(resp.topicNodes)
-				state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(ads))
+				state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(resp.topicNodes))
+				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 			}
 			queryCh = nil
 
