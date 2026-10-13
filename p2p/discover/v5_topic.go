@@ -450,7 +450,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 }
 
 // passGap is the minimum length of the next pass: regloopMinTime, doubling
-// after every pass that neither returned nothing new nor moved the active
+// after every pass that neither returned anything new nor moved the active
 // bucket, up to searchPassBackoff.
 func (s *topicSearch) passGap(nresults int, moved bool) time.Duration {
 	if nresults > 0 || moved {
