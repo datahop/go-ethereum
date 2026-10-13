@@ -491,10 +491,6 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			}
 		}
 		if n := state.PeekResult(); n != nil {
-			if s.resultFilter.Seen(n) {
-				state.PopResult()
-				continue
-			}
 			result = n
 			resultCh = s.resultCh
 		}
