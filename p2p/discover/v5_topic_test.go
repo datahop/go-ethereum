@@ -227,14 +227,15 @@ func TestTopicSearchStopsWhenUnread(t *testing.T) {
 		t.Fatal("no first result")
 	}
 	// The consumer stops reading. The queries must stop too.
-	time.Sleep(2 * time.Second)
+	time.Sleep(time.Second)
 	sent := s.queries.Load()
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 	if again := s.queries.Load(); again != sent {
 		t.Fatalf("%d queries sent while results waited unread", again-sent)
 	}
-	if sent > uint64(len(regs)+2) {
-		t.Fatalf("%d queries before the consumer stopped, want at most %d", sent, len(regs)+2)
+	// At most every registrar and the bootnode: nothing was asked twice.
+	if sent > uint64(len(regs)+1) {
+		t.Fatalf("%d queries before the consumer stopped, want at most %d", sent, len(regs)+1)
 	}
 	// Reading again lets the search go on: every ad comes out.
 	for n := 1; n < nads; n++ {
