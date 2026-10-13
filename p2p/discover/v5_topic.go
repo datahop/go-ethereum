@@ -440,18 +440,20 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		state.AddNodes(nil, nodes)
 
 		exit, nresults := s.run(sys, state)
+		moved := state.ActiveBucket() != s.activeBucket
 		s.activeBucket = state.ActiveBucket()
 		if exit {
 			return
 		}
-		gap = s.passGap(nresults)
+		gap = s.passGap(nresults, moved)
 	}
 }
 
 // passGap is the minimum length of the next pass: regloopMinTime, doubling
-// after every pass that returned nothing new, up to searchPassBackoff.
-func (s *topicSearch) passGap(nresults int) time.Duration {
-	if nresults > 0 {
+// after every pass that neither returned nothing new nor moved the active
+// bucket, up to searchPassBackoff.
+func (s *topicSearch) passGap(nresults int, moved bool) time.Duration {
+	if nresults > 0 || moved {
 		s.idlePasses = 0
 		return regloopMinTime
 	}
@@ -552,7 +554,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				sys.transport.trackTopicRequest(resp.src, true)
 				// AddReply first frees the node's slot for an aux node.
 				ads := filterTopicDiscovery(resp.topicNodes)
-				state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(resp.topicNodes))
+				state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(ads))
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 			}
 			queryCh = nil
