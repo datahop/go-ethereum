@@ -101,8 +101,6 @@ func (f *SearchFilter) Take(registrar enode.ID, results []*enode.Node) []*enode.
 	return f.mix(false)
 }
 
-// Release returns the results that still wait, one registrar at a time. It is
-// called at the end of a search pass.
 // replaceQueued swaps a waiting record of the same node for a newer one.
 func (f *SearchFilter) replaceQueued(n *enode.Node) {
 	for _, q := range f.queues {
@@ -117,6 +115,8 @@ func (f *SearchFilter) replaceQueued(n *enode.Node) {
 	}
 }
 
+// Release returns the results that still wait, one registrar at a time. It is
+// called at the end of a search pass.
 func (f *SearchFilter) Release() []*enode.Node {
 	out := f.mix(true)
 	f.queues, f.registrars = nil, make(map[enode.ID]*registrarQueue)
