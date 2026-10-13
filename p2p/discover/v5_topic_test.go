@@ -110,6 +110,30 @@ func capableRecord(t *testing.T, port int) *enode.Node {
 	return ln.Node()
 }
 
+// waitForTable waits until the node's routing table holds every node in nodes,
+// so a search's first pass seeds from all of them.
+func waitForTable(t *testing.T, node *UDPv5, nodes []*enode.Node) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		known := make(map[enode.ID]bool)
+		for _, n := range node.AllNodes() {
+			known[n.ID()] = true
+		}
+		have := 0
+		for _, n := range nodes {
+			if known[n.ID()] {
+				have++
+			}
+		}
+		if have == len(nodes) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("node knows %d of %d nodes", have, len(nodes))
+		}
+	}
+}
+
 // TestTopicSearchMixesRegistrars runs a search over five registrars that each
 // hold two ads of their own: the first five results come from five different
 // registrars, and every ad is returned.
@@ -140,25 +164,7 @@ func TestTopicSearchMixesRegistrars(t *testing.T) {
 	}
 	searcher := startLocalhostV5(t, Config{Bootnodes: append([]*enode.Node{node0.Self()}, regs...)})
 	all = append(all, searcher)
-	// The first pass seeds from the routing table: wait until it holds every registrar.
-	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
-		known := make(map[enode.ID]bool)
-		for _, n := range searcher.AllNodes() {
-			known[n.ID()] = true
-		}
-		have := 0
-		for _, r := range regs {
-			if known[r.ID()] {
-				have++
-			}
-		}
-		if have == len(regs) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("searcher knows %d of %d registrars", have, len(regs))
-		}
-	}
+	waitForTable(t, searcher, regs)
 
 	it := searcher.TopicSearch(testTopic1, 0)
 	defer it.Close()
@@ -183,6 +189,58 @@ func TestTopicSearchMixesRegistrars(t *testing.T) {
 	sortByID(ads)
 	if err := checkNodesEqual(found, ads); err != nil {
 		t.Error(err)
+	}
+}
+
+// TestTopicSearchStopsWhenUnread checks that a search sends no queries while
+// its consumer leaves results unread, and queries again once they are read.
+func TestTopicSearchStopsWhenUnread(t *testing.T) {
+	node0 := startLocalhostV5(t, Config{})
+	var all []*UDPv5
+	defer func() {
+		node0.Close()
+		for _, n := range all {
+			n.Close()
+		}
+	}()
+	var regs []*enode.Node
+	nads := 0
+	for i := 0; i < 6; i++ {
+		reg := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+		all = append(all, reg)
+		regs = append(regs, reg.Self())
+		var own []*enode.Node
+		for j := 0; j < 16; j++ {
+			own = append(own, capableRecord(t, 41000+100*i+j))
+		}
+		seedTopicTable(t, reg, testTopic1, own...)
+		nads += len(own)
+	}
+	searcher := startLocalhostV5(t, Config{Bootnodes: append([]*enode.Node{node0.Self()}, regs...)})
+	all = append(all, searcher)
+	waitForTable(t, searcher, regs)
+
+	it := searcher.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	s := it.(*topicSearchIterator).search
+	if !it.Next() {
+		t.Fatal("no first result")
+	}
+	// The consumer stops reading. The queries must stop too.
+	time.Sleep(2 * time.Second)
+	sent := s.queries.Load()
+	time.Sleep(3 * time.Second)
+	if again := s.queries.Load(); again != sent {
+		t.Fatalf("%d queries sent while results waited unread", again-sent)
+	}
+	if sent > uint64(len(regs)+2) {
+		t.Fatalf("%d queries before the consumer stopped, want at most %d", sent, len(regs)+2)
+	}
+	// Reading again lets the search go on: every ad comes out.
+	for n := 1; n < nads; n++ {
+		if !it.Next() {
+			t.Fatalf("search ended after %d results, want %d", n, nads)
+		}
 	}
 }
 
