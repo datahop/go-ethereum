@@ -69,7 +69,7 @@ type Search struct {
 	cycle        int               // search-cycle index, set by runLoop each rollover
 	origin       map[enode.ID]bool // first-seen source: true=referral, false=DHT
 	resultBuffer []*enode.Node
-	resultSeen   map[enode.ID]struct{}
+	resultSeen   map[enode.ID]uint64 // record seq of every result so far
 }
 
 type searchBucket struct {
@@ -89,7 +89,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		cfg:         cfg,
 		log:         cfg.Log.New("topic", topic),
 		topic:       topic,
-		resultSeen:  make(map[enode.ID]struct{}),
+		resultSeen:  make(map[enode.ID]uint64),
 		asked:       NewSearchFilter(cfg),
 		spare:       make(map[enode.ID]*enode.Node),
 		bucketCheck: make(map[int]struct{}, cfg.SearchTableDepth),
@@ -409,10 +409,7 @@ func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) int 
 			continue
 		}
 		s.cfg.Log.Debug("Added topic search result", "topic", s.topic, "fromid", from.ID(), "rid", n.ID())
-		_, seen := s.resultSeen[n.ID()]
-		if !seen {
-			s.resultSeen[n.ID()] = struct{}{}
-			s.resultBuffer = append(s.resultBuffer, n)
+		if s.addResult(n) {
 			newAds++
 		}
 	}
@@ -430,13 +427,22 @@ func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) int 
 func (s *Search) AddResults(nodes []*enode.Node) int {
 	added := 0
 	for _, n := range nodes {
-		if _, seen := s.resultSeen[n.ID()]; !seen && n.ID() != s.cfg.Self {
-			s.resultSeen[n.ID()] = struct{}{}
-			s.resultBuffer = append(s.resultBuffer, n)
+		if n.ID() != s.cfg.Self && s.addResult(n) {
 			added++
 		}
 	}
 	return added
+}
+
+// addResult buffers a result unless the node was already a result of this
+// search with a record at least as new. It reports whether n was buffered.
+func (s *Search) addResult(n *enode.Node) bool {
+	if seq, seen := s.resultSeen[n.ID()]; seen && seq >= n.Seq() {
+		return false
+	}
+	s.resultSeen[n.ID()] = n.Seq()
+	s.resultBuffer = append(s.resultBuffer, n)
+	return true
 }
 
 // PeekResult returns a node from the result set.

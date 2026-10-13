@@ -89,6 +89,7 @@ func (f *SearchFilter) Take(registrar enode.ID, results []*enode.Node) []*enode.
 			continue
 		}
 		if _, ok := f.queued[n.ID()]; ok {
+			f.replaceQueued(n)
 			continue
 		}
 		if q == nil {
@@ -100,6 +101,20 @@ func (f *SearchFilter) Take(registrar enode.ID, results []*enode.Node) []*enode.
 		q.nodes = append(q.nodes, n)
 	}
 	return f.mix(false)
+}
+
+// replaceQueued swaps a waiting record of the same node for a newer one.
+func (f *SearchFilter) replaceQueued(n *enode.Node) {
+	for _, q := range f.queues {
+		for i, old := range q.nodes {
+			if old.ID() == n.ID() {
+				if n.Seq() > old.Seq() {
+					q.nodes[i] = n
+				}
+				return
+			}
+		}
+	}
 }
 
 // Dropped returns how many results Take has dropped as recently returned.

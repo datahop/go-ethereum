@@ -129,8 +129,103 @@ func TestTopicSearchAdaptive(t *testing.T) {
 	}
 }
 
-// seedTopicTable registers the given nodes for a topic in t's local topic
-// table. The work runs on the dispatch goroutine, which owns the table.
+// capableRecord is the signed record of a TopDisc node that is not running:
+// a registrar can hold it as an ad without it joining anyone's routing table.
+func capableRecord(t *testing.T, port int) *enode.Node {
+	db, err := enode.OpenDB("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.Close)
+	ln := enode.NewLocalNode(db, newkey())
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	ln.SetStaticIP(net.IP{127, 0, 0, 1})
+	ln.SetFallbackUDP(port)
+	return ln.Node()
+}
+
+// waitForTable waits until the node's routing table holds every node in nodes,
+// so a search's first pass seeds from all of them.
+func waitForTable(t *testing.T, node *UDPv5, nodes []*enode.Node) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		known := make(map[enode.ID]bool)
+		for _, n := range node.AllNodes() {
+			known[n.ID()] = true
+		}
+		have := 0
+		for _, n := range nodes {
+			if known[n.ID()] {
+				have++
+			}
+		}
+		if have == len(nodes) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("node knows %d of %d nodes", have, len(nodes))
+		}
+	}
+}
+
+// TestTopicSearchMixesRegistrars runs a search over five registrars that each
+// hold two ads of their own: the first five results come from five different
+// registrars, and every ad is returned.
+func TestTopicSearchMixesRegistrars(t *testing.T) {
+	node0 := startLocalhostV5(t, Config{})
+	var all []*UDPv5
+	defer func() {
+		node0.Close()
+		for _, n := range all {
+			n.Close()
+		}
+	}()
+	regOf := make(map[enode.ID]int)
+	var regs []*enode.Node
+	var ads []*enode.Node
+	for i := 0; i < 5; i++ {
+		reg := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+		all = append(all, reg)
+		regs = append(regs, reg.Self())
+		var own []*enode.Node
+		for j := 0; j < 2; j++ {
+			ad := capableRecord(t, 40000+10*i+j)
+			own = append(own, ad)
+			regOf[ad.ID()] = i
+		}
+		seedTopicTable(t, reg, testTopic1, own...)
+		ads = append(ads, own...)
+	}
+	searcher := startLocalhostV5(t, Config{Bootnodes: append([]*enode.Node{node0.Self()}, regs...)})
+	all = append(all, searcher)
+	waitForTable(t, searcher, regs)
+
+	it := searcher.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	timeout := time.AfterFunc(30*time.Second, it.Close)
+	defer timeout.Stop()
+	// Results are checked in the order the search hands them out.
+	var found []*enode.Node
+	for len(found) < len(ads) && it.Next() {
+		found = append(found, it.Node())
+	}
+	if len(found) != len(ads) {
+		t.Fatalf("got %d results, want %d", len(found), len(ads))
+	}
+	seen := make(map[int]bool)
+	for _, n := range found[:5] {
+		seen[regOf[n.ID()]] = true
+	}
+	if len(seen) != 5 {
+		t.Fatalf("first five results came from %d registrars, want 5", len(seen))
+	}
+	sortByID(found)
+	sortByID(ads)
+	if err := checkNodesEqual(found, ads); err != nil {
+		t.Error(err)
+	}
+}
+
 // TestTopicSearchNoRepeats checks that a search doesn't return a node again
 // in later passes until the ad lifetime has passed.
 func TestTopicSearchNoRepeats(t *testing.T) {
@@ -162,8 +257,8 @@ func TestTopicSearchNoRepeats(t *testing.T) {
 	if it.Node().ID() != node0.Self().ID() {
 		t.Fatalf("unexpected result %v", it.Node().ID())
 	}
-	if d := time.Since(first); d < lifetime-regloopMinTime {
-		t.Fatalf("node returned again after %v, want at least %v", d, lifetime-regloopMinTime)
+	if d := time.Since(first); d < lifetime-200*time.Millisecond {
+		t.Fatalf("node returned again after %v, want about %v", d, lifetime)
 	}
 	st := it.(*topicSearchIterator).Stats()
 	if st.Passes < 2 || st.Yielded < 2 || st.Filtered < 1 || st.Queries < st.Passes || st.Contacted < 1 || st.Received < st.Yielded {
@@ -171,6 +266,8 @@ func TestTopicSearchNoRepeats(t *testing.T) {
 	}
 }
 
+// seedTopicTable registers the given nodes for a topic in t's local topic
+// table. The work runs on the dispatch goroutine, which owns the table.
 func seedTopicTable(t *testing.T, node *UDPv5, topic topicindex.TopicID, regs ...*enode.Node) {
 	t.Helper()
 	done := make(chan struct{})

@@ -177,3 +177,23 @@ func TestSearchFilterMixShared(t *testing.T) {
 		t.Fatalf("released %d results, want the two that were not returned before", len(got))
 	}
 }
+
+// A newer record of a node that already waits in a queue replaces the waiting one.
+func TestSearchFilterMixNewerRecord(t *testing.T) {
+	f := NewSearchFilter(Config{Clock: new(mclock.Simulated)})
+	regA, regB := newNode().ID(), newNode().ID()
+	id := newNode().ID()
+	old, updated := nodeWithSeq(id, intIP(1), 1), nodeWithSeq(id, intIP(1), 2)
+
+	f.Take(regA, []*enode.Node{old})
+	f.Take(regB, []*enode.Node{updated})
+	got := f.Release()
+	if len(got) != 1 || got[0].Seq() != 2 {
+		t.Fatalf("released %v, want the record with seq 2", got)
+	}
+	f.Take(regA, []*enode.Node{updated})
+	f.Take(regB, []*enode.Node{old})
+	if got := f.Release(); len(got) != 1 || got[0].Seq() != 2 {
+		t.Fatalf("an older record replaced the waiting one: %v", got)
+	}
+}

@@ -576,13 +576,6 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			}
 		}
 		if n := state.PeekResult(); n != nil {
-			if s.resultFilter.Seen(n) {
-				state.PopResult()
-				s.contactsMu.Lock()
-				s.stats.Filtered++
-				s.contactsMu.Unlock()
-				continue
-			}
 			result = n
 			resultCh = s.resultCh
 		}
