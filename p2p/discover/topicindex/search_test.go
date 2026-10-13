@@ -654,3 +654,52 @@ func TestSearchAdaptiveFailedAsked(t *testing.T) {
 		t.Fatal("failed node re-admitted by the next pass")
 	}
 }
+
+// TestSearchAdaptiveFarHelperPullsOut checks that a search that walked past
+// the populated region comes back: full replies from a farther bucket pull it
+// out to the bucket before them, and a farther bucket at the floor pulls it out
+// to that bucket, while sparse replies from a farther bucket are ignored.
+func TestSearchAdaptiveFarHelperPullsOut(t *testing.T) {
+	far := func() *Search {
+		s := NewSearch(topic1, testConfig(t))
+		s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 247, 2, 1)) // bucket 9
+		s.SetActiveBucket(12)
+		return s
+	}
+	s := far()
+	reply(t, s, 9, 2)
+	reply(t, s, 9, 2)
+	if s.ActiveBucket() != 12 {
+		t.Fatalf("active bucket %d after sparse replies from a far helper, want 12", s.ActiveBucket())
+	}
+	s = far()
+	reply(t, s, 9, 16)
+	reply(t, s, 9, 16)
+	if s.ActiveBucket() != 8 {
+		t.Fatalf("active bucket %d after full replies from bucket 9, want 8", s.ActiveBucket())
+	}
+	s = far()
+	reply(t, s, 9, 8)
+	reply(t, s, 9, 9)
+	if s.ActiveBucket() != 9 {
+		t.Fatalf("active bucket %d after replies at the floor from bucket 9, want 9", s.ActiveBucket())
+	}
+}
+
+// TestSearchAdaptiveAskedByID checks that an asked node with a newer record
+// is still not asked again within the ad lifetime.
+func TestSearchAdaptiveAskedByID(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+	n := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)[0]
+	s.AddNodes(nil, []*enode.Node{n})
+	s.AddQueryResults(s.QueryTarget(), nil)
+
+	next := NewSearch(topic1, config)
+	next.SetAskedFilter(s.asked)
+	bumped := nodeWithSeq(n.ID(), n.IP(), n.Seq()+1)
+	next.AddNodes(nil, []*enode.Node{bumped})
+	if next.buckets[0].contains(n.ID()) {
+		t.Fatal("asked node re-admitted with a newer record")
+	}
+}
