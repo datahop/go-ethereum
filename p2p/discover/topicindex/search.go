@@ -325,6 +325,11 @@ func (s *Search) addResult(n *enode.Node) {
 	s.resultBuffer = append(s.resultBuffer, n)
 }
 
+// Buffered returns the number of results waiting to be handed out.
+func (s *Search) Buffered() int {
+	return len(s.resultBuffer)
+}
+
 // PeekResult returns a node from the result set.
 // When no result is available, it returns nil.
 func (s *Search) PeekResult() *enode.Node {

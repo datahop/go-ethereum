@@ -19,6 +19,7 @@ package discover
 import (
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -222,6 +223,9 @@ func shuffleNodes(nodes []*enode.Node) {
 const (
 	regloopMinTime    = 2 * time.Second
 	searchPassBackoff = time.Minute
+	// searchUnreadLimit is the number of results that may wait unread before
+	// the search stops querying. It resumes when the consumer reads again.
+	searchUnreadLimit = topicindex.TopicNodesLimit
 )
 
 // pause ensures that top-level registration loop iterations take at least regLoopMinTime.
@@ -377,9 +381,11 @@ type topicSearch struct {
 	queryCh      chan topicQueryJob
 	queryRespCh  chan topicQueryResult
 	resultCh     chan *enode.Node
+	readCh       chan struct{} // the consumer took a result
 	resultFilter *topicindex.SearchFilter
 	activeBucket int
-	idlePasses   int // passes in a row that returned nothing new
+	idlePasses   int           // passes in a row that returned nothing new
+	queries      atomic.Uint64 // TOPICQUERY requests sent
 	askedFilter  *topicindex.SearchFilter
 
 	newNodesCh  chan *enode.Node
@@ -398,6 +404,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
+		readCh:      make(chan struct{}, 1),
 	}
 
 	s.newNodesCh = make(chan *enode.Node, 100)
@@ -499,8 +506,12 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		released  bool // the pass is over and its waiting results are handed out
 	)
 
+	// Results the consumer has not read wait in the search's buffer or in the
+	// result channel. The search sends no query while searchUnreadLimit of them
+	// wait, and ends no pass while any waits.
+	unread := func() int { return state.Buffered() + len(s.resultCh) }
 	for {
-		if queryCh == nil && state.IsDone() {
+		if queryCh == nil && unread() == 0 && state.IsDone() {
 			// The pass is over: hand out the results that still wait in the filter.
 			if held := s.resultFilter.Release(); len(held) > 0 {
 				state.AddResults(held)
@@ -510,7 +521,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			s.config.Log.Debug("Topic search rollover", "topic", s.topic, "nres", nresults)
 			return false, nresults
 		}
-		if queryCh == nil && !released {
+		if queryCh == nil && !released && unread() < searchUnreadLimit {
 			target := state.QueryTarget()
 			if target != nil {
 				queryCh = s.queryCh
@@ -530,7 +541,11 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		case <-s.newNodesCh:
 			// Drained here as in pause: the table's feed sends under its
 			// mutex and would stall every lookup once the channel is full.
+		case <-s.readCh:
+			// The consumer read a result: the unread count changed.
+
 		case queryCh <- nextQuery:
+			s.queries.Add(1)
 		case resp := <-s.queryRespCh:
 			switch {
 			case resp.err == errClosed:
@@ -616,6 +631,10 @@ func newTopicSearchIterator(sys *topicSystem, search *topicSearch, ch <-chan *en
 func (tsi *topicSearchIterator) Next() bool {
 	n, ok := <-tsi.ch
 	tsi.cur = n
+	select {
+	case tsi.search.readCh <- struct{}{}:
+	default:
+	}
 	return ok
 }
 
