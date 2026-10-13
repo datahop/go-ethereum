@@ -591,3 +591,66 @@ func TestSearchResultNewerRecord(t *testing.T) {
 func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 	s.AddReply(from, results, len(results))
 }
+
+// TestSearchAdaptiveHelperKeepsBucket checks that replies from helpers outside
+// the active neighbourhood do not move the search: a rare topic settled close
+// to the hash is not dragged back out by empty replies from far seeds.
+func TestSearchAdaptiveHelperKeepsBucket(t *testing.T) {
+	s := NewSearch(topic1, testConfig(t))
+	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 255, 2, 1)) // bucket 1
+	s.SetActiveBucket(8)
+	reply(t, s, 1, 0)
+	reply(t, s, 1, 0)
+	if s.ActiveBucket() != 8 {
+		t.Fatalf("active bucket %d after two helper replies, want 8", s.ActiveBucket())
+	}
+	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 249, 2, 10)) // bucket 7
+	reply(t, s, 7, 16)
+	reply(t, s, 7, 16)
+	if s.ActiveBucket() != 6 {
+		t.Fatalf("active bucket %d after full replies from a neighbour, want 6", s.ActiveBucket())
+	}
+}
+
+// TestSearchAdaptivePassBudget checks that a pass ends after searchPassQueries
+// replies even while every reply refills the active bucket.
+func TestSearchAdaptivePassBudget(t *testing.T) {
+	s := NewSearch(topic1, testConfig(t))
+	s.SetActiveBucket(3)
+	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 253, 2, 1))
+	for i := 0; i < searchPassQueries; i++ {
+		n := s.QueryTarget()
+		if n == nil {
+			t.Fatalf("no target at query %d", i)
+		}
+		s.AddReply(n, nil, searchYieldFloor)
+		s.AddNodes(n, nodesAtDistanceFrom(enode.ID(topic1), 253, 1, 100+i))
+	}
+	if n := s.QueryTarget(); n != nil {
+		t.Fatalf("query %v offered after the pass budget", n.ID())
+	}
+	if !s.IsDone() {
+		t.Fatal("pass not done after its query budget")
+	}
+	if s.ActiveBucket() != 3 {
+		t.Fatalf("active bucket %d, want 3 kept for the next pass", s.ActiveBucket())
+	}
+}
+
+// TestSearchAdaptiveFailedAsked checks that a node whose query failed is not
+// asked again by the next pass within the ad lifetime.
+func TestSearchAdaptiveFailedAsked(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+	nodes := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
+	s.AddNodes(nil, nodes)
+	n := s.QueryTarget()
+	s.HandleErrorResponse(n, errors.New("timeout"))
+
+	next := NewSearch(topic1, config)
+	next.SetAskedFilter(s.asked)
+	next.AddNodes(nil, nodes)
+	if next.buckets[0].contains(n.ID()) {
+		t.Fatal("failed node re-admitted by the next pass")
+	}
+}

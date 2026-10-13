@@ -41,6 +41,9 @@ const (
 	searchYieldWindow = 4
 	searchMaxJump     = 4
 	searchAuxRadius   = 1
+	// searchPassQueries bounds a pass: aux nodes can refill the active bucket
+	// for as long as the search keeps asking.
+	searchPassQueries = 32
 )
 
 // Search is the state associated with searching for a single topic.
@@ -57,6 +60,7 @@ type Search struct {
 	spare     map[enode.ID]*enode.Node // asked nodes, one re-asked per pass if nothing else is left
 	spareUsed bool
 	advanced  bool // the pass moved the active bucket at its end
+	replies   int  // queries answered or failed in this pass
 
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
@@ -141,10 +145,11 @@ func (s *Search) IsDone() bool {
 	return true
 }
 
-// activeDone reports whether the active bucket is exhausted, ending the pass.
+// activeDone reports whether the pass is over: the active bucket is exhausted
+// with enough replies to place the next pass, or the pass spent its queries.
 func (s *Search) activeDone() bool {
 	b := &s.buckets[s.active]
-	return len(b.new) == 0 && len(b.yield) >= 2
+	return s.replies >= searchPassQueries || (len(b.new) == 0 && len(b.yield) >= 2)
 }
 
 // BucketsWithFreeSpace gives the distances from the topic within
@@ -206,6 +211,8 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 // IP-limit entry.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
+	s.replies++
+	s.asked.Add(from)
 	s.removeNode(from.ID())
 }
 
@@ -254,7 +261,8 @@ func (s *Search) observe(bi int, ads int) {
 	if len(b.yield) > searchYieldWindow {
 		b.yield = b.yield[1:]
 	}
-	if len(b.yield) < 2 {
+	// A helper outside the active neighbourhood does not move the search.
+	if len(b.yield) < 2 || bi < s.active-searchAuxRadius || bi > s.active+searchAuxRadius {
 		return
 	}
 	sorted := append([]int(nil), b.yield...)
@@ -276,6 +284,7 @@ func (s *Search) observe(bi int, ads int) {
 // AddReply adds the results of a topic query response. ads is the number of
 // ads the response carried, the density sample that moves the active bucket.
 func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) {
+	s.replies++
 	s.observe(s.bucketIndex(from.ID()), ads)
 	s.asked.Add(from)
 	s.removeNode(from.ID())
