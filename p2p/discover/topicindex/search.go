@@ -180,7 +180,7 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
 
-		if s.asked.Seen(n) {
+		if s.asked.Has(n.ID()) {
 			s.spare[id] = n
 			continue
 		}
@@ -261,24 +261,35 @@ func (s *Search) observe(bi int, ads int) {
 	if len(b.yield) > searchYieldWindow {
 		b.yield = b.yield[1:]
 	}
-	// A helper outside the active neighbourhood does not move the search.
-	if len(b.yield) < 2 || bi < s.active-searchAuxRadius || bi > s.active+searchAuxRadius {
+	if len(b.yield) < 2 {
 		return
 	}
 	sorted := append([]int(nil), b.yield...)
 	slices.Sort(sorted)
 	lower, upper := sorted[(len(sorted)-1)/2], sorted[len(sorted)/2]
+	var next int
 	switch {
 	case lower >= TopicNodesLimit:
-		s.active = max(0, bi-1)
+		next = max(0, bi-1)
 	case upper >= searchYieldFloor:
-		s.active = bi
+		next = bi
 	case upper == 0:
-		s.active = min(len(s.buckets)-1, bi+searchMaxJump)
+		next = min(len(s.buckets)-1, bi+searchMaxJump)
 	default:
 		jump := int(math.Ceil(math.Log2(float64(searchYieldFloor) / float64(upper))))
-		s.active = min(len(s.buckets)-1, bi+min(jump, searchMaxJump))
+		next = min(len(s.buckets)-1, bi+min(jump, searchMaxJump))
 	}
+	// Ads get denser toward the topic, so a helper farther out than the
+	// active bucket can only pull the search out, and one closer in can only
+	// push it in.
+	switch {
+	case bi >= s.active-searchAuxRadius && bi <= s.active+searchAuxRadius:
+	case bi < s.active && next <= bi:
+	case bi > s.active && next > bi:
+	default:
+		return
+	}
+	s.active = next
 }
 
 // AddReply adds the results of a topic query response. ads is the number of
