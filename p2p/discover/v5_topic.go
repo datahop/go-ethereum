@@ -220,13 +220,7 @@ func shuffleNodes(nodes []*enode.Node) {
 	})
 }
 
-const (
-	regloopMinTime    = 2 * time.Second
-	searchPassBackoff = time.Minute
-	// searchUnreadLimit is the number of results that may wait unread before
-	// the search stops querying. It resumes when the consumer reads again.
-	searchUnreadLimit = topicindex.TopicNodesLimit
-)
+const regloopMinTime = 2 * time.Second
 
 // pause ensures that top-level registration loop iterations take at least regLoopMinTime.
 // This prevents the loop from running too hot when the local node table is very empty.
@@ -370,6 +364,14 @@ func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 }
 
 // topicSearch handles searching in a single topic.
+const (
+	// searchPassBackoff caps the gap between passes that change nothing.
+	searchPassBackoff = time.Minute
+	// searchUnreadLimit is the number of results that may wait unread before
+	// the search stops querying. It resumes when the consumer reads again.
+	searchUnreadLimit = topicindex.TopicNodesLimit
+)
+
 type topicSearch struct {
 	topic  topicindex.TopicID
 	opid   uint64
@@ -384,8 +386,8 @@ type topicSearch struct {
 	readCh       chan struct{} // the consumer took a result
 	resultFilter *topicindex.SearchFilter
 	activeBucket int
-	idlePasses   int           // passes in a row that returned nothing new
-	queries      atomic.Uint64 // TOPICQUERY requests sent
+	idlePasses   int           // passes in a row that neither returned anything new nor moved the active bucket
+	queries      atomic.Uint64 // TOPICQUERY requests sent, for statistics
 	askedFilter  *topicindex.SearchFilter
 
 	newNodesCh  chan *enode.Node
