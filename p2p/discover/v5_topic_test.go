@@ -226,6 +226,62 @@ func TestTopicSearchMixesRegistrars(t *testing.T) {
 	}
 }
 
+// TestTopicSearchStopsWhenUnread checks that a search sends no queries while
+// its consumer leaves results unread, and queries again once they are read.
+func TestTopicSearchStopsWhenUnread(t *testing.T) {
+	node0 := startLocalhostV5(t, Config{})
+	var all []*UDPv5
+	defer func() {
+		node0.Close()
+		for _, n := range all {
+			n.Close()
+		}
+	}()
+	var regs []*enode.Node
+	nads := 0
+	for i := 0; i < 6; i++ {
+		reg := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+		all = append(all, reg)
+		regs = append(regs, reg.Self())
+		var own []*enode.Node
+		for j := 0; j < 16; j++ {
+			own = append(own, capableRecord(t, 41000+100*i+j))
+		}
+		seedTopicTable(t, reg, testTopic1, own...)
+		nads += len(own)
+	}
+	searcher := startLocalhostV5(t, Config{Bootnodes: append([]*enode.Node{node0.Self()}, regs...)})
+	all = append(all, searcher)
+	waitForTable(t, searcher, regs)
+
+	it := searcher.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	queries := func() int {
+		n, _ := it.(*topicSearchIterator).Contacts()
+		return n
+	}
+	if !it.Next() {
+		t.Fatal("no first result")
+	}
+	// The consumer stops reading. The queries must stop too.
+	time.Sleep(time.Second)
+	sent := queries()
+	time.Sleep(2 * time.Second)
+	if again := queries(); again != sent {
+		t.Fatalf("%d queries sent while results waited unread", again-sent)
+	}
+	// At most every registrar and the bootnode: nothing was asked twice.
+	if sent > len(regs)+1 {
+		t.Fatalf("%d queries before the consumer stopped, want at most %d", sent, len(regs)+1)
+	}
+	// Reading again lets the search go on: every ad comes out.
+	for n := 1; n < nads; n++ {
+		if !it.Next() {
+			t.Fatalf("search ended after %d results, want %d", n, nads)
+		}
+	}
+}
+
 // TestTopicSearchNoRepeats checks that a search doesn't return a node again
 // in later passes until the ad lifetime has passed.
 func TestTopicSearchNoRepeats(t *testing.T) {
@@ -313,19 +369,25 @@ func TestTopicSearchPassGap(t *testing.T) {
 	s := &topicSearch{config: topicindex.Config{SearchPassBackoff: 9 * time.Second}}
 	want := []time.Duration{4 * time.Second, 8 * time.Second, 9 * time.Second, 9 * time.Second}
 	for i, w := range want {
-		if got := s.passGap(0); got != w {
+		if got := s.passGap(0, false); got != w {
 			t.Fatalf("empty pass %d: gap %v, want %v", i+1, got, w)
 		}
 	}
-	if got := s.passGap(3); got != regloopMinTime {
+	if got := s.passGap(3, false); got != regloopMinTime {
 		t.Fatalf("pass with results: gap %v, want %v", got, regloopMinTime)
 	}
-	if got := s.passGap(0); got != 4*time.Second {
+	if got := s.passGap(0, false); got != 4*time.Second {
 		t.Fatalf("empty pass after a reset: gap %v, want 4s", got)
+	}
+	if got := s.passGap(0, true); got != regloopMinTime {
+		t.Fatalf("empty pass that moved the active bucket: gap %v, want %v", got, regloopMinTime)
+	}
+	if got := s.passGap(0, false); got != 4*time.Second {
+		t.Fatalf("empty pass after a move: gap %v, want 4s", got)
 	}
 	s = &topicSearch{config: topicindex.Config{SearchPassBackoff: -1}}
 	for i := 0; i < 3; i++ {
-		if got := s.passGap(0); got != regloopMinTime {
+		if got := s.passGap(0, false); got != regloopMinTime {
 			t.Fatalf("back-off disabled: gap %v, want %v", got, regloopMinTime)
 		}
 	}
@@ -333,7 +395,7 @@ func TestTopicSearchPassGap(t *testing.T) {
 	s = &topicSearch{config: topicindex.Config{}}
 	want = []time.Duration{4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, time.Minute, time.Minute}
 	for i, w := range want {
-		if got := s.passGap(0); got != w {
+		if got := s.passGap(0, false); got != w {
 			t.Fatalf("default back-off, empty pass %d: gap %v, want %v", i+1, got, w)
 		}
 	}

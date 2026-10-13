@@ -588,6 +588,9 @@ func TestSearchAdaptiveIsDone(t *testing.T) {
 	if s.IsDone() {
 		t.Fatal("done while results are buffered")
 	}
+	if n := s.QueryTarget(); n != nil {
+		t.Fatalf("query to %v after the active bucket was exhausted; the pass would end with it in flight", n.ID())
+	}
 	for s.PeekResult() != nil {
 		s.PopResult()
 	}
@@ -709,5 +712,126 @@ func TestSearchAdaptiveSpare(t *testing.T) {
 	next.AddQueryResults(helper, nil)
 	if n := next.QueryTarget(); n == nil || n.ID() != fresh[0].ID() {
 		t.Fatalf("walk did not resume from the aux node, got %v", n)
+	}
+}
+
+// TestSearchAdaptiveHelperKeepsBucket checks that replies from helpers outside
+// the active neighbourhood do not move the search: a rare topic settled close
+// to the hash is not dragged back out by empty replies from far seeds.
+func TestSearchAdaptiveHelperKeepsBucket(t *testing.T) {
+	config := testConfig(t)
+	config.SearchYieldFloor = 8
+	s := NewSearch(topic1, config)
+	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 255, 2, 1)) // bucket 1
+	s.SetActiveBucket(8)
+	reply(t, s, 1, 0)
+	reply(t, s, 1, 0)
+	if s.ActiveBucket() != 8 {
+		t.Fatalf("active bucket %d after two helper replies, want 8", s.ActiveBucket())
+	}
+	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 249, 2, 10)) // bucket 7
+	reply(t, s, 7, 16)
+	reply(t, s, 7, 16)
+	if s.ActiveBucket() != 6 {
+		t.Fatalf("active bucket %d after full replies from a neighbour, want 6", s.ActiveBucket())
+	}
+}
+
+// TestSearchAdaptivePassBudget checks that a pass ends after searchPassQueries
+// replies even while every reply refills the active bucket.
+func TestSearchAdaptivePassBudget(t *testing.T) {
+	config := testConfig(t)
+	config.SearchYieldFloor = 8
+	s := NewSearch(topic1, config)
+	s.SetActiveBucket(3)
+	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 253, 2, 1))
+	for i := 0; i < searchPassQueries; i++ {
+		n := s.QueryTarget()
+		if n == nil {
+			t.Fatalf("no target at query %d", i)
+		}
+		s.AddReply(n, nil, config.SearchYieldFloor)
+		s.AddNodes(n, nodesAtDistanceFrom(enode.ID(topic1), 253, 1, 100+i))
+	}
+	if n := s.QueryTarget(); n != nil {
+		t.Fatalf("query %v offered after the pass budget", n.ID())
+	}
+	if !s.IsDone() {
+		t.Fatal("pass not done after its query budget")
+	}
+	if s.ActiveBucket() != 3 {
+		t.Fatalf("active bucket %d, want 3 kept for the next pass", s.ActiveBucket())
+	}
+}
+
+// TestSearchAdaptiveFailedAsked checks that a node whose query failed is not
+// asked again by the next pass within the ad lifetime.
+func TestSearchAdaptiveFailedAsked(t *testing.T) {
+	config := testConfig(t)
+	config.SearchYieldFloor = 8
+	s := NewSearch(topic1, config)
+	nodes := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
+	s.AddNodes(nil, nodes)
+	n := s.QueryTarget()
+	s.HandleErrorResponse(n, errors.New("timeout"))
+
+	next := NewSearch(topic1, config)
+	next.SetAskedFilter(s.asked)
+	next.AddNodes(nil, nodes)
+	if next.buckets[0].contains(n.ID()) {
+		t.Fatal("failed node re-admitted by the next pass")
+	}
+}
+
+// TestSearchAdaptiveFarHelperPullsOut checks that a search that walked past
+// the populated region comes back: full replies from a farther bucket pull it
+// out to the bucket before them, and a farther bucket at the floor pulls it out
+// to that bucket, while sparse replies from a farther bucket are ignored.
+func TestSearchAdaptiveFarHelperPullsOut(t *testing.T) {
+	far := func() *Search {
+		config := testConfig(t)
+		config.SearchYieldFloor = 8
+		config.SearchTableDepth = 18
+		s := NewSearch(topic1, config)
+		s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 247, 2, 1)) // bucket 9
+		s.SetActiveBucket(12)
+		return s
+	}
+	s := far()
+	reply(t, s, 9, 2)
+	reply(t, s, 9, 2)
+	if s.ActiveBucket() != 12 {
+		t.Fatalf("active bucket %d after sparse replies from a far helper, want 12", s.ActiveBucket())
+	}
+	s = far()
+	reply(t, s, 9, 16)
+	reply(t, s, 9, 16)
+	if s.ActiveBucket() != 8 {
+		t.Fatalf("active bucket %d after full replies from bucket 9, want 8", s.ActiveBucket())
+	}
+	s = far()
+	reply(t, s, 9, 8)
+	reply(t, s, 9, 9)
+	if s.ActiveBucket() != 9 {
+		t.Fatalf("active bucket %d after replies at the floor from bucket 9, want 9", s.ActiveBucket())
+	}
+}
+
+// TestSearchAdaptiveAskedByID checks that an asked node with a newer record
+// is still not asked again within the ad lifetime.
+func TestSearchAdaptiveAskedByID(t *testing.T) {
+	config := testConfig(t)
+	config.SearchYieldFloor = 8
+	s := NewSearch(topic1, config)
+	n := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)[0]
+	s.AddNodes(nil, []*enode.Node{n})
+	s.AddQueryResults(s.QueryTarget(), nil)
+
+	next := NewSearch(topic1, config)
+	next.SetAskedFilter(s.asked)
+	bumped := nodeWithSeq(n.ID(), n.IP(), n.Seq()+1)
+	next.AddNodes(nil, []*enode.Node{bumped})
+	if next.buckets[0].contains(n.ID()) {
+		t.Fatal("asked node re-admitted with a newer record")
 	}
 }

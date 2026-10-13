@@ -36,6 +36,9 @@ const (
 	// and the most buckets one estimate may move the search.
 	searchYieldWindow = 4
 	searchMaxJump     = 4
+	// searchPassQueries bounds a pass: aux nodes can refill the active bucket
+	// for as long as the search keeps asking.
+	searchPassQueries = 32
 )
 
 // Search is the state associated with searching for a single topic.
@@ -64,6 +67,7 @@ type Search struct {
 	spareUsed bool
 	advanced  bool // the pass moved the active bucket at its end
 	sampled   bool // the pass added its bucket occupancy to the statistics
+	replies   int  // queries answered or failed in this pass
 
 	bucketCheck  map[int]struct{}
 	cycle        int               // search-cycle index, set by runLoop each rollover
@@ -176,10 +180,11 @@ func (s *Search) IsDone() bool {
 	return true
 }
 
-// activeDone reports whether the active bucket is exhausted, ending the pass.
+// activeDone reports whether the pass is over: the active bucket is exhausted
+// with enough replies to place the next pass, or the pass spent its queries.
 func (s *Search) activeDone() bool {
 	b := &s.buckets[s.active]
-	return len(b.new) == 0 && len(b.yield) >= 2
+	return s.replies >= searchPassQueries || (len(b.new) == 0 && len(b.yield) >= 2)
 }
 
 // BucketsWithFreeSpace gives n distances from the topic at which
@@ -224,7 +229,7 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
 
-		if s.adaptive() && s.asked.Seen(n) {
+		if s.adaptive() && s.asked.Has(n.ID()) {
 			s.spare[id] = n
 			continue
 		}
@@ -269,6 +274,10 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 // IP-limit entry.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
+	s.replies++
+	if s.adaptive() {
+		s.asked.Add(from)
+	}
 	s.removeNode(from.ID())
 }
 
@@ -363,17 +372,30 @@ func (s *Search) observe(bi int, ads int) {
 	sorted := append([]int(nil), b.yield...)
 	slices.Sort(sorted)
 	lower, upper := sorted[(len(sorted)-1)/2], sorted[len(sorted)/2]
+	var next int
 	switch {
 	case lower >= s.cfg.TopicNodesLimit:
-		s.active = max(0, bi-1)
+		next = max(0, bi-1)
 	case upper >= s.cfg.SearchYieldFloor:
-		s.active = bi
+		next = bi
 	case upper == 0:
-		s.active = min(len(s.buckets)-1, bi+searchMaxJump)
+		next = min(len(s.buckets)-1, bi+searchMaxJump)
 	default:
 		jump := int(math.Ceil(math.Log2(float64(s.cfg.SearchYieldFloor) / float64(upper))))
-		s.active = min(len(s.buckets)-1, bi+min(jump, searchMaxJump))
+		next = min(len(s.buckets)-1, bi+min(jump, searchMaxJump))
 	}
+	// Ads get denser toward the topic, so a helper farther out than the
+	// active bucket can only pull the search out, and one closer in can only
+	// push it in.
+	r := max(1, s.cfg.SearchAuxRadius)
+	switch {
+	case bi >= s.active-r && bi <= s.active+r:
+	case bi < s.active && next <= bi:
+	case bi > s.active && next > bi:
+	default:
+		return
+	}
+	s.active = next
 }
 
 // AddQueryResults adds the response nodes for a topic query to the table.
@@ -393,6 +415,7 @@ func (s *Search) RecordReach(from *enode.Node, ads []*enode.Node) {
 // taken from it. It is the density sample of an adaptive search. AddReply
 // returns how many results were new to this search.
 func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) int {
+	s.replies++
 	b := s.bucket(from.ID())
 	b.setAsked(from)
 	b.numRequests++
@@ -443,6 +466,11 @@ func (s *Search) addResult(n *enode.Node) bool {
 	s.resultSeen[n.ID()] = n.Seq()
 	s.resultBuffer = append(s.resultBuffer, n)
 	return true
+}
+
+// Buffered returns the number of results waiting to be handed out.
+func (s *Search) Buffered() int {
+	return len(s.resultBuffer)
 }
 
 // PeekResult returns a node from the result set.

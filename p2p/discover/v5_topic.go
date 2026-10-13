@@ -387,9 +387,10 @@ type topicSearch struct {
 	queryCh      chan topicQueryJob
 	queryRespCh  chan topicQueryResult
 	resultCh     chan *enode.Node
+	readCh       chan struct{} // the consumer took a result
 	resultFilter *topicindex.SearchFilter
 	activeBucket int                      // where the last adaptive pass settled
-	idlePasses   int                      // passes in a row that returned nothing new
+	idlePasses   int                      // passes in a row that neither returned anything new nor moved the active bucket
 	askedFilter  *topicindex.SearchFilter // nodes adaptive passes have queried
 
 	newNodesCh  chan *enode.Node
@@ -444,6 +445,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
+		readCh:      make(chan struct{}, 1),
 		contacted:   make(map[enode.ID]struct{}),
 	}
 
@@ -494,19 +496,21 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		s.contactsMu.Unlock()
 
 		exit, nresults := s.run(sys, state)
+		moved := state.ActiveBucket() != s.activeBucket
 		s.activeBucket = state.ActiveBucket()
 		if exit {
 			return
 		}
-		gap = s.passGap(nresults)
+		gap = s.passGap(nresults, moved)
 	}
 }
 
 // passGap is the minimum length of the next pass: regloopMinTime, doubling
-// after every pass that returned nothing new, up to SearchPassBackoff.
-func (s *topicSearch) passGap(nresults int) time.Duration {
+// after every pass that neither returned anything new nor moved the active
+// bucket, up to SearchPassBackoff.
+func (s *topicSearch) passGap(nresults int, moved bool) time.Duration {
 	backoff := s.config.PassBackoff()
-	if nresults > 0 || backoff <= 0 {
+	if nresults > 0 || moved || backoff <= 0 {
 		s.idlePasses = 0
 		return regloopMinTime
 	}
@@ -553,8 +557,13 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 	)
 	lastActive := state.ActiveBucket()
 
+	// Results the consumer has not read wait in the search's buffer or in the
+	// result channel. The search sends no query while TopicNodesLimit of them
+	// wait, and ends no pass while any waits.
+	unreadLimit, _ := s.config.ResponseLimits()
+	unread := func() int { return state.Buffered() + len(s.resultCh) }
 	for {
-		if queryCh == nil && state.IsDone() {
+		if queryCh == nil && unread() == 0 && state.IsDone() {
 			// The pass is over: hand out what the registrar limit held back.
 			if held := s.resultFilter.Release(); len(held) > 0 {
 				added := state.AddResults(held)
@@ -567,7 +576,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			s.config.Log.Debug("Topic search rollover", "topic", s.topic, "nres", nresults)
 			return false, nresults
 		}
-		if queryCh == nil && !released {
+		if queryCh == nil && !released && unread() < unreadLimit {
 			target := state.QueryTarget()
 			if target != nil {
 				queryCh = s.queryCh
@@ -583,6 +592,9 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		select {
 		case <-s.quit:
 			return true, nresults
+
+		case <-s.readCh:
+			// The consumer read a result: the unread count changed.
 
 		case queryCh <- nextQuery:
 			s.contactsMu.Lock()
@@ -614,8 +626,8 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				dropped := s.resultFilter.Dropped()
 				taken := s.resultFilter.Take(resp.src.ID(), topicNodes)
 				dropped = s.resultFilter.Dropped() - dropped
-				// The density sample is the size of the reply, not what Take let through.
-				added := state.AddReply(resp.src, taken, len(resp.topicNodes))
+				// The density sample is the capable ads of the reply, not what Take let through.
+				added := state.AddReply(resp.src, taken, len(topicNodes))
 				// AddReply first frees the node's slot for an aux node.
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 				s.contactsMu.Lock()
@@ -708,6 +720,10 @@ func newTopicSearchIterator(sys *topicSystem, search *topicSearch, ch <-chan *en
 func (tsi *topicSearchIterator) Next() bool {
 	n, ok := <-tsi.ch
 	tsi.cur = n
+	select {
+	case tsi.search.readCh <- struct{}{}:
+	default:
+	}
 	return ok
 }
 
