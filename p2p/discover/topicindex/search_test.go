@@ -213,26 +213,6 @@ func TestSearchHandleErrorResponse(t *testing.T) {
 	}
 }
 
-// TestSearchRepliedNodeFreesIP verifies that a node that replied leaves the
-// table and releases its IP-limit entry, so a same-/24 replacement is admitted.
-func TestSearchRepliedNodeFreesIP(t *testing.T) {
-	config := testConfig(t)
-	s := NewSearch(topic1, config)
-
-	nodes := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
-	n := nodes[0]
-	s.AddNodes(nil, nodes)
-	s.AddQueryResults(n, nil)
-	if s.buckets[0].contains(n.ID()) {
-		t.Fatal("node still in the table after its reply")
-	}
-	replacement := nodeAtDistance(enode.ID(topic1), 256, n.IP())
-	s.AddNodes(nil, []*enode.Node{replacement})
-	if !s.buckets[0].contains(replacement.ID()) {
-		t.Fatal("replacement with the replied node's IP was not admitted (IP slot leaked)")
-	}
-}
-
 // This checks (de)queueing of topic search results: results come out of the
 // buffer in the order they were received.
 func TestSearchResultsTracking(t *testing.T) {
@@ -531,10 +511,10 @@ func TestSearchAdaptiveWalkedDry(t *testing.T) {
 	if s.NextPassBucket() != 1 {
 		t.Fatalf("next pass at %d after walking bucket 0 dry, want 1", s.NextPassBucket())
 	}
-	// At the closest bucket with no ads seen, the next pass starts wide again.
+	// At the closest bucket, unasked, the next pass stays to ask it.
 	s.SetActiveBucket(len(s.buckets) - 1)
-	if !s.IsDone() || s.NextPassBucket() != 0 {
-		t.Fatalf("next pass at %d, want 0 from the closest bucket of an empty topic", s.NextPassBucket())
+	if !s.IsDone() || s.NextPassBucket() != len(s.buckets)-1 {
+		t.Fatalf("next pass at %d, want to stay at the closest bucket until it is asked", s.NextPassBucket())
 	}
 }
 
@@ -799,9 +779,16 @@ func TestSearchAdaptiveNoReaskInPass(t *testing.T) {
 // the far end, so a topic that gets its first advertisers later is found.
 func TestSearchAdaptiveEmptyTopicRestartsWide(t *testing.T) {
 	s := adaptiveSearch(t)
-	s.SetActiveBucket(len(s.buckets) - 1)
+	last := len(s.buckets) - 1
+	s.SetActiveBucket(last)
+	// Landing at the closest bucket is not enough: it has to be asked.
+	if got := s.NextPassBucket(); got != last {
+		t.Fatalf("next pass at %d with the closest bucket unasked, want %d", got, last)
+	}
+	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(s.topic), s.buckets[last].dist, 1, 70))
+	reply(t, s, last, 0)
 	if got := s.NextPassBucket(); got != 0 {
-		t.Fatalf("next pass at %d after an empty pass at the closest bucket, want 0", got)
+		t.Fatalf("next pass at %d after an empty reply at the closest bucket, want 0", got)
 	}
 	s.SetActiveBucket(3)
 	if got := s.NextPassBucket(); got != 4 {
@@ -959,5 +946,47 @@ func TestSearchAdaptiveSpareAskedFromTable(t *testing.T) {
 				t.Fatalf("node %v asked again in the pass it was asked", target.ID())
 			}
 		})
+	}
+}
+
+// A node that answered keeps its subnet counted against the bucket's IP
+// limit for the pass: its slot is free, but not for a node from its own /24.
+func TestSearchAdaptiveRepliedNodeKeepsSubnet(t *testing.T) {
+	s := NewSearch(topic1, testConfig(t))
+	first := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
+	s.AddNodes(nil, first)
+	n := reply(t, s, 0, 0)
+	same := nodeWithSeq(nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 2)[0].ID(), n.IP(), 1)
+	s.AddNodes(n, []*enode.Node{same})
+	if s.buckets[0].contains(same.ID()) {
+		t.Fatal("a node from the replied node's subnet took its slot")
+	}
+	other := nodeWithSeq(nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 3)[0].ID(), intIP(9), 1)
+	s.AddNodes(n, []*enode.Node{other})
+	if !s.buckets[0].contains(other.ID()) {
+		t.Fatal("a node from another subnet was refused")
+	}
+}
+
+// An active bucket whose nodes all failed gave no sample: the pass goes on
+// through its neighbours, and the next pass stays on that bucket.
+func TestSearchAdaptiveFailuresKeepBucket(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(3)
+	for i := 0; i < 2; i++ {
+		n := s.QueryTarget()
+		if n == nil || s.bucketIndex(n.ID()) != 3 {
+			t.Fatalf("query %d went to %v, want bucket 3", i, n)
+		}
+		s.HandleErrorResponse(n, errors.New("timeout"))
+	}
+	for n := s.QueryTarget(); n != nil; n = s.QueryTarget() {
+		s.HandleErrorResponse(n, errors.New("timeout"))
+	}
+	if !s.IsDone() {
+		t.Fatal("pass not done with every query failed")
+	}
+	if got := s.NextPassBucket(); got != 3 {
+		t.Fatalf("next pass at %d, want 3: a bucket that was asked but gave no sample is kept", got)
 	}
 }

@@ -387,7 +387,7 @@ type topicSearch struct {
 	resultFilter *topicindex.SearchFilter
 	activeBucket int
 	idlePasses   int           // passes in a row that neither returned anything new nor moved the active bucket
-	queries      atomic.Uint64 // TOPICQUERY requests sent, for statistics
+	queries      atomic.Uint64 // TOPICQUERY requests sent, read by tests
 	asked        *topicindex.AskedSet
 
 	newNodesCh  chan *enode.Node
@@ -553,7 +553,6 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			// Drained here as in pause: the table's feed sends under its
 			// mutex and would stall every lookup once the channel is full.
 		case <-s.readCh:
-			// The consumer read a result: the unread count changed.
 
 		case queryCh <- nextQuery:
 			s.queries.Add(1)
@@ -578,12 +577,13 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				}
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
-				// AddReply first frees the node's slot for an aux node.
+				// The density sample is the reply's size as the registrar sent
+				// it, before the searcher's own filtering drops records.
 				ads := filterTopicDiscovery(resp.topicNodes)
 				if resp.err != nil {
-					state.AddPartialReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(ads))
+					state.AddPartialReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(resp.topicNodes))
 				} else {
-					state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(ads))
+					state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(resp.topicNodes))
 				}
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 			}

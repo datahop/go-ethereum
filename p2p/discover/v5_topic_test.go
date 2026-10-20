@@ -828,9 +828,17 @@ func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 		t.Fatalf("next pass at %d, want 6: an empty pass that ran dry walks one bucket in", s.activeBucket)
 	}
 	state.SetActiveBucket(1 << 10) // clamps to the closest bucket
-	if s.nextPass(state) || s.activeBucket != 0 {
-		t.Fatalf("next pass at %d after an empty pass at the closest bucket, want 0", s.activeBucket)
+	last := state.ActiveBucket()
+	if s.nextPass(state) || s.activeBucket != last {
+		t.Fatalf("next pass at %d with the closest bucket unasked, want %d", s.activeBucket, last)
 	}
+	// Asked at the closest bucket with nothing found: start wide again.
+	near := enode.SignNull(new(enr.Record), enode.ID{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
+	state.AddReply(near, nil, 0)
+	if s.nextPass(state) || s.activeBucket != 0 {
+		t.Fatalf("next pass at %d after an empty reply at the closest bucket, want 0", s.activeBucket)
+	}
+	state = topicindex.NewSearch(topicindex.TopicID{1}, topicindex.Config{})
 	state.SetActiveBucket(0)
 	state.AddReply(enode.SignNull(new(enr.Record), enode.ID{7}), nil, 3)
 	s.activeBucket = 2

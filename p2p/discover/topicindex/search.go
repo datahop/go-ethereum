@@ -74,10 +74,11 @@ type Search struct {
 }
 
 type searchBucket struct {
-	dist     int
-	new      map[enode.ID]*enode.Node
-	yield    []int // ad counts of the last searchYieldWindow replies
-	answered int   // replies from this bucket in the pass, cut short or not
+	dist   int
+	new    map[enode.ID]*enode.Node
+	yield  []int // ad counts of the last searchYieldWindow replies
+	done   int   // replies from this bucket in the pass, cut short or not
+	failed int   // queries to this bucket that failed in the pass
 
 	ips netutil.DistinctNetSet
 }
@@ -151,17 +152,17 @@ func (s *Search) IsDone() bool {
 }
 
 // NextPassBucket returns the bucket the next pass starts from once this one
-// is done: the active one, or the next one in when the pass ran out of
-// nodes to ask before any density sample placed the active bucket. Empty
-// replies push the search toward the topic, so a topic with no ads at all
-// walks to the closest bucket; from there such a pass starts the next one
-// wide again, so that advertisers appearing later are found.
+// is done: the active one, or the next one in when the pass ran dry before
+// the bucket could decide, unless every query to it failed and its density
+// is still unknown. A pass that asked the closest bucket and saw no ads
+// anywhere starts wide again, so that an empty topic's first advertisers
+// are found.
 func (s *Search) NextPassBucket() int {
 	next := s.active
-	if !s.activeDone() && !s.placed {
+	if b := &s.buckets[s.active]; !s.activeDone() && !s.placed && !(b.done == 0 && b.failed > 0) {
 		next = min(s.active+1, len(s.buckets)-1)
 	}
-	if s.ads == 0 && next == len(s.buckets)-1 {
+	if last := len(s.buckets) - 1; s.ads == 0 && next == last && s.buckets[last].done > 0 {
 		return 0
 	}
 	return next
@@ -171,7 +172,7 @@ func (s *Search) NextPassBucket() int {
 // with enough replies to place the next pass, or the pass spent its queries.
 func (s *Search) activeDone() bool {
 	b := &s.buckets[s.active]
-	return s.replies >= searchPassQueries || (len(b.new) == 0 && b.answered >= 2)
+	return s.replies >= searchPassQueries || (len(b.new) == 0 && b.done >= 2)
 }
 
 // BucketsWithFreeSpace gives the distances from the topic within
@@ -233,22 +234,23 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 }
 
 // HandleErrorResponse drops a failed node from the table for the rest of the
-// pass, freeing its slot and IP-limit entry. It is not recorded as asked
-// beyond the pass: a node that did not answer may have dropped one packet,
-// and the next pass may ask it again, while a dead one leaves the routing
-// table on its own.
+// pass. It is not recorded as asked beyond the pass: one dropped packet is no
+// reason to lose a registrar for an ad lifetime.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
 	s.replies++
 	s.askedNow[from.ID()] = struct{}{}
 	delete(s.spare, from.ID())
-	s.removeNode(from.ID())
+	s.buckets[s.bucketIndex(from.ID())].failed++
+	s.removeNode(from.ID(), false)
 }
 
-// removeNode drops a node and releases its IP-limit entry.
-func (s *Search) removeNode(id enode.ID) {
+// removeNode drops a node from its bucket. With keepIP its subnet stays
+// counted against the bucket's IP limit for the pass, so a node that
+// answered cannot be replaced by another from its own subnet.
+func (s *Search) removeNode(id enode.ID, keepIP bool) {
 	b := s.bucket(id)
-	if n, ok := b.new[id]; ok {
+	if n, ok := b.new[id]; ok && !keepIP {
 		if ip := n.IP(); ip != nil && !netutil.IsLAN(ip) {
 			b.ips.Remove(ip)
 		}
@@ -348,12 +350,12 @@ func (s *Search) addReply(from *enode.Node, results []*enode.Node, ads int, samp
 	s.ads += ads
 	s.askedNow[from.ID()] = struct{}{}
 	delete(s.spare, from.ID())
-	s.buckets[s.bucketIndex(from.ID())].answered++
+	s.buckets[s.bucketIndex(from.ID())].done++
 	if sample {
 		s.observe(s.bucketIndex(from.ID()), ads)
 	}
 	s.asked.Add(from.ID())
-	s.removeNode(from.ID())
+	s.removeNode(from.ID(), true)
 
 	// The results may come from several registrars when the filter mixes
 	// them, so they are not attributed to from.

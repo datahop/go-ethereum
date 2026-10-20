@@ -196,12 +196,12 @@ Algorithm 3 (TOPICNODES is the orthogonal results channel).
 |---|---|---|---|
 | Per-topic table B(s) initialized from B(node.id) | Alg 2 line 1 | `Search` with `searchTableDepth=18`, seeded from `tab.allNodes()` | ✅ |
 | K_lookup queries per bucket | Alg 2 line 4 | `SearchBucketSize=8` max queried per bucket | ✅ |
-| Walk buckets far → close (b0 to bm-1) | Alg 2 line 3 | `Search.QueryTarget` selects from buckets with unqueried nodes; stops at first bucket with no prior requests | ✅ |
+| Walk buckets far → close (b0 to bm-1) | Alg 2 line 3 | `Search.QueryTarget` asks the active bucket, moved by the ad density of the replies (`Search.observe`), and its neighbours when it is empty | ✅ adaptive |
 | Populate B(s) from query response neighbours (Alg 3) | Alg 2 line 15 | `Search.AddNodes(resp.src, resp.auxNodes)` on TOPICQUERY response | ✅ |
 | Stop at F_lookup distinct advertisers | Alg 2 line 8 | No F_lookup gate. Search runs until `IsDone` (buckets exhausted + no recent novel nodes). Caller-side `numNodes` parameter on the `TopicSearch` RPC provides an equivalent early-exit at the consumer level. | ⚠️ |
 | Per-bucket IP/subnet cap | not in paper | `searchBucket.ips`, `searchBucketSubnet=24`, `searchBucketIPLimit=1` — same defence as the registration side | ➕ on original topdisc code |
 | One-per-bucket-per-RPC rule | not in paper | `Search.bucketCheck` map — defends against a single TOPICQUERY response stuffing many sybils into one bucket | ➕ ⚠️ broken in topdisc — write missing, rule never triggers (Issue #47) |
-| Self filter (skip own ID) | not in paper | `cfg.Self` filtered in `Search.AddNodes` and `Search.AddQueryResults` | ➕ on original topdisc code |
+| Self filter (skip own ID) | not in paper | `cfg.Self` filtered in `Search.AddNodes` and `Search.AddResults` | ➕ on original topdisc code |
 | Search.IsDone termination | not in paper | `topicindex/search.IsDone` — defends against a search hanging indefinitely when the bucket `new` set drains with attempts still in flight | ➕ ❌ Issue #27 |
 | Active topicSearch lifecycle | not in paper | `topicSystem.search` map + ctx-cancel into `topicQuery` — defends against `UDPv5.Close` leaving search goroutines / TOPICQUERY RPCs running past shutdown | ➕ ❌ Issues #28, #30 |
 | Active random table revalidation | not in paper | periodic background task over search buckets — same defence scope as registration side | ➕ ❌ Issue #21 |

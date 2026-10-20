@@ -184,13 +184,6 @@ func (f *SearchFilter) Seen(n *enode.Node) bool {
 	return n.Seq() <= e.seq || e.returned
 }
 
-// Has reports whether the node has an entry, whatever its record.
-func (f *SearchFilter) Has(id enode.ID) bool {
-	f.expire()
-	_, ok := f.seen[id]
-	return ok
-}
-
 // Add records that n was returned. Every ID keeps a single entry, so the
 // filter never holds more than limit entries.
 func (f *SearchFilter) Add(n *enode.Node) {
