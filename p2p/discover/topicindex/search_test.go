@@ -18,6 +18,7 @@ package topicindex
 
 import (
 	"errors"
+	"net"
 	"slices"
 	"testing"
 	"time"
@@ -595,6 +596,45 @@ func TestSearchAdaptiveHelperKeepsBucket(t *testing.T) {
 	reply(t, s, 7, 16)
 	if s.ActiveBucket() != 6 {
 		t.Fatalf("active bucket %d after full replies from a neighbour, want 6", s.ActiveBucket())
+	}
+}
+
+// TestSearchAdaptivePassBudget checks that a pass ends after searchPassQueries
+// queries whatever their outcome, while every query refills the active bucket.
+func TestSearchAdaptivePassBudget(t *testing.T) {
+	outcomes := map[string]func(s *Search, n *enode.Node){
+		"full":    func(s *Search, n *enode.Node) { s.AddReply(n, nil, TopicNodesLimit, TopicNodesLimit) },
+		"partial": func(s *Search, n *enode.Node) { s.AddPartialReply(n, nil, 0, searchYieldFloor-1) },
+		"failed":  func(s *Search, n *enode.Node) { s.HandleErrorResponse(n, errors.New("timeout")) },
+	}
+	for name, outcome := range outcomes {
+		t.Run(name, func(t *testing.T) {
+			s := NewSearch(topic1, testConfig(t))
+			s.SetActiveBucket(3)
+			// Distinct /24s, so the IP limit admits every node of the pool.
+			fresh := func(i int) *enode.Node {
+				ip := net.IP{byte(1 + i/256), byte(i % 256), 3, 4}
+				return nodeAtDistance(enode.ID(topic1), s.buckets[s.ActiveBucket()].dist, ip)
+			}
+			s.AddNodes(nil, []*enode.Node{fresh(0), fresh(1)})
+			for i := 0; i < searchPassQueries; i++ {
+				n := s.QueryTarget()
+				if n == nil {
+					t.Fatalf("no target at query %d", i)
+				}
+				outcome(s, n)
+				s.AddNodes(n, []*enode.Node{fresh(2 + i)})
+			}
+			if n := s.QueryTarget(); n != nil {
+				t.Fatalf("query %v offered after the pass budget", n.ID())
+			}
+			if !s.IsDone() {
+				t.Fatal("pass not done after its query budget")
+			}
+			if got := s.NextPassBucket(); got != s.ActiveBucket() {
+				t.Fatalf("next pass at %d, want the active bucket %d", got, s.ActiveBucket())
+			}
+		})
 	}
 }
 
