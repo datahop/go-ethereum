@@ -519,16 +519,15 @@ func TestSearchAdaptiveWalkedDry(t *testing.T) {
 }
 
 // TestSearchAdaptiveSpare checks that a pass with every known node already
-// asked re-asks up to searchSpareQueries of them to fetch aux nodes, and
-// walks on from any unasked node those bring.
+// asked re-asks one of them, once, to fetch aux nodes, and walks on from any
+// unasked node those bring.
 func TestSearchAdaptiveSpare(t *testing.T) {
 	config := testConfig(t)
 	s := NewSearch(topic1, config)
-	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, searchSpareQueries+1, 1)
+	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 2, 1)
 	s.AddNodes(nil, seeds)
-	for range seeds {
-		reply(t, s, 0, 0)
-	}
+	reply(t, s, 0, 0)
+	reply(t, s, 0, 0)
 
 	next := NewSearch(topic1, config)
 	next.SetAsked(s.asked)
@@ -536,17 +535,12 @@ func TestSearchAdaptiveSpare(t *testing.T) {
 	if next.IsDone() {
 		t.Fatal("done with spare nodes still to ask")
 	}
-	// Every seed is a spare: the pass re-asks searchSpareQueries of them.
-	var helper *enode.Node
-	for i := 0; i < searchSpareQueries; i++ {
-		n := next.QueryTarget()
-		if n == nil {
-			t.Fatalf("spare %d not offered", i+1)
-		}
-		helper = n
+	helper := next.QueryTarget()
+	if helper == nil {
+		t.Fatal("no spare node offered")
 	}
 	if n := next.QueryTarget(); n != nil {
-		t.Fatalf("spare %d offered, want at most %d per pass", searchSpareQueries+1, searchSpareQueries)
+		t.Fatalf("second spare %v offered in the same pass", n.ID())
 	}
 	fresh := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 50)
 	next.AddNodes(helper, fresh)
@@ -601,31 +595,6 @@ func TestSearchAdaptiveHelperKeepsBucket(t *testing.T) {
 	reply(t, s, 7, 16)
 	if s.ActiveBucket() != 6 {
 		t.Fatalf("active bucket %d after full replies from a neighbour, want 6", s.ActiveBucket())
-	}
-}
-
-// TestSearchAdaptivePassBudget checks that a pass ends after searchPassQueries
-// replies even while every reply refills the active bucket.
-func TestSearchAdaptivePassBudget(t *testing.T) {
-	s := NewSearch(topic1, testConfig(t))
-	s.SetActiveBucket(3)
-	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(topic1), 253, 2, 1))
-	for i := 0; i < searchPassQueries; i++ {
-		n := s.QueryTarget()
-		if n == nil {
-			t.Fatalf("no target at query %d", i)
-		}
-		s.AddReply(n, nil, searchYieldFloor, searchYieldFloor)
-		s.AddNodes(n, nodesAtDistanceFrom(enode.ID(topic1), 253, 1, 100+i))
-	}
-	if n := s.QueryTarget(); n != nil {
-		t.Fatalf("query %v offered after the pass budget", n.ID())
-	}
-	if !s.IsDone() {
-		t.Fatal("pass not done after its query budget")
-	}
-	if s.ActiveBucket() != 3 {
-		t.Fatalf("active bucket %d, want 3 kept for the next pass", s.ActiveBucket())
 	}
 }
 
@@ -834,45 +803,21 @@ func TestSearchAdaptiveConfirmedBucketHolds(t *testing.T) {
 	}
 }
 
-// Spares are re-asked longest unasked first, so the passes rotate through
-// them instead of re-asking the same few.
-func TestSearchAdaptiveSpareOrder(t *testing.T) {
+// The spare of a pass is the node asked longest ago, so the passes rotate
+// through the asked nodes instead of re-asking the same one.
+func TestSearchAdaptiveSpareRotation(t *testing.T) {
 	clock := new(mclock.Simulated)
 	config := testConfig(t)
 	config.Clock = clock
 	s := NewSearch(topic1, config)
 	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 3, 1)
 	s.AddNodes(nil, seeds)
-	var order []*enode.Node
-	for range seeds {
-		order = append(order, reply(t, s, 0, 0))
-		clock.Run(time.Second)
-	}
-
-	next := NewSearch(topic1, config)
-	next.SetAsked(s.asked)
-	next.AddNodes(nil, seeds)
-	for i, want := range order {
-		if got := next.QueryTarget(); got == nil || got.ID() != want.ID() {
-			t.Fatalf("spare %d is %v, want the one asked %d-th", i, got, i)
-		}
-	}
-}
-
-// Two passes over more spares than a pass re-asks cover all of them.
-func TestSearchAdaptiveSpareRotation(t *testing.T) {
-	clock := new(mclock.Simulated)
-	config := testConfig(t)
-	config.Clock = clock
-	s := NewSearch(topic1, config)
-	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 2*searchSpareQueries, 1)
-	s.AddNodes(nil, seeds)
 	for range seeds {
 		reply(t, s, 0, 0)
 		clock.Run(time.Second)
 	}
 	asked := map[enode.ID]int{}
-	for pass := 0; pass < 2; pass++ {
+	for pass := 0; pass < len(seeds); pass++ {
 		next := NewSearch(topic1, config)
 		next.SetAsked(s.asked)
 		next.AddNodes(nil, seeds)
@@ -884,7 +829,7 @@ func TestSearchAdaptiveSpareRotation(t *testing.T) {
 	}
 	for _, n := range seeds {
 		if asked[n.ID()] != 1 {
-			t.Fatalf("node asked %d times over two passes, want once each", asked[n.ID()])
+			t.Fatalf("node asked %d times over three passes, want once each", asked[n.ID()])
 		}
 	}
 }

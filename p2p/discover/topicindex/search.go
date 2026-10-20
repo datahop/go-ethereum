@@ -42,12 +42,6 @@ const (
 	searchYieldWindow = 4
 	searchMaxJump     = 4
 	searchAuxRadius   = 1
-	// searchPassQueries bounds a pass: aux nodes can refill the active bucket
-	// for as long as the search keeps asking.
-	searchPassQueries = 32
-	// searchSpareQueries is how many asked nodes a pass with nothing else left
-	// asks again, for their aux nodes and any ads they got since.
-	searchSpareQueries = 4
 )
 
 // Search is the state associated with searching for a single topic.
@@ -59,15 +53,14 @@ type Search struct {
 	// Note: search buckets are ordered far -> close.
 	buckets [searchTableDepth]searchBucket
 
-	active   int
-	start    int                      // the bucket this pass started at
-	asked    *AskedSet                // nodes queried within the last ad lifetime
-	spare    map[enode.ID]*enode.Node // asked nodes, re-asked longest unasked first if nothing else is left
-	spares   int                      // spares asked in this pass
-	placed   bool                     // a density sample placed the active bucket in this pass
-	replies  int                      // queries answered or failed in this pass
-	askedNow map[enode.ID]struct{}    // nodes that answered or failed in this pass, not asked again in it
-	ads      int                      // ads the replies of this pass carried
+	active    int
+	start     int                      // the bucket this pass started at
+	asked     *AskedSet                // nodes queried within the last ad lifetime
+	spare     map[enode.ID]*enode.Node // asked nodes; the longest unasked is re-asked once if nothing else is left
+	spareUsed bool                     // the pass re-asked its one spare
+	placed    bool                     // a density sample placed the active bucket in this pass
+	askedNow  map[enode.ID]struct{}    // nodes that answered or failed in this pass, not asked again in it
+	ads       int                      // ads the replies of this pass carried
 
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
@@ -157,7 +150,7 @@ func (s *Search) IsDone() bool {
 			return false
 		}
 	}
-	return s.spares >= searchSpareQueries || len(s.spare) == 0
+	return s.spareUsed || len(s.spare) == 0
 }
 
 // NextPassBucket returns the bucket the next pass starts from once this one
@@ -178,10 +171,10 @@ func (s *Search) NextPassBucket() int {
 }
 
 // activeDone reports whether the pass is over: the active bucket is exhausted
-// with enough replies to place the next pass, or the pass spent its queries.
+// with enough samples to place the next pass.
 func (s *Search) activeDone() bool {
 	b := &s.buckets[s.active]
-	return s.replies >= searchPassQueries || (len(b.new) == 0 && b.done >= 2)
+	return len(b.new) == 0 && len(b.yield) >= 2
 }
 
 // BucketsWithFreeSpace gives the distances from the topic within
@@ -247,7 +240,6 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 // reason to lose a registrar for an ad lifetime.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
-	s.replies++
 	s.askedNow[from.ID()] = struct{}{}
 	delete(s.spare, from.ID())
 	s.buckets[s.bucketIndex(from.ID())].failed++
@@ -285,7 +277,7 @@ func (s *Search) QueryTarget() *enode.Node {
 	}
 	// Spares go longest unasked first: their ads are the likeliest to have
 	// changed.
-	if s.spares < searchSpareQueries {
+	if !s.spareUsed {
 		var pick *enode.Node
 		var at mclock.AbsTime
 		for id, n := range s.spare {
@@ -294,7 +286,7 @@ func (s *Search) QueryTarget() *enode.Node {
 			}
 		}
 		if pick != nil {
-			s.spares++
+			s.spareUsed = true
 			delete(s.spare, pick.ID())
 			return pick
 		}
@@ -357,7 +349,6 @@ func (s *Search) AddPartialReply(from *enode.Node, results []*enode.Node, ads, s
 }
 
 func (s *Search) addReply(from *enode.Node, results []*enode.Node, ads, sent int, sample bool) {
-	s.replies++
 	s.ads += ads
 	s.askedNow[from.ID()] = struct{}{}
 	delete(s.spare, from.ID())
