@@ -814,3 +814,32 @@ func BenchmarkTable_findnodeByID(b *testing.B) {
 		})
 	}
 }
+
+// collectOnePerDist keeps looking past candidates the check rejects: a
+// distance whose first nodes lack the capability still yields the one that
+// has it.
+func TestTable_collectOnePerDistRejects(t *testing.T) {
+	transport := newPingRecorder()
+	tab, db := newTestTable(transport, Config{})
+	defer db.Close()
+	defer tab.close()
+
+	target := idAtDistance(tab.self().ID(), 256)
+	var last *enode.Node
+	for i := 0; i < 20; i++ {
+		n := nodeAtDistance(target, 250, net.IP{10, 9, byte(i), 1})
+		if tab.addFoundNode(n, true) {
+			last = n
+		}
+	}
+	if last == nil {
+		t.Fatal("no node inserted")
+	}
+	only := func(n *enode.Node) bool { return n.ID() == last.ID() }
+	for i := 0; i < 20; i++ {
+		got := tab.collectOnePerDist(target, []uint{250}, only)
+		if len(got) != 1 || got[0].ID() != last.ID() {
+			t.Fatalf("got %v, want the one node the check accepts", got)
+		}
+	}
+}
