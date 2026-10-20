@@ -276,9 +276,12 @@ func TestSearchAdaptiveIsDoneOnce(t *testing.T) {
 		if !s.IsDone() {
 			t.Fatal("empty search not done")
 		}
+		if got := s.ActiveBucket(); got != 3 {
+			t.Fatalf("IsDone moved the active bucket to %d", got)
+		}
 	}
-	if got := s.ActiveBucket(); got != 4 {
-		t.Fatalf("active bucket %d after the pass, want 4", got)
+	if got := s.NextPassBucket(); got != 4 {
+		t.Fatalf("next pass at %d, want 4: a pass that ran dry starts one bucket in", got)
 	}
 }
 
@@ -503,7 +506,7 @@ func TestSearchAdaptiveExplores(t *testing.T) {
 	}
 
 	next := NewSearch(topic1, config)
-	next.SetAskedFilter(s.asked)
+	next.SetAsked(s.asked)
 	next.AddNodes(nil, nodes)
 	if next.buckets[0].contains(asked.ID()) {
 		t.Fatal("asked node re-admitted by the next pass")
@@ -523,12 +526,12 @@ func TestSearchAdaptiveWalkedDry(t *testing.T) {
 	if !s.IsDone() {
 		t.Fatal("not done with the only candidate asked")
 	}
-	if s.ActiveBucket() != 1 {
-		t.Fatalf("active bucket %d after walking bucket 0 dry, want 1", s.ActiveBucket())
+	if s.NextPassBucket() != 1 {
+		t.Fatalf("next pass at %d after walking bucket 0 dry, want 1", s.NextPassBucket())
 	}
 	s.SetActiveBucket(len(s.buckets) - 1)
-	if !s.IsDone() || s.ActiveBucket() != len(s.buckets)-1 {
-		t.Fatalf("active bucket %d, want to stay at the closest bucket", s.ActiveBucket())
+	if !s.IsDone() || s.NextPassBucket() != len(s.buckets)-1 {
+		t.Fatalf("next pass at %d, want to stay at the closest bucket", s.NextPassBucket())
 	}
 }
 
@@ -544,7 +547,7 @@ func TestSearchAdaptiveSpare(t *testing.T) {
 	reply(t, s, 0, 0)
 
 	next := NewSearch(topic1, config)
-	next.SetAskedFilter(s.asked)
+	next.SetAsked(s.asked)
 	next.AddNodes(nil, seeds)
 	if next.IsDone() {
 		t.Fatal("done with spare nodes still to ask")
@@ -553,8 +556,12 @@ func TestSearchAdaptiveSpare(t *testing.T) {
 	if helper == nil {
 		t.Fatal("no spare node offered")
 	}
+	// Both seeds are spares: the pass may re-ask up to searchSpareQueries.
+	if n := next.QueryTarget(); n == nil || n.ID() == helper.ID() {
+		t.Fatalf("second spare not offered, got %v", n)
+	}
 	if n := next.QueryTarget(); n != nil {
-		t.Fatalf("second spare %v offered in the same pass", n.ID())
+		t.Fatalf("a third node %v offered with only two spares", n.ID())
 	}
 	fresh := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 50)
 	next.AddNodes(helper, fresh)
@@ -654,7 +661,7 @@ func TestSearchAdaptiveFailedAsked(t *testing.T) {
 	// One dropped packet must not exclude a registrar for an ad lifetime:
 	// the next pass asks it again.
 	next := NewSearch(topic1, config)
-	next.SetAskedFilter(s.asked)
+	next.SetAsked(s.asked)
 	next.AddNodes(nil, nodes)
 	if !next.buckets[0].contains(n.ID()) {
 		t.Fatal("failed node not re-admitted by the next pass")
@@ -702,7 +709,7 @@ func TestSearchAdaptiveAskedByID(t *testing.T) {
 	s.AddQueryResults(s.QueryTarget(), nil)
 
 	next := NewSearch(topic1, config)
-	next.SetAskedFilter(s.asked)
+	next.SetAsked(s.asked)
 	bumped := nodeWithSeq(n.ID(), n.IP(), n.Seq()+1)
 	next.AddNodes(nil, []*enode.Node{bumped})
 	if next.buckets[0].contains(n.ID()) {

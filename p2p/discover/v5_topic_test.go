@@ -822,8 +822,8 @@ func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 	if s.nextPass(state) {
 		t.Fatal("a pass without ads counted as a move")
 	}
-	if s.activeBucket != 5 {
-		t.Fatalf("next pass at %d, want 5: an empty pass keeps walking in", s.activeBucket)
+	if s.activeBucket != 6 {
+		t.Fatalf("next pass at %d, want 6: an empty pass that ran dry walks one bucket in", s.activeBucket)
 	}
 	state.SetActiveBucket(1 << 10) // clamps to the closest bucket
 	if s.nextPass(state) || s.activeBucket != 0 {
@@ -832,7 +832,7 @@ func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 	state.SetActiveBucket(0)
 	state.AddReply(enode.SignNull(new(enr.Record), enode.ID{7}), nil, 3)
 	s.activeBucket = 2
-	if !s.nextPass(state) || s.activeBucket != 0 {
-		t.Fatalf("next pass at %d after a pass with ads, want 0 and a move", s.activeBucket)
+	if !s.nextPass(state) || s.activeBucket != 1 {
+		t.Fatalf("next pass at %d after a pass with ads that ran dry, want 1 and a move", s.activeBucket)
 	}
 }

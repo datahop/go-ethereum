@@ -363,7 +363,6 @@ func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 	}
 }
 
-// topicSearch handles searching in a single topic.
 const (
 	// searchPassBackoff caps the gap between passes that change nothing.
 	searchPassBackoff = time.Minute
@@ -372,6 +371,7 @@ const (
 	searchUnreadLimit = topicindex.TopicNodesLimit
 )
 
+// topicSearch handles searching in a single topic.
 type topicSearch struct {
 	topic  topicindex.TopicID
 	opid   uint64
@@ -388,7 +388,7 @@ type topicSearch struct {
 	activeBucket int
 	idlePasses   int           // passes in a row that neither returned anything new nor moved the active bucket
 	queries      atomic.Uint64 // TOPICQUERY requests sent, for statistics
-	askedFilter  *topicindex.SearchFilter
+	asked        *topicindex.AskedSet
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -402,7 +402,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 		quit:         make(chan struct{}),
 		resultCh:     out,
 		resultFilter: topicindex.NewSearchFilter(sys.config),
-		askedFilter:  topicindex.NewSearchFilter(sys.config),
+		asked:        topicindex.NewAskedSet(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -440,7 +440,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 
 		state := topicindex.NewSearch(s.topic, s.config)
 		state.SetActiveBucket(s.activeBucket)
-		state.SetAskedFilter(s.askedFilter)
+		state.SetAsked(s.asked)
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
@@ -464,9 +464,9 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 // such a pass starts the next one wide again, and counts as idle so that the
 // back-off still grows.
 func (s *topicSearch) nextPass(state *topicindex.Search) (moved bool) {
-	next := state.ActiveBucket()
+	next := state.NextPassBucket()
 	if state.AdsSeen() == 0 {
-		if state.AtClosestBucket() {
+		if next == topicindex.SearchTableDepth-1 {
 			next = 0
 		}
 		s.activeBucket = next
