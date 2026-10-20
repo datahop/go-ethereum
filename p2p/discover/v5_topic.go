@@ -499,6 +499,9 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		case <-s.quit:
 			return true
 
+		case <-s.newNodesCh:
+			// Drained here as in pause: the table's feed sends under its
+			// mutex and would stall every lookup once the channel is full.
 		case queryCh <- nextQuery:
 		case resp := <-s.queryRespCh:
 			switch {

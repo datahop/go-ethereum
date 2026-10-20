@@ -678,3 +678,52 @@ func TestHandleRegtopicRecordIP(t *testing.T) {
 		}
 	})
 }
+
+// TestTopicSearchDrainsTableFeed checks that a search blocked on a consumer
+// that stops reading keeps draining the table's node feed: the feed sends
+// under the table mutex, so a full subscription channel would stall every
+// lookup. The result channel buffers 200 results, so the pass must carry more.
+func TestTopicSearchDrainsTableFeed(t *testing.T) {
+	node0 := startLocalhostV5(t, Config{})
+	var all []*UDPv5
+	defer func() {
+		node0.Close()
+		for _, n := range all {
+			n.Close()
+		}
+	}()
+	var regs []*enode.Node
+	for i := 0; i < 14; i++ {
+		reg := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+		all = append(all, reg)
+		regs = append(regs, reg.Self())
+		var own []*enode.Node
+		for j := 0; j < 16; j++ {
+			own = append(own, capableRecord(t, 41000+100*i+j))
+		}
+		seedTopicTable(t, reg, testTopic1, own...)
+	}
+	searcher := startLocalhostV5(t, Config{Bootnodes: append([]*enode.Node{node0.Self()}, regs...)})
+	all = append(all, searcher)
+
+	it := searcher.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	if !it.Next() {
+		t.Fatal("no first result")
+	}
+	// The consumer reads nothing more; the pass fills the result channel and
+	// the search waits on it. The feed must still get through.
+	time.Sleep(2 * time.Second)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 300; i++ {
+			searcher.tab.nodeFeed.Send(capableRecord(t, 43000+i))
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the table feed blocked behind the search's full subscription channel")
+	}
+}
