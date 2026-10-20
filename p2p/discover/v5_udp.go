@@ -46,7 +46,7 @@ const (
 	findnodeResultLimit     = 16 // applies in FINDNODE handler
 	totalNodesResponseLimit = 5  // applies in waitForNodes
 	regtopicNodesLimit      = 8
-	topicNodesResultLimit   = 16 // applies in TOPICQUERY handler
+	topicNodesResultLimit   = topicindex.TopicNodesLimit // applies in TOPICQUERY handler
 )
 
 // codecV5 is implemented by v5wire.Codec (and testCodec).
@@ -1376,7 +1376,7 @@ func (t *UDPv5) collectTopicAuxNodes(topic topicindex.TopicID, reqDist []uint, r
 		return topicindex.SupportsTopicDiscovery(n) && netutil.CheckRelayAddr(remoteIP, n.IPAddr()) == nil
 	}
 	// One node is returned per distance, so cap the requested distances to keep
-	// the response (and the scan) within regtopicNodesLimit.
+	// the response within regtopicNodesLimit.
 	if len(reqDist) > regtopicNodesLimit {
 		reqDist = reqDist[:regtopicNodesLimit]
 	}

@@ -80,6 +80,9 @@ func (cfg Config) withDefaults() Config {
 	return cfg
 }
 
+// TopicNodesLimit is the number of ads in a TOPICNODES reply.
+const TopicNodesLimit = 16
+
 // TopicID represents a topic.
 type TopicID [32]byte
 
