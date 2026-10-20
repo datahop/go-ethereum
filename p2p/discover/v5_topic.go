@@ -511,6 +511,8 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				if resp.err == errTimeout {
 					sys.transport.trackTopicRequest(resp.src, false)
 				}
+				// Results waiting in the filter may be due by now.
+				state.AddResults(s.resultFilter.Take(resp.src.ID(), nil))
 			default:
 				if resp.err != nil {
 					// Partial response: nodes arrived before the error, so the

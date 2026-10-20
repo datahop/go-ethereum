@@ -213,13 +213,10 @@ func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 	b.setAsked(from)
 	b.numRequests++
 
-	for _, n := range results {
-		if n.ID() == s.cfg.Self {
-			continue
-		}
-		s.cfg.Log.Debug("Added topic search result", "topic", s.topic, "fromid", from.ID(), "rid", n.ID())
-		s.addResult(n)
-	}
+	// The results may come from several registrars when the filter mixes
+	// them, so they are not attributed to from.
+	s.cfg.Log.Debug("Topic query answered", "topic", s.topic, "fromid", from.ID(), "n", len(results))
+	s.AddResults(results)
 }
 
 // AddResults adds nodes to the result set.
@@ -232,9 +229,9 @@ func (s *Search) AddResults(nodes []*enode.Node) {
 }
 
 // addResult buffers a result unless the node was already a result of this
-// search with a record at least as new.
+// search. A newer record of a node is left for the next pass.
 func (s *Search) addResult(n *enode.Node) {
-	if seq, seen := s.resultSeen[n.ID()]; seen && seq >= n.Seq() {
+	if _, seen := s.resultSeen[n.ID()]; seen {
 		return
 	}
 	s.resultSeen[n.ID()] = n.Seq()
