@@ -785,21 +785,15 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check fun
 		want[dist] = struct{}{}
 	}
 
-	// Gather a few candidates per distance, so repeated queries walk different
-	// nodes, and stop once every distance has enough: check decodes the
-	// record, so it runs on the picks, not on the whole table.
-	const perDist = 8
+	// Gather the candidates per distance, then pick at random among them so
+	// repeated queries walk different nodes: check decodes the record, so it
+	// runs on the picks until one passes, not on the whole table.
 	cands := make(map[uint][]*enode.Node, len(want))
-	short := len(want)
-	for bi := 0; bi < len(tab.buckets) && short > 0; bi++ {
+	for bi := 0; bi < len(tab.buckets); bi++ {
 		for _, n := range tab.buckets[bi].entries {
 			d := uint(enode.LogDist(target, n.ID()))
-			if _, ok := want[d]; !ok {
-				continue
-			}
-			cands[d] = append(cands[d], n.Node)
-			if len(cands[d]) == perDist {
-				short--
+			if _, ok := want[d]; ok {
+				cands[d] = append(cands[d], n.Node)
 			}
 		}
 	}

@@ -709,3 +709,21 @@ func TestSearchAdaptiveAskedByID(t *testing.T) {
 		t.Fatal("asked node re-admitted with a newer record")
 	}
 }
+
+// A reply cut short by an error carries no density sample: it neither moves
+// the active bucket nor counts toward the ads the pass saw.
+func TestSearchAdaptivePartialReplyNoSample(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(3)
+	reply(t, s, 3, 16)
+	before := s.ActiveBucket()
+	regs := nodesAtDistanceFrom(enode.ID(s.topic), s.buckets[3].dist, 1, 50)
+	s.AddNodes(nil, regs)
+	s.AddReply(regs[0], nil, -1)
+	if s.ActiveBucket() != before {
+		t.Fatalf("active bucket moved to %d on a partial reply", s.ActiveBucket())
+	}
+	if s.AdsSeen() != 16 {
+		t.Fatalf("ads seen %d, want the 16 of the full reply alone", s.AdsSeen())
+	}
+}

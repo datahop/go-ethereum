@@ -312,11 +312,14 @@ func (s *Search) observe(bi int, ads int) {
 }
 
 // AddReply adds the results of a topic query response. ads is the number of
-// ads the response carried, the density sample that moves the active bucket.
+// ads the response carried, the density sample that moves the active bucket;
+// a reply cut short, ads < 0, is no sample.
 func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) {
 	s.replies++
-	s.ads += ads
-	s.observe(s.bucketIndex(from.ID()), ads)
+	if ads >= 0 {
+		s.ads += ads
+		s.observe(s.bucketIndex(from.ID()), ads)
+	}
 	s.asked.Add(from)
 	s.removeNode(from.ID())
 

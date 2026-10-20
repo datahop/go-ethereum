@@ -588,9 +588,14 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				}
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
-				// AddReply first frees the node's slot for an aux node.
+				// AddReply first frees the node's slot for an aux node. A reply
+				// cut short by the error is no density sample.
 				ads := filterTopicDiscovery(resp.topicNodes)
-				state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(ads))
+				sample := len(ads)
+				if resp.err != nil {
+					sample = -1
+				}
+				state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), sample)
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 			}
 			queryCh = nil
