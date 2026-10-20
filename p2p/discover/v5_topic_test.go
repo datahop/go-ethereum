@@ -839,9 +839,10 @@ func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 	}
 }
 
-// TestTopicSearchRunPartialReply drives one pass of the run loop by hand: a
-// reply that carries ads but ends in an error reaches the state as a partial
-// reply, so its ads count and, below the floor, it is no density sample.
+// TestTopicSearchRunPartialReply drives one pass of the run loop by hand:
+// replies that carry ads but end in an error reach the state as partial
+// replies, so their ads count and, below the floor, they are no density
+// sample. Two of them would move the active bucket as samples.
 func TestTopicSearchRunPartialReply(t *testing.T) {
 	node := startLocalhostV5(t, Config{})
 	defer node.Close()
@@ -859,9 +860,17 @@ func TestTopicSearchRunPartialReply(t *testing.T) {
 		newNodesCh:   make(chan *enode.Node, 100),
 	}
 	state := topicindex.NewSearch(testTopic1, sys.config)
-	reg := capableRecord(t, 45000)
-	state.AddNodes(nil, []*enode.Node{reg})
 	active := state.ActiveBucket()
+	// Two registrars in the active bucket.
+	regs := map[enode.ID]*enode.Node{}
+	for port := 45000; len(regs) < 2; port++ {
+		if n := capableRecord(t, port); enode.LogDist(enode.ID(testTopic1), n.ID()) == 256-active {
+			regs[n.ID()] = n
+		}
+	}
+	for _, n := range regs {
+		state.AddNodes(nil, []*enode.Node{n})
+	}
 
 	// A consumer that reads everything, as the iterator does: the pass
 	// cannot end while a result waits unread.
@@ -888,29 +897,34 @@ func TestTopicSearchRunPartialReply(t *testing.T) {
 		defer close(done)
 		s.run(sys, state)
 	}()
-	select {
-	case job := <-s.queryCh:
-		if job.dst.ID() != reg.ID() {
-			t.Fatalf("query to %v, want the registrar", job.dst.ID())
+	var nads int
+	for i := range len(regs) {
+		var job topicQueryJob
+		select {
+		case job = <-s.queryCh:
+			if regs[job.dst.ID()] == nil {
+				t.Fatalf("query to %v, want a registrar", job.dst.ID())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no query sent")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("no query sent")
+		ads := []*enode.Node{capableRecord(t, 46000+2*i), capableRecord(t, 46001+2*i)}
+		nads += len(ads)
+		s.queryRespCh <- topicQueryResult{src: job.dst, topicNodes: ads, err: errTimeout}
 	}
-	ads := []*enode.Node{capableRecord(t, 45001), capableRecord(t, 45002)}
-	s.queryRespCh <- topicQueryResult{src: reg, topicNodes: ads, err: errTimeout}
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		close(s.quit)
-		t.Fatal("the pass did not end after the partial reply")
+		t.Fatal("the pass did not end after the partial replies")
 	}
-	if got := state.AdsSeen(); got != len(ads) {
-		t.Fatalf("ads seen %d, want %d: a partial reply's ads count", got, len(ads))
+	if got := state.AdsSeen(); got != nads {
+		t.Fatalf("ads seen %d, want %d: partial replies' ads count", got, nads)
 	}
 	if state.ActiveBucket() != active {
-		t.Fatalf("active bucket moved to %d on a partial reply below the floor", state.ActiveBucket())
+		t.Fatalf("active bucket moved to %d on partial replies below the floor", state.ActiveBucket())
 	}
-	if got := int(read.Load()); got != len(ads) {
-		t.Fatalf("%d results handed out, want %d: the pass end releases the partial reply's ads", got, len(ads))
+	if got := int(read.Load()); got != nads {
+		t.Fatalf("%d results handed out, want %d: the pass end releases the partial replies' ads", got, nads)
 	}
 }

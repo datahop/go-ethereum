@@ -886,7 +886,8 @@ func TestSearchAdaptiveSpareRotation(t *testing.T) {
 }
 
 // A spare whose asked entry expired after it answered in this pass is not
-// asked again in the pass.
+// asked again in the pass, and neither is one asked from the table after
+// its own entry expired.
 func TestSearchAdaptiveSpareNoReaskAfterExpiry(t *testing.T) {
 	clock := new(mclock.Simulated)
 	config := testConfig(t)
@@ -900,15 +901,63 @@ func TestSearchAdaptiveSpareNoReaskAfterExpiry(t *testing.T) {
 
 	next := NewSearch(topic1, config)
 	next.SetAsked(s.asked)
+	next.SetActiveBucket(s.NextPassBucket())
 	next.AddNodes(nil, seeds) // both are spares
+	asked := map[enode.ID]int{}
 	spare := next.QueryTarget()
+	asked[spare.ID()]++
 	next.AddQueryResults(spare, nil)
 	clock.Run(2 * time.Minute) // every asked entry expires mid-pass
 	next.AddNodes(nil, seeds)  // the table offers both again
 	for n := next.QueryTarget(); n != nil; n = next.QueryTarget() {
-		if n.ID() == spare.ID() {
-			t.Fatal("a node that answered in this pass was asked again")
-		}
+		asked[n.ID()]++
 		next.AddQueryResults(n, nil)
+	}
+	for _, n := range seeds {
+		if asked[n.ID()] > 1 {
+			t.Fatalf("node %v asked %d times in one pass", n.ID(), asked[n.ID()])
+		}
+	}
+}
+
+// A spare asked from the table in this pass leaves the spares, whether it
+// answers or fails: the pass must not wait on a spare it will never ask.
+func TestSearchAdaptiveSpareAskedFromTable(t *testing.T) {
+	for name, settle := range map[string]func(*Search, *enode.Node){
+		"reply": func(s *Search, n *enode.Node) { s.AddQueryResults(n, nil) },
+		"error": func(s *Search, n *enode.Node) { s.HandleErrorResponse(n, errors.New("timeout")) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			clock := new(mclock.Simulated)
+			config := testConfig(t)
+			config.Clock = clock
+			config.AdLifetime = time.Minute
+			s := NewSearch(topic1, config)
+			seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 2, 1)
+			s.AddNodes(nil, seeds)
+			reply(t, s, 0, 0)
+			reply(t, s, 0, 0)
+
+			next := NewSearch(topic1, config)
+			next.SetAsked(s.asked)
+			next.SetActiveBucket(s.NextPassBucket())
+			next.AddNodes(nil, seeds) // both are spares
+			next.AddQueryResults(next.QueryTarget(), nil)
+			clock.Run(2 * time.Minute)
+			next.AddNodes(nil, seeds) // the other one is now a spare and in the table
+			n := next.QueryTarget()
+			if n == nil || !next.buckets[0].contains(n.ID()) || next.spare[n.ID()] == nil {
+				t.Fatal("the remaining seed is not asked from the table while a spare")
+			}
+			settle(next, n)
+			done := next.IsDone()
+			target := next.QueryTarget()
+			if !done && target == nil {
+				t.Fatal("pass not done with nothing left to ask")
+			}
+			if target != nil {
+				t.Fatalf("node %v asked again in the pass it was asked", target.ID())
+			}
+		})
 	}
 }

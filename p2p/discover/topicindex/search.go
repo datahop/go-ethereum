@@ -61,7 +61,7 @@ type Search struct {
 
 	active   int
 	asked    *AskedSet                // nodes queried within the last ad lifetime
-	spare    map[enode.ID]*enode.Node // asked nodes, re-asked oldest ask first if nothing else is left
+	spare    map[enode.ID]*enode.Node // asked nodes, re-asked longest unasked first if nothing else is left
 	spares   int                      // spares asked in this pass
 	placed   bool                     // a density sample placed the active bucket in this pass
 	replies  int                      // queries answered or failed in this pass
@@ -241,6 +241,7 @@ func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
 	s.replies++
 	s.askedNow[from.ID()] = struct{}{}
+	delete(s.spare, from.ID())
 	s.removeNode(from.ID())
 }
 
@@ -272,15 +273,11 @@ func (s *Search) QueryTarget() *enode.Node {
 		}
 	}
 	// Spares go longest unasked first: their ads are the likeliest to have
-	// changed. One asked in this pass already is dropped.
+	// changed.
 	if s.spares < searchSpareQueries {
 		var pick *enode.Node
 		var at mclock.AbsTime
 		for id, n := range s.spare {
-			if _, ok := s.askedNow[id]; ok {
-				delete(s.spare, id)
-				continue
-			}
 			if t := s.asked.LastAsked(id); pick == nil || t < at {
 				pick, at = n, t
 			}
@@ -350,6 +347,7 @@ func (s *Search) addReply(from *enode.Node, results []*enode.Node, ads int, samp
 	s.replies++
 	s.ads += ads
 	s.askedNow[from.ID()] = struct{}{}
+	delete(s.spare, from.ID())
 	s.buckets[s.bucketIndex(from.ID())].answered++
 	if sample {
 		s.observe(s.bucketIndex(from.ID()), ads)
