@@ -35,6 +35,9 @@ func TestAskedSetKeepsFirstExpiry(t *testing.T) {
 	if !a.Has(id) {
 		t.Fatal("asked node not in the set")
 	}
+	if a.LastAsked(id) != mclock.AbsTime(40*time.Second) {
+		t.Fatal("the re-ask did not move the last-asked time")
+	}
 	clock.Run(21 * time.Second)
 	if a.Has(id) {
 		t.Fatal("re-asking a spare extended its expiry")

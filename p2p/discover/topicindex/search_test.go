@@ -830,7 +830,8 @@ func TestSearchAdaptiveConfirmedBucketHolds(t *testing.T) {
 	}
 }
 
-// Spares are re-asked oldest ask first.
+// Spares are re-asked longest unasked first, so the passes rotate through
+// them instead of re-asking the same few.
 func TestSearchAdaptiveSpareOrder(t *testing.T) {
 	clock := new(mclock.Simulated)
 	config := testConfig(t)
@@ -851,5 +852,63 @@ func TestSearchAdaptiveSpareOrder(t *testing.T) {
 		if got := next.QueryTarget(); got == nil || got.ID() != want.ID() {
 			t.Fatalf("spare %d is %v, want the one asked %d-th", i, got, i)
 		}
+	}
+}
+
+// Two passes over more spares than a pass re-asks cover all of them.
+func TestSearchAdaptiveSpareRotation(t *testing.T) {
+	clock := new(mclock.Simulated)
+	config := testConfig(t)
+	config.Clock = clock
+	s := NewSearch(topic1, config)
+	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 2*searchSpareQueries, 1)
+	s.AddNodes(nil, seeds)
+	for range seeds {
+		reply(t, s, 0, 0)
+		clock.Run(time.Second)
+	}
+	asked := map[enode.ID]int{}
+	for pass := 0; pass < 2; pass++ {
+		next := NewSearch(topic1, config)
+		next.SetAsked(s.asked)
+		next.AddNodes(nil, seeds)
+		for n := next.QueryTarget(); n != nil; n = next.QueryTarget() {
+			asked[n.ID()]++
+			next.AddQueryResults(n, nil)
+			clock.Run(time.Second)
+		}
+	}
+	for _, n := range seeds {
+		if asked[n.ID()] != 1 {
+			t.Fatalf("node asked %d times over two passes, want once each", asked[n.ID()])
+		}
+	}
+}
+
+// A spare whose asked entry expired after it answered in this pass is not
+// asked again in the pass.
+func TestSearchAdaptiveSpareNoReaskAfterExpiry(t *testing.T) {
+	clock := new(mclock.Simulated)
+	config := testConfig(t)
+	config.Clock = clock
+	config.AdLifetime = time.Minute
+	s := NewSearch(topic1, config)
+	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 2, 1)
+	s.AddNodes(nil, seeds)
+	reply(t, s, 0, 0)
+	reply(t, s, 0, 0)
+
+	next := NewSearch(topic1, config)
+	next.SetAsked(s.asked)
+	next.AddNodes(nil, seeds) // both are spares
+	spare := next.QueryTarget()
+	next.AddQueryResults(spare, nil)
+	clock.Run(2 * time.Minute) // every asked entry expires mid-pass
+	next.AddNodes(nil, seeds)  // the table offers both again
+	for n := next.QueryTarget(); n != nil; n = next.QueryTarget() {
+		if n.ID() == spare.ID() {
+			t.Fatal("a node that answered in this pass was asked again")
+		}
+		next.AddQueryResults(n, nil)
 	}
 }

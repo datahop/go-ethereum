@@ -24,18 +24,23 @@ import (
 )
 
 // AskedSet remembers the nodes a topic search asked, for an ad lifetime from
-// the first ask: a spare re-asked within that time keeps its expiry.
+// the first ask: a spare re-asked within that time keeps its expiry, and the
+// time of its last ask orders the spares.
 type AskedSet struct {
 	clock   mclock.Clock
 	ttl     time.Duration
-	at      map[enode.ID]mclock.AbsTime
+	at      map[enode.ID]*asked
 	expired mclock.AbsTime // when expire last ran
+}
+
+type asked struct {
+	first, last mclock.AbsTime
 }
 
 // NewAskedSet creates an empty set.
 func NewAskedSet(cfg Config) *AskedSet {
 	cfg = cfg.withDefaults()
-	return &AskedSet{clock: cfg.Clock, ttl: cfg.AdLifetime, at: make(map[enode.ID]mclock.AbsTime)}
+	return &AskedSet{clock: cfg.Clock, ttl: cfg.AdLifetime, at: make(map[enode.ID]*asked)}
 }
 
 // Has reports whether id was asked within the ttl.
@@ -45,18 +50,25 @@ func (a *AskedSet) Has(id enode.ID) bool {
 	return ok
 }
 
-// Add records that id was asked, unless it already is in the set.
+// Add records that id was asked. The first ask sets the expiry; a later one
+// only moves the node behind the other spares.
 func (a *AskedSet) Add(id enode.ID) {
 	a.expire()
-	if _, ok := a.at[id]; !ok {
-		a.at[id] = a.clock.Now()
+	now := a.clock.Now()
+	if e, ok := a.at[id]; ok {
+		e.last = now
+		return
 	}
+	a.at[id] = &asked{first: now, last: now}
 }
 
-// AskedAt returns when id was first asked, or zero when it is not in the set.
-func (a *AskedSet) AskedAt(id enode.ID) mclock.AbsTime {
+// LastAsked returns when id was last asked, or zero when it is not in the set.
+func (a *AskedSet) LastAsked(id enode.ID) mclock.AbsTime {
 	a.expire()
-	return a.at[id]
+	if e, ok := a.at[id]; ok {
+		return e.last
+	}
+	return 0
 }
 
 // expire drops the entries past the ttl, at most once a second.
@@ -66,8 +78,8 @@ func (a *AskedSet) expire() {
 		return
 	}
 	a.expired = now
-	for id, t := range a.at {
-		if now.Sub(t) >= a.ttl {
+	for id, e := range a.at {
+		if now.Sub(e.first) >= a.ttl {
 			delete(a.at, id)
 		}
 	}

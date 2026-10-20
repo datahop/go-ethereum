@@ -271,18 +271,25 @@ func (s *Search) QueryTarget() *enode.Node {
 			}
 		}
 	}
-	// Spares go oldest ask first: their ads are the likeliest to have changed.
-	if s.spares < searchSpareQueries && len(s.spare) > 0 {
+	// Spares go longest unasked first: their ads are the likeliest to have
+	// changed. One asked in this pass already is dropped.
+	if s.spares < searchSpareQueries {
 		var pick *enode.Node
 		var at mclock.AbsTime
-		for _, n := range s.spare {
-			if t := s.asked.AskedAt(n.ID()); pick == nil || t < at {
+		for id, n := range s.spare {
+			if _, ok := s.askedNow[id]; ok {
+				delete(s.spare, id)
+				continue
+			}
+			if t := s.asked.LastAsked(id); pick == nil || t < at {
 				pick, at = n, t
 			}
 		}
-		s.spares++
-		delete(s.spare, pick.ID())
-		return pick
+		if pick != nil {
+			s.spares++
+			delete(s.spare, pick.ID())
+			return pick
+		}
 	}
 	return nil
 }
