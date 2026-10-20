@@ -36,8 +36,8 @@ const (
 // SearchFilter remembers the nodes returned by a topic search, so that later
 // search passes don't return them again until AdLifetime has passed; a node
 // with a newer record is returned once more, and only once. It also mixes the
-// results of the registrars, so that the results of a search come from
-// several of them.
+// results of the registrars for the whole pass, one from each in turn, so
+// that no registrar's reply reaches the consumer in a burst.
 type SearchFilter struct {
 	self  enode.ID
 	clock mclock.Clock
@@ -50,15 +50,18 @@ type SearchFilter struct {
 	mixWait       time.Duration
 	queues        []*registrarQueue // in arrival order of the registrars that replied with ads
 	registrars    map[enode.ID]*registrarQueue
-	queued        map[enode.ID]*registrarQueue // waiting nodes, by the queue that holds them
-	handed        map[enode.ID]struct{}        // handed out in this pass
+	newest        map[enode.ID]*enode.Node // the newest record of every waiting node
+	handed        map[enode.ID]struct{}    // handed out in this pass
 	firstQueued   mclock.AbsTime
 	waiting       bool
 }
 
-// registrarQueue holds the results of one registrar that wait to be handed out.
+// registrarQueue holds the results of one registrar that wait to be handed
+// out. A node several registrars return waits in each of their queues and is
+// handed out once.
 type registrarQueue struct {
-	nodes []*enode.Node
+	nodes    []*enode.Node
+	queuedAt mclock.AbsTime // when the queue last went from empty to waiting
 }
 
 type searchFilterEntry struct {
@@ -89,16 +92,17 @@ func NewSearchFilter(cfg Config) *SearchFilter {
 func (f *SearchFilter) reset() {
 	f.queues = nil
 	f.registrars = make(map[enode.ID]*registrarQueue)
-	f.queued = make(map[enode.ID]*registrarQueue)
+	f.newest = make(map[enode.ID]*enode.Node)
 	f.handed = make(map[enode.ID]struct{})
 	f.waiting = false
 }
 
 // Take queues the results of a registrar's reply and returns the results that
 // can be handed out now. A registrar counts toward the mix when its reply
-// held ads, even if every one of them already waits in another queue.
+// held ads, even if every one of them waits in other queues as well.
 func (f *SearchFilter) Take(registrar enode.ID, results []*enode.Node) []*enode.Node {
 	q := f.registrars[registrar]
+	now := f.clock.Now()
 	for _, n := range results {
 		if n.ID() == f.self || f.Seen(n) {
 			continue
@@ -111,29 +115,18 @@ func (f *SearchFilter) Take(registrar enode.ID, results []*enode.Node) []*enode.
 			f.registrars[registrar] = q
 			f.queues = append(f.queues, q)
 		}
-		if other, ok := f.queued[n.ID()]; ok {
-			other.replace(n)
-			continue
+		if cur, ok := f.newest[n.ID()]; !ok || n.Seq() > cur.Seq() {
+			f.newest[n.ID()] = n
+		}
+		if len(q.nodes) == 0 {
+			q.queuedAt = now
 		}
 		if !f.waiting {
-			f.firstQueued, f.waiting = f.clock.Now(), true
+			f.firstQueued, f.waiting = now, true
 		}
-		f.queued[n.ID()] = q
 		q.nodes = append(q.nodes, n)
 	}
 	return f.mix(false)
-}
-
-// replace swaps a waiting record of the same node for a newer one.
-func (q *registrarQueue) replace(n *enode.Node) {
-	for i, old := range q.nodes {
-		if old.ID() == n.ID() {
-			if n.Seq() > old.Seq() {
-				q.nodes[i] = n
-			}
-			return
-		}
-	}
 }
 
 // Release returns the results that still wait, one registrar at a time. It is
@@ -144,33 +137,37 @@ func (f *SearchFilter) Release() []*enode.Node {
 	return out
 }
 
-// mix takes one result from every registrar that has results waiting, round
-// after round, once enough registrars have replied or the results have waited
-// long enough. With all set, it takes every waiting result.
+// mix hands out results in rounds of one per registrar with results waiting,
+// once enough registrars have replied or the first result has waited long
+// enough. A round with a single registrar waits as well, so that a late
+// reply is interleaved with whatever comes after it, unless it has waited
+// long enough on its own. With all set, every waiting result goes out.
 func (f *SearchFilter) mix(all bool) []*enode.Node {
-	if !all && len(f.queues) < f.mixRegistrars && f.waiting && f.clock.Now().Sub(f.firstQueued) >= f.mixWait {
-		all = true
+	now := f.clock.Now()
+	waited := func(since mclock.AbsTime) bool { return now.Sub(since) >= f.mixWait }
+	if !all && len(f.queues) < f.mixRegistrars && !(f.waiting && waited(f.firstQueued)) {
+		return nil
 	}
 	var out []*enode.Node
 	for {
-		waiting := 0
+		var round []*registrarQueue
 		for _, q := range f.queues {
 			if len(q.nodes) > 0 {
-				waiting++
+				round = append(round, q)
 			}
 		}
-		if waiting == 0 || (len(f.queues) < f.mixRegistrars && !all) {
+		if len(round) == 0 || (!all && len(round) == 1 && !waited(round[0].queuedAt)) {
 			return out
 		}
-		for _, q := range f.queues {
-			if len(q.nodes) == 0 {
-				continue
-			}
+		for _, q := range round {
 			n := q.nodes[0]
 			q.nodes = q.nodes[1:]
-			delete(f.queued, n.ID())
+			if _, ok := f.handed[n.ID()]; ok {
+				continue
+			}
 			f.handed[n.ID()] = struct{}{}
-			out = append(out, n)
+			out = append(out, f.newest[n.ID()])
+			delete(f.newest, n.ID())
 		}
 	}
 }

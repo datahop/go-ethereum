@@ -294,3 +294,41 @@ func TestSearchFilterNewerRecordOnce(t *testing.T) {
 		t.Fatal("record seen after expiry")
 	}
 }
+
+// Mixing holds for the whole pass: a registrar that replies after the first
+// results went out gets one result per round, interleaved with the replies
+// that follow, and a lone late reply waits for company or for the wait.
+func TestSearchFilterMixContinuous(t *testing.T) {
+	clock := new(mclock.Simulated)
+	f := NewSearchFilter(Config{Clock: clock})
+	f.mixRegistrars = 2
+	regA, regB, sybil, regD := newNode().ID(), newNode().ID(), newNode().ID(), newNode().ID()
+	adsA, adsB, adsS, adsD := newNodes(1), newNodes(1), newNodes(4), newNodes(2)
+	f.Take(regA, adsA)
+	if got := f.Take(regB, adsB); len(got) != 2 {
+		t.Fatalf("got %d results after two registrars, want 2", len(got))
+	}
+	// A late reply of four results is held: nothing to mix it with yet.
+	if got := f.Take(sybil, adsS); len(got) != 0 {
+		t.Fatalf("a lone late reply went out in a burst of %d", len(got))
+	}
+	clock.Run(time.Second)
+	got := f.Take(regD, adsD)
+	want := []*enode.Node{adsS[0], adsD[0], adsS[1], adsD[1]}
+	if len(got) != len(want) {
+		t.Fatalf("got %d results, want %d interleaved", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("result %d out of order", i)
+		}
+	}
+	// The rest of the late reply waits again, then goes out after the wait.
+	if got := f.Take(newNode().ID(), nil); len(got) != 0 {
+		t.Fatalf("the remaining results went out with nothing to mix: %d", len(got))
+	}
+	clock.Run(searchMixWait)
+	if got := f.Take(newNode().ID(), nil); len(got) != 2 || got[0] != adsS[2] || got[1] != adsS[3] {
+		t.Fatalf("got %v after the wait, want the two remaining results", got)
+	}
+}
