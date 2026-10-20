@@ -90,6 +90,7 @@ func startLocalhostV5(t *testing.T, cfg Config) *UDPv5 {
 	}
 	realaddr := socket.LocalAddr().(*net.UDPAddr)
 	ln.SetStaticIP(realaddr.IP)
+	ln.SetFallbackUDP(realaddr.Port) // keeps the port after the first PONG updates the endpoint
 	ln.Set(enr.UDP(realaddr.Port))
 	udp, err := ListenV5(socket, ln, cfg)
 	if err != nil {
