@@ -322,3 +322,26 @@ func TestSearchBucketsWithFreeSpace(t *testing.T) {
 		}
 	}
 }
+
+// TestSearchResultNewerRecord checks that a node already returned in this
+// pass is not returned again, with a newer record or an older one: a bumped
+// record must not keep a node at the front of the results.
+func TestSearchResultNewerRecord(t *testing.T) {
+	s := NewSearch(topic1, testConfig(t))
+	regs := nodesAtDistanceFrom(enode.ID(topic1), 256, 2, 1)
+	regA, regB := regs[0], regs[1]
+	id := enode.SignNull(new(enr.Record), enode.ID{7}).ID()
+	old, updated := nodeWithSeq(id, intIP(1), 1), nodeWithSeq(id, intIP(1), 2)
+	s.AddNodes(nil, regs)
+
+	s.AddQueryResults(regA, []*enode.Node{old})
+	s.PopResult()
+	s.AddQueryResults(regB, []*enode.Node{updated})
+	if s.PeekResult() != nil {
+		t.Fatal("newer record of a returned node returned again in the same pass")
+	}
+	s.AddResults([]*enode.Node{old})
+	if s.PeekResult() != nil {
+		t.Fatal("older record returned again")
+	}
+}

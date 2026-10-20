@@ -47,7 +47,7 @@ type Search struct {
 
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
-	resultSeen   map[enode.ID]struct{}
+	resultSeen   map[enode.ID]uint64 // record seq of every result so far
 }
 
 type searchBucket struct {
@@ -66,7 +66,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		cfg:         cfg,
 		log:         cfg.Log.New("topic", topic),
 		topic:       topic,
-		resultSeen:  make(map[enode.ID]struct{}),
+		resultSeen:  make(map[enode.ID]uint64),
 		bucketCheck: make(map[int]struct{}, searchTableDepth),
 	}
 	dist := 256
@@ -213,17 +213,29 @@ func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
 	b.setAsked(from)
 	b.numRequests++
 
-	for _, n := range results {
-		if n.ID() == s.cfg.Self {
-			continue
-		}
-		s.cfg.Log.Debug("Added topic search result", "topic", s.topic, "fromid", from.ID(), "rid", n.ID())
-		_, seen := s.resultSeen[n.ID()]
-		if !seen {
-			s.resultSeen[n.ID()] = struct{}{}
-			s.resultBuffer = append(s.resultBuffer, n)
+	// The results may come from several registrars when the filter mixes
+	// them, so they are not attributed to from.
+	s.cfg.Log.Debug("Topic query answered", "topic", s.topic, "fromid", from.ID(), "n", len(results))
+	s.AddResults(results)
+}
+
+// AddResults adds nodes to the result set.
+func (s *Search) AddResults(nodes []*enode.Node) {
+	for _, n := range nodes {
+		if n.ID() != s.cfg.Self {
+			s.addResult(n)
 		}
 	}
+}
+
+// addResult buffers a result unless the node was already a result of this
+// search. A newer record of a node is left for the next pass.
+func (s *Search) addResult(n *enode.Node) {
+	if _, seen := s.resultSeen[n.ID()]; seen {
+		return
+	}
+	s.resultSeen[n.ID()] = n.Seq()
+	s.resultBuffer = append(s.resultBuffer, n)
 }
 
 // PeekResult returns a node from the result set.

@@ -95,6 +95,133 @@ func TestTopicSearch(t *testing.T) {
 	}
 }
 
+// capableRecord is the signed record of a TopDisc node that is not running:
+// a registrar can hold it as an ad without it joining anyone's routing table.
+func capableRecord(t *testing.T, port int) *enode.Node {
+	db, err := enode.OpenDB("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.Close)
+	ln := enode.NewLocalNode(db, newkey())
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	ln.SetStaticIP(net.IP{127, 0, 0, 1})
+	ln.SetFallbackUDP(port)
+	return ln.Node()
+}
+
+// TestTopicSearchMixesRegistrars runs a search over five registrars that each
+// hold two ads of their own: the first five results come from five different
+// registrars, and every ad is returned.
+func TestTopicSearchMixesRegistrars(t *testing.T) {
+	node0 := startLocalhostV5(t, Config{})
+	var all []*UDPv5
+	defer func() {
+		node0.Close()
+		for _, n := range all {
+			n.Close()
+		}
+	}()
+	regOf := make(map[enode.ID]int)
+	var regs []*enode.Node
+	var ads []*enode.Node
+	for i := 0; i < 5; i++ {
+		reg := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+		all = append(all, reg)
+		regs = append(regs, reg.Self())
+		var own []*enode.Node
+		for j := 0; j < 2; j++ {
+			ad := capableRecord(t, 40000+10*i+j)
+			own = append(own, ad)
+			regOf[ad.ID()] = i
+		}
+		seedTopicTable(t, reg, testTopic1, own...)
+		ads = append(ads, own...)
+	}
+	searcher := startLocalhostV5(t, Config{Bootnodes: append([]*enode.Node{node0.Self()}, regs...)})
+	all = append(all, searcher)
+	// The first pass seeds from the routing table: wait until it holds every registrar.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		known := make(map[enode.ID]bool)
+		for _, n := range searcher.AllNodes() {
+			known[n.ID()] = true
+		}
+		have := 0
+		for _, r := range regs {
+			if known[r.ID()] {
+				have++
+			}
+		}
+		if have == len(regs) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("searcher knows %d of %d registrars", have, len(regs))
+		}
+	}
+
+	it := searcher.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	timeout := time.AfterFunc(30*time.Second, it.Close)
+	defer timeout.Stop()
+	// Results are checked in the order the search hands them out.
+	var found []*enode.Node
+	for len(found) < len(ads) && it.Next() {
+		found = append(found, it.Node())
+	}
+	if len(found) != len(ads) {
+		t.Fatalf("got %d results, want %d", len(found), len(ads))
+	}
+	seen := make(map[int]bool)
+	for _, n := range found[:5] {
+		seen[regOf[n.ID()]] = true
+	}
+	if len(seen) != 5 {
+		t.Fatalf("first five results came from %d registrars, want 5", len(seen))
+	}
+	sortByID(found)
+	sortByID(ads)
+	if err := checkNodesEqual(found, ads); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestTopicSearchNoRepeats checks that a search doesn't return a node again
+// in later passes until the ad lifetime has passed.
+func TestTopicSearchNoRepeats(t *testing.T) {
+	const lifetime = 3 * regloopMinTime
+	node0 := startLocalhostV5(t, Config{})
+	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+	node2 := startLocalhostV5(t, Config{
+		Bootnodes: []*enode.Node{node0.Self(), node1.Self()},
+		Topic:     topicindex.Config{AdLifetime: lifetime},
+	})
+	defer func() {
+		for _, n := range []*UDPv5{node0, node1, node2} {
+			n.Close()
+		}
+	}()
+	seedTopicTable(t, node1, testTopic1, node0.Self())
+
+	it := node2.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	timeout := time.AfterFunc(30*time.Second, it.Close)
+	defer timeout.Stop()
+	if !it.Next() {
+		t.Fatal("search ended without results")
+	}
+	first := time.Now()
+	if !it.Next() {
+		t.Fatal("search ended without second result")
+	}
+	if it.Node().ID() != node0.Self().ID() {
+		t.Fatalf("unexpected result %v", it.Node().ID())
+	}
+	if d := time.Since(first); d < lifetime-200*time.Millisecond {
+		t.Fatalf("node returned again after %v, want about %v", d, lifetime)
+	}
+}
+
 // seedTopicTable registers the given nodes for a topic in t's local topic
 // table. The work runs on the dispatch goroutine, which owns the table.
 func seedTopicTable(t *testing.T, node *UDPv5, topic topicindex.TopicID, regs ...*enode.Node) {
@@ -550,4 +677,53 @@ func TestHandleRegtopicRecordIP(t *testing.T) {
 			t.Fatalf("registration from rebound port was rejected: %d ads, want 1", len(nodes))
 		}
 	})
+}
+
+// TestTopicSearchDrainsTableFeed checks that a search blocked on a consumer
+// that stops reading keeps draining the table's node feed: the feed sends
+// under the table mutex, so a full subscription channel would stall every
+// lookup. The result channel buffers 200 results, so the pass must carry more.
+func TestTopicSearchDrainsTableFeed(t *testing.T) {
+	node0 := startLocalhostV5(t, Config{})
+	var all []*UDPv5
+	defer func() {
+		node0.Close()
+		for _, n := range all {
+			n.Close()
+		}
+	}()
+	var regs []*enode.Node
+	for i := 0; i < 14; i++ {
+		reg := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
+		all = append(all, reg)
+		regs = append(regs, reg.Self())
+		var own []*enode.Node
+		for j := 0; j < 16; j++ {
+			own = append(own, capableRecord(t, 41000+100*i+j))
+		}
+		seedTopicTable(t, reg, testTopic1, own...)
+	}
+	searcher := startLocalhostV5(t, Config{Bootnodes: append([]*enode.Node{node0.Self()}, regs...)})
+	all = append(all, searcher)
+
+	it := searcher.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	if !it.Next() {
+		t.Fatal("no first result")
+	}
+	// The consumer reads nothing more; the pass fills the result channel and
+	// the search waits on it. The feed must still get through.
+	time.Sleep(2 * time.Second)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 300; i++ {
+			searcher.tab.nodeFeed.Send(capableRecord(t, 43000+i))
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the table feed blocked behind the search's full subscription channel")
+	}
 }
