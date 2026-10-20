@@ -589,10 +589,11 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				// The density sample is the reply's size as the registrar sent
 				// it, before the searcher's own filtering drops records.
 				ads := filterTopicDiscovery(resp.topicNodes)
+				nads, sent := len(ads), len(resp.topicNodes)
 				if resp.err != nil {
-					state.AddPartialReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(resp.topicNodes))
+					state.AddPartialReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), nads, sent)
 				} else {
-					state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), len(resp.topicNodes))
+					state.AddReply(resp.src, s.resultFilter.Take(resp.src.ID(), ads), nads, sent)
 				}
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 			}

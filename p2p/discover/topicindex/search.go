@@ -342,26 +342,28 @@ func (s *Search) observe(bi int, ads int) {
 }
 
 // AddReply adds the results of a topic query response. ads is the number of
-// ads the response carried, the density sample that moves the active bucket.
-func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) {
-	s.addReply(from, results, ads, true)
+// usable ads the response carried, counted by AdsSeen. sent is the number of
+// records as the registrar sent them, the density sample that moves the
+// active bucket.
+func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads, sent int) {
+	s.addReply(from, results, ads, sent, true)
 }
 
 // AddPartialReply adds the results of a response cut short by an error. Its
-// ad count is a lower bound: it counts as a density sample only when it
+// record count is a lower bound: it counts as a density sample only when it
 // reaches the floor on its own.
-func (s *Search) AddPartialReply(from *enode.Node, results []*enode.Node, ads int) {
-	s.addReply(from, results, ads, ads >= searchYieldFloor)
+func (s *Search) AddPartialReply(from *enode.Node, results []*enode.Node, ads, sent int) {
+	s.addReply(from, results, ads, sent, sent >= searchYieldFloor)
 }
 
-func (s *Search) addReply(from *enode.Node, results []*enode.Node, ads int, sample bool) {
+func (s *Search) addReply(from *enode.Node, results []*enode.Node, ads, sent int, sample bool) {
 	s.replies++
 	s.ads += ads
 	s.askedNow[from.ID()] = struct{}{}
 	delete(s.spare, from.ID())
 	s.buckets[s.bucketIndex(from.ID())].done++
 	if sample {
-		s.observe(s.bucketIndex(from.ID()), ads)
+		s.observe(s.bucketIndex(from.ID()), sent)
 	}
 	s.asked.Add(from.ID())
 	s.removeNode(from.ID(), true)

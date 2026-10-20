@@ -278,7 +278,7 @@ func TestSearchAdaptiveReplySize(t *testing.T) {
 		if n == nil || s.bucketIndex(n.ID()) != 3 {
 			t.Fatalf("query %d did not go to bucket 3", i)
 		}
-		s.AddReply(n, nodesAtDistanceFrom(enode.ID(topic1), 100, 6, 300+10*i), TopicNodesLimit)
+		s.AddReply(n, nodesAtDistanceFrom(enode.ID(topic1), 100, 6, 300+10*i), TopicNodesLimit, TopicNodesLimit)
 	}
 	if got := s.ActiveBucket(); got != 2 {
 		t.Fatalf("active bucket %d after two full replies, want 2", got)
@@ -581,7 +581,7 @@ func TestSearchResultNewerRecord(t *testing.T) {
 
 // AddQueryResults adds a response whose ads are all taken as results.
 func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) {
-	s.AddReply(from, results, len(results))
+	s.AddReply(from, results, len(results), len(results))
 }
 
 // TestSearchAdaptiveHelperKeepsBucket checks that replies from helpers outside
@@ -615,7 +615,7 @@ func TestSearchAdaptivePassBudget(t *testing.T) {
 		if n == nil {
 			t.Fatalf("no target at query %d", i)
 		}
-		s.AddReply(n, nil, searchYieldFloor)
+		s.AddReply(n, nil, searchYieldFloor, searchYieldFloor)
 		s.AddNodes(n, nodesAtDistanceFrom(enode.ID(topic1), 253, 1, 100+i))
 	}
 	if n := s.QueryTarget(); n != nil {
@@ -712,13 +712,13 @@ func TestSearchAdaptivePartialReply(t *testing.T) {
 	reply(t, s, 3, 0) // one empty sample: a second would jump the search in
 	regs := nodesAtDistanceFrom(enode.ID(s.topic), s.buckets[3].dist, 2, 50)
 	s.AddNodes(nil, regs)
-	s.AddPartialReply(regs[0], nil, 0)
+	s.AddPartialReply(regs[0], nil, 0, 0)
 	if s.ActiveBucket() != 3 {
 		t.Fatalf("active bucket moved to %d on an empty partial reply", s.ActiveBucket())
 	}
 	// Enough ads before the cut make a sample: with the empty one they read
 	// "at least the floor", and the bucket stays; a second full one moves out.
-	s.AddPartialReply(regs[1], nil, TopicNodesLimit)
+	s.AddPartialReply(regs[1], nil, TopicNodesLimit, TopicNodesLimit)
 	if s.ActiveBucket() != 3 {
 		t.Fatalf("active bucket %d after a full partial reply and an empty one, want 3", s.ActiveBucket())
 	}
@@ -727,7 +727,7 @@ func TestSearchAdaptivePartialReply(t *testing.T) {
 	}
 	more := nodesAtDistanceFrom(enode.ID(s.topic), s.buckets[3].dist, 1, 60)
 	s.AddNodes(nil, more)
-	s.AddPartialReply(more[0], nil, TopicNodesLimit)
+	s.AddPartialReply(more[0], nil, TopicNodesLimit, TopicNodesLimit)
 	if s.ActiveBucket() != 2 {
 		t.Fatalf("active bucket %d after two full partial replies, want 2: full samples move the search out", s.ActiveBucket())
 	}
@@ -803,7 +803,7 @@ func TestSearchAdaptiveEmptyClosestRestartsWide(t *testing.T) {
 	s := adaptiveSearch(t)
 	s.SetActiveBucket(len(s.buckets) - 1)
 	for n := s.QueryTarget(); n != nil; n = s.QueryTarget() {
-		s.AddReply(n, nil, 0)
+		s.AddReply(n, nil, 0, 0)
 	}
 	if !s.IsDone() {
 		t.Fatal("pass not done with every node asked")

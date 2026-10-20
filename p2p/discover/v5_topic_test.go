@@ -837,13 +837,13 @@ func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 	// A pass at the closest bucket with nothing found: start wide again.
 	state.SetActiveBucket(last)
 	near := enode.SignNull(new(enr.Record), enode.ID{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
-	state.AddReply(near, nil, 0)
+	state.AddReply(near, nil, 0, 0)
 	if s.nextPass(state) || s.activeBucket != 0 {
 		t.Fatalf("next pass at %d after an empty reply at the closest bucket, want 0", s.activeBucket)
 	}
 	state = topicindex.NewSearch(topicindex.TopicID{1}, topicindex.Config{})
 	state.SetActiveBucket(0)
-	state.AddReply(enode.SignNull(new(enr.Record), enode.ID{7}), nil, 3)
+	state.AddReply(enode.SignNull(new(enr.Record), enode.ID{7}), nil, 3, 3)
 	s.activeBucket = 2
 	if !s.nextPass(state) || s.activeBucket != 1 {
 		t.Fatalf("next pass at %d after a pass with ads that ran dry, want 1 and a move", s.activeBucket)
@@ -867,7 +867,7 @@ func TestTopicSearchNextPassDeadFrontier(t *testing.T) {
 			if n.ID() == dead.ID() {
 				state.HandleErrorResponse(n, errTimeout)
 			} else {
-				state.AddReply(n, nil, 0)
+				state.AddReply(n, nil, 0, 0)
 			}
 		}
 		if !state.IsDone() {
@@ -901,7 +901,7 @@ func TestTopicSearchNextPassPlacedFailures(t *testing.T) {
 			if n.ID() == dead.ID() {
 				state.HandleErrorResponse(n, errTimeout)
 			} else {
-				state.AddReply(n, nil, topicindex.TopicNodesLimit)
+				state.AddReply(n, nil, topicindex.TopicNodesLimit, topicindex.TopicNodesLimit)
 			}
 		}
 		if !state.IsDone() {
@@ -1004,5 +1004,86 @@ func TestTopicSearchRunPartialReply(t *testing.T) {
 	}
 	if got := int(read.Load()); got != nads {
 		t.Fatalf("%d results handed out, want %d: the pass end releases the partial replies' ads", got, nads)
+	}
+}
+
+// TestTopicSearchRunUnsupportedAds checks that records the searcher filters
+// out still count toward the density sample, as the registrar sent them, but
+// not as ads seen: a pass that found nothing usable is idle.
+func TestTopicSearchRunUnsupportedAds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"complete", nil},
+		{"partial", errTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := startLocalhostV5(t, Config{})
+			defer node.Close()
+			sys := node.topicSys
+			s := &topicSearch{
+				topic:        testTopic1,
+				config:       sys.config,
+				quit:         make(chan struct{}),
+				resultCh:     make(chan *enode.Node, 200),
+				resultFilter: topicindex.NewSearchFilter(sys.config),
+				asked:        topicindex.NewAskedSet(sys.config),
+				queryCh:      make(chan topicQueryJob),
+				queryRespCh:  make(chan topicQueryResult),
+				readCh:       make(chan struct{}, 1),
+				newNodesCh:   make(chan *enode.Node, 100),
+				activeBucket: 1,
+			}
+			state := topicindex.NewSearch(testTopic1, sys.config)
+			state.SetActiveBucket(s.activeBucket)
+			regs := map[enode.ID]*enode.Node{}
+			for port := 45000; len(regs) < 2; port++ {
+				if n := capableRecord(t, port); enode.LogDist(enode.ID(testTopic1), n.ID()) == 256-s.activeBucket {
+					regs[n.ID()] = n
+				}
+			}
+			for _, n := range regs {
+				state.AddNodes(nil, []*enode.Node{n})
+			}
+
+			done := make(chan int)
+			go func() {
+				_, nresults := s.run(sys, state)
+				done <- nresults
+			}()
+			for range len(regs) {
+				var job topicQueryJob
+				select {
+				case job = <-s.queryCh:
+				case <-time.After(5 * time.Second):
+					t.Fatal("no query sent")
+				}
+				// Full replies of records without the topic discovery entry.
+				unsupported := nodesAtDistance(enode.ID(testTopic1), 200, topicindex.TopicNodesLimit)
+				s.queryRespCh <- topicQueryResult{src: job.dst, topicNodes: unsupported, err: tc.err}
+			}
+			var nresults int
+			select {
+			case nresults = <-done:
+			case <-time.After(5 * time.Second):
+				close(s.quit)
+				t.Fatal("the pass did not end after the replies")
+			}
+			if got := state.AdsSeen(); got != 0 {
+				t.Fatalf("ads seen %d, want 0: unsupported records are no ads", got)
+			}
+			if got := state.ActiveBucket(); got != 0 {
+				t.Fatalf("active bucket %d, want 0: full replies as sent move the search out", got)
+			}
+			moved := s.nextPass(state)
+			if moved {
+				t.Fatal("a pass without usable ads counted as a move")
+			}
+			s.passGap(nresults, moved)
+			if s.idlePasses != 1 {
+				t.Fatalf("idle passes %d, want 1: a pass without usable ads is idle", s.idlePasses)
+			}
+		})
 	}
 }
