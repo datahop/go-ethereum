@@ -449,13 +449,32 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		state.AddNodes(nil, nodes)
 
 		exit, nresults := s.run(sys, state)
-		moved := state.ActiveBucket() != s.activeBucket
-		s.activeBucket = state.ActiveBucket()
+		moved := s.nextPass(state)
 		if exit {
 			return
 		}
 		gap = s.passGap(nresults, moved)
 	}
+}
+
+// nextPass sets where the next pass starts from the state of the one that
+// ended, and reports whether the active bucket moved. Empty replies push the
+// search toward the topic, so a topic with no ads at all walks to the closest
+// bucket and would stay there, asking only the few nodes next to the topic:
+// such a pass starts the next one wide again, and counts as idle so that the
+// back-off still grows.
+func (s *topicSearch) nextPass(state *topicindex.Search) (moved bool) {
+	next := state.ActiveBucket()
+	if state.AdsSeen() == 0 {
+		if state.AtClosestBucket() {
+			next = 0
+		}
+		s.activeBucket = next
+		return false
+	}
+	moved = next != s.activeBucket
+	s.activeBucket = next
+	return moved
 }
 
 // passGap is the minimum length of the next pass: regloopMinTime, doubling

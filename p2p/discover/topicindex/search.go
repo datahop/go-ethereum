@@ -59,8 +59,10 @@ type Search struct {
 	asked     *SearchFilter            // nodes queried within the last ad lifetime
 	spare     map[enode.ID]*enode.Node // asked nodes, one re-asked per pass if nothing else is left
 	spareUsed bool
-	advanced  bool // the pass moved the active bucket at its end
-	replies   int  // queries answered or failed in this pass
+	advanced  bool                  // the pass moved the active bucket at its end
+	replies   int                   // queries answered or failed in this pass
+	ads       int                   // ads the replies of this pass carried
+	failed    map[enode.ID]struct{} // nodes that failed in this pass, not re-admitted before the next one
 
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
@@ -85,6 +87,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		resultSeen:  make(map[enode.ID]uint64),
 		asked:       NewSearchFilter(cfg),
 		spare:       make(map[enode.ID]*enode.Node),
+		failed:      make(map[enode.ID]struct{}),
 		bucketCheck: make(map[int]struct{}, searchTableDepth),
 	}
 	dist := 256
@@ -110,6 +113,17 @@ func (s *Search) ActiveBucket() int {
 // SetActiveBucket sets the bucket to query first.
 func (s *Search) SetActiveBucket(i int) {
 	s.active = max(0, min(i, len(s.buckets)-1))
+}
+
+// AtClosestBucket reports whether the active bucket is the one closest to the
+// topic, past which an empty topic has nowhere left to walk.
+func (s *Search) AtClosestBucket() bool {
+	return s.active == len(s.buckets)-1
+}
+
+// AdsSeen returns the number of ads the replies of this pass carried.
+func (s *Search) AdsSeen() int {
+	return s.ads
 }
 
 // SetAskedFilter shares the record of queried nodes between search passes.
@@ -180,6 +194,9 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
 
+		if _, ok := s.failed[id]; ok {
+			continue
+		}
 		if s.asked.Has(n.ID()) {
 			s.spare[id] = n
 			continue
@@ -207,12 +224,14 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
-// HandleErrorResponse drops a failed node from the table, freeing its slot and
-// IP-limit entry.
+// HandleErrorResponse drops a failed node from the table for the rest of the
+// pass, freeing its slot and IP-limit entry. It is not recorded as asked: a
+// node that did not answer may have dropped one packet, and the next pass
+// may ask it again, while a dead one leaves the routing table on its own.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
 	s.replies++
-	s.asked.Add(from)
+	s.failed[from.ID()] = struct{}{}
 	s.removeNode(from.ID())
 }
 
@@ -296,6 +315,7 @@ func (s *Search) observe(bi int, ads int) {
 // ads the response carried, the density sample that moves the active bucket.
 func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) {
 	s.replies++
+	s.ads += ads
 	s.observe(s.bucketIndex(from.ID()), ads)
 	s.asked.Add(from)
 	s.removeNode(from.ID())

@@ -646,12 +646,18 @@ func TestSearchAdaptiveFailedAsked(t *testing.T) {
 	s.AddNodes(nil, nodes)
 	n := s.QueryTarget()
 	s.HandleErrorResponse(n, errors.New("timeout"))
+	s.AddNodes(nil, nodes)
+	if s.buckets[0].contains(n.ID()) {
+		t.Fatal("failed node re-admitted in the same pass")
+	}
 
+	// One dropped packet must not exclude a registrar for an ad lifetime:
+	// the next pass asks it again.
 	next := NewSearch(topic1, config)
 	next.SetAskedFilter(s.asked)
 	next.AddNodes(nil, nodes)
-	if next.buckets[0].contains(n.ID()) {
-		t.Fatal("failed node re-admitted by the next pass")
+	if !next.buckets[0].contains(n.ID()) {
+		t.Fatal("failed node not re-admitted by the next pass")
 	}
 }
 

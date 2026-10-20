@@ -811,3 +811,28 @@ func TestTopicSearchDrainsTableFeed(t *testing.T) {
 		t.Fatal("the table feed blocked behind the search's full subscription channel")
 	}
 }
+
+// TestTopicSearchNextPassEmptyTopic checks that a pass without a single ad
+// starts the next one wide once the search has walked to the closest bucket,
+// and counts as idle either way, while a pass with ads keeps its bucket.
+func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
+	s := &topicSearch{activeBucket: 3}
+	state := topicindex.NewSearch(topicindex.TopicID{1}, topicindex.Config{})
+	state.SetActiveBucket(5)
+	if s.nextPass(state) {
+		t.Fatal("a pass without ads counted as a move")
+	}
+	if s.activeBucket != 5 {
+		t.Fatalf("next pass at %d, want 5: an empty pass keeps walking in", s.activeBucket)
+	}
+	state.SetActiveBucket(1 << 10) // clamps to the closest bucket
+	if s.nextPass(state) || s.activeBucket != 0 {
+		t.Fatalf("next pass at %d after an empty pass at the closest bucket, want 0", s.activeBucket)
+	}
+	state.SetActiveBucket(0)
+	state.AddReply(enode.SignNull(new(enr.Record), enode.ID{7}), nil, 3)
+	s.activeBucket = 2
+	if !s.nextPass(state) || s.activeBucket != 0 {
+		t.Fatalf("next pass at %d after a pass with ads, want 0 and a move", s.activeBucket)
+	}
+}

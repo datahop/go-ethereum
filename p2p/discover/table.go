@@ -785,26 +785,37 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check fun
 		want[dist] = struct{}{}
 	}
 
-	// Pick a random node per distance so repeated queries walk different nodes.
-	pick := make(map[uint]*enode.Node, len(want))
-	seen := make(map[uint]int, len(want))
-	for bi := 0; bi < len(tab.buckets); bi++ {
+	// Gather a few candidates per distance, so repeated queries walk different
+	// nodes, and stop once every distance has enough: check decodes the
+	// record, so it runs on the picks, not on the whole table.
+	const perDist = 8
+	cands := make(map[uint][]*enode.Node, len(want))
+	short := len(want)
+	for bi := 0; bi < len(tab.buckets) && short > 0; bi++ {
 		for _, n := range tab.buckets[bi].entries {
 			d := uint(enode.LogDist(target, n.ID()))
-			if _, ok := want[d]; !ok || !check(n.Node) {
+			if _, ok := want[d]; !ok {
 				continue
 			}
-			seen[d]++
-			if tab.rand.Intn(seen[d]) == 0 {
-				pick[d] = n.Node
+			cands[d] = append(cands[d], n.Node)
+			if len(cands[d]) == perDist {
+				short--
 			}
 		}
 	}
-	nodes := make([]*enode.Node, 0, len(pick))
+	nodes := make([]*enode.Node, 0, len(want))
 	for _, dist := range distances {
-		if n, ok := pick[dist]; ok {
-			nodes = append(nodes, n)
-			delete(pick, dist)
+		c, ok := cands[dist]
+		if !ok {
+			continue
+		}
+		delete(cands, dist)
+		tab.rand.Shuffle(len(c), func(i, j int) { c[i], c[j] = c[j], c[i] })
+		for _, n := range c {
+			if check(n) {
+				nodes = append(nodes, n)
+				break
+			}
 		}
 	}
 	return nodes
