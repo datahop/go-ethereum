@@ -21,6 +21,7 @@ import (
 	"crypto/ecdsa"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -835,5 +836,81 @@ func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 	s.activeBucket = 2
 	if !s.nextPass(state) || s.activeBucket != 1 {
 		t.Fatalf("next pass at %d after a pass with ads that ran dry, want 1 and a move", s.activeBucket)
+	}
+}
+
+// TestTopicSearchRunPartialReply drives one pass of the run loop by hand: a
+// reply that carries ads but ends in an error reaches the state as a partial
+// reply, so its ads count and, below the floor, it is no density sample.
+func TestTopicSearchRunPartialReply(t *testing.T) {
+	node := startLocalhostV5(t, Config{})
+	defer node.Close()
+	sys := node.topicSys
+	s := &topicSearch{
+		topic:        testTopic1,
+		config:       sys.config,
+		quit:         make(chan struct{}),
+		resultCh:     make(chan *enode.Node, 200),
+		resultFilter: topicindex.NewSearchFilter(sys.config),
+		asked:        topicindex.NewAskedSet(sys.config),
+		queryCh:      make(chan topicQueryJob),
+		queryRespCh:  make(chan topicQueryResult),
+		readCh:       make(chan struct{}, 1),
+		newNodesCh:   make(chan *enode.Node, 100),
+	}
+	state := topicindex.NewSearch(testTopic1, sys.config)
+	reg := capableRecord(t, 45000)
+	state.AddNodes(nil, []*enode.Node{reg})
+	active := state.ActiveBucket()
+
+	// A consumer that reads everything, as the iterator does: the pass
+	// cannot end while a result waits unread.
+	var read atomic.Int32
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-s.resultCh:
+				read.Add(1)
+				select {
+				case s.readCh <- struct{}{}:
+				default:
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	defer close(stop)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.run(sys, state)
+	}()
+	select {
+	case job := <-s.queryCh:
+		if job.dst.ID() != reg.ID() {
+			t.Fatalf("query to %v, want the registrar", job.dst.ID())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no query sent")
+	}
+	ads := []*enode.Node{capableRecord(t, 45001), capableRecord(t, 45002)}
+	s.queryRespCh <- topicQueryResult{src: reg, topicNodes: ads, err: errTimeout}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(s.quit)
+		t.Fatal("the pass did not end after the partial reply")
+	}
+	if got := state.AdsSeen(); got != len(ads) {
+		t.Fatalf("ads seen %d, want %d: a partial reply's ads count", got, len(ads))
+	}
+	if state.ActiveBucket() != active {
+		t.Fatalf("active bucket moved to %d on a partial reply below the floor", state.ActiveBucket())
+	}
+	if got := int(read.Load()); got != len(ads) {
+		t.Fatalf("%d results handed out, want %d: the pass end releases the partial reply's ads", got, len(ads))
 	}
 }
