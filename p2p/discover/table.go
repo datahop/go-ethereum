@@ -776,7 +776,7 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check fun
 	tab.mutex.Lock()
 	defer tab.mutex.Unlock()
 
-	// Build the set of still-wanted distances. Each is dropped once filled.
+	// Build the set of wanted distances.
 	want := make(map[uint]struct{}, len(distances))
 	for _, dist := range distances {
 		if dist == 0 || dist > 256 {

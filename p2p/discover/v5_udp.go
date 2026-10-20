@@ -1376,7 +1376,7 @@ func (t *UDPv5) collectTopicAuxNodes(topic topicindex.TopicID, reqDist []uint, r
 		return topicindex.SupportsTopicDiscovery(n) && netutil.CheckRelayAddr(remoteIP, n.IPAddr()) == nil
 	}
 	// One node is returned per distance, so cap the requested distances to keep
-	// the response (and the scan) within regtopicNodesLimit.
+	// the response within regtopicNodesLimit.
 	if len(reqDist) > regtopicNodesLimit {
 		reqDist = reqDist[:regtopicNodesLimit]
 	}

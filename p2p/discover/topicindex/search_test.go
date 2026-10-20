@@ -710,20 +710,33 @@ func TestSearchAdaptiveAskedByID(t *testing.T) {
 	}
 }
 
-// A reply cut short by an error carries no density sample: it neither moves
-// the active bucket nor counts toward the ads the pass saw.
-func TestSearchAdaptivePartialReplyNoSample(t *testing.T) {
+// A reply cut short by an error is a lower bound: its ads count toward the
+// ads the pass saw, and it is a density sample only when it reaches the
+// floor on its own, so a lost packet neither pulls the search in nor hides
+// a full reply.
+func TestSearchAdaptivePartialReply(t *testing.T) {
 	s := adaptiveSearch(t)
 	s.SetActiveBucket(3)
-	reply(t, s, 3, 16)
-	before := s.ActiveBucket()
-	regs := nodesAtDistanceFrom(enode.ID(s.topic), s.buckets[3].dist, 1, 50)
+	reply(t, s, 3, 0) // one empty sample: a second would jump the search in
+	regs := nodesAtDistanceFrom(enode.ID(s.topic), s.buckets[3].dist, 2, 50)
 	s.AddNodes(nil, regs)
-	s.AddReply(regs[0], nil, -1)
-	if s.ActiveBucket() != before {
-		t.Fatalf("active bucket moved to %d on a partial reply", s.ActiveBucket())
+	s.AddPartialReply(regs[0], nil, 0)
+	if s.ActiveBucket() != 3 {
+		t.Fatalf("active bucket moved to %d on an empty partial reply", s.ActiveBucket())
 	}
-	if s.AdsSeen() != 16 {
-		t.Fatalf("ads seen %d, want the 16 of the full reply alone", s.AdsSeen())
+	// Enough ads before the cut make a sample: with the empty one they read
+	// "at least the floor", and the bucket stays; a second full one moves out.
+	s.AddPartialReply(regs[1], nil, TopicNodesLimit)
+	if s.ActiveBucket() != 3 {
+		t.Fatalf("active bucket %d after a full partial reply and an empty one, want 3", s.ActiveBucket())
+	}
+	if s.AdsSeen() != TopicNodesLimit {
+		t.Fatalf("ads seen %d, want %d: a partial reply's ads count", s.AdsSeen(), TopicNodesLimit)
+	}
+	more := nodesAtDistanceFrom(enode.ID(s.topic), s.buckets[3].dist, 1, 60)
+	s.AddNodes(nil, more)
+	s.AddPartialReply(more[0], nil, TopicNodesLimit)
+	if s.ActiveBucket() != 2 {
+		t.Fatalf("active bucket %d after two full partial replies, want 2: full samples move the search out", s.ActiveBucket())
 	}
 }

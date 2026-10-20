@@ -312,12 +312,22 @@ func (s *Search) observe(bi int, ads int) {
 }
 
 // AddReply adds the results of a topic query response. ads is the number of
-// ads the response carried, the density sample that moves the active bucket;
-// a reply cut short, ads < 0, is no sample.
+// ads the response carried, the density sample that moves the active bucket.
 func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) {
+	s.addReply(from, results, ads, true)
+}
+
+// AddPartialReply adds the results of a response cut short by an error. Its
+// ad count is a lower bound: it counts as a density sample only when it
+// reaches the floor on its own.
+func (s *Search) AddPartialReply(from *enode.Node, results []*enode.Node, ads int) {
+	s.addReply(from, results, ads, ads >= searchYieldFloor)
+}
+
+func (s *Search) addReply(from *enode.Node, results []*enode.Node, ads int, sample bool) {
 	s.replies++
-	if ads >= 0 {
-		s.ads += ads
+	s.ads += ads
+	if sample {
 		s.observe(s.bucketIndex(from.ID()), ads)
 	}
 	s.asked.Add(from)
