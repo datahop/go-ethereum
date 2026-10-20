@@ -27,24 +27,17 @@ import (
 const (
 	searchFilterLimit = 50000
 
-	// searchMixRegistrars is the number of registrars a search mixes results
-	// from. Results are handed out while this many registrars have replied
-	// with ads in the pass, so that the first results of a pass do not all
-	// come from one registrar.
+	// Results are handed out once this many registrars replied with ads in
+	// the pass, or once the first result has waited this long.
 	searchMixRegistrars = 5
-
-	// searchMixWait bounds how long results wait for more registrars. A topic
-	// with fewer registrars than searchMixRegistrars, or a search that
-	// reaches fewer, would otherwise hold its results until the pass ends.
-	searchMixWait = 5 * time.Second
+	searchMixWait       = 5 * time.Second
 )
 
 // SearchFilter remembers the nodes returned by a topic search, so that later
-// search passes don't return them again until AdLifetime has passed. A node
-// whose record was updated meanwhile is returned once more within that time,
-// and only once, so that a record bumped on purpose cannot stay at the front
-// of every search. The filter also mixes the results of the registrars, so
-// that the results of a search come from several of them.
+// search passes don't return them again until AdLifetime has passed; a node
+// with a newer record is returned once more, and only once. It also mixes the
+// results of the registrars, so that the results of a search come from
+// several of them.
 type SearchFilter struct {
 	self  enode.ID
 	clock mclock.Clock
@@ -55,12 +48,12 @@ type SearchFilter struct {
 
 	mixRegistrars int
 	mixWait       time.Duration
-	queues        []*registrarQueue            // in arrival order of the registrars that replied with ads
-	registrars    map[enode.ID]*registrarQueue // by registrar
-	queued        map[enode.ID]*registrarQueue // nodes waiting, by the queue that holds them
-	handed        map[enode.ID]struct{}        // nodes handed out in this pass
-	firstQueued   mclock.AbsTime               // when the pass's first result was queued
-	waiting       bool                         // a result has been queued in this pass
+	queues        []*registrarQueue // in arrival order of the registrars that replied with ads
+	registrars    map[enode.ID]*registrarQueue
+	queued        map[enode.ID]*registrarQueue // waiting nodes, by the queue that holds them
+	handed        map[enode.ID]struct{}        // handed out in this pass
+	firstQueued   mclock.AbsTime
+	waiting       bool
 }
 
 // registrarQueue holds the results of one registrar that wait to be handed out.
@@ -72,7 +65,7 @@ type searchFilterEntry struct {
 	id       enode.ID
 	seq      uint64
 	expiry   mclock.AbsTime
-	returned bool // a newer record was returned again within the ttl
+	returned bool // a newer record was returned again
 }
 
 // NewSearchFilter creates an empty filter.
@@ -102,13 +95,8 @@ func (f *SearchFilter) reset() {
 }
 
 // Take queues the results of a registrar's reply and returns the results that
-// can be handed out now. The local node, results returned recently and
-// results already handed out in this pass are dropped; a result that waits
-// in another registrar's queue is kept there, with the newer record of the
-// two. A registrar whose reply held ads counts toward the mix whether or not
-// any of them was new. Results are handed out one registrar at a time once
-// searchMixRegistrars registrars have replied with ads, or once the first
-// result has waited searchMixWait. The rest wait until Release.
+// can be handed out now. A registrar counts toward the mix when its reply
+// held ads, even if every one of them already waits in another queue.
 func (f *SearchFilter) Take(registrar enode.ID, results []*enode.Node) []*enode.Node {
 	q := f.registrars[registrar]
 	for _, n := range results {
@@ -156,9 +144,9 @@ func (f *SearchFilter) Release() []*enode.Node {
 	return out
 }
 
-// mix takes one result from every registrar that has results waiting, and
-// repeats this while enough registrars have replied, or the results have
-// waited long enough. With all set, it takes every waiting result.
+// mix takes one result from every registrar that has results waiting, round
+// after round, once enough registrars have replied or the results have waited
+// long enough. With all set, it takes every waiting result.
 func (f *SearchFilter) mix(all bool) []*enode.Node {
 	if !all && len(f.queues) < f.mixRegistrars && f.waiting && f.clock.Now().Sub(f.firstQueued) >= f.mixWait {
 		all = true
@@ -187,9 +175,8 @@ func (f *SearchFilter) mix(all bool) []*enode.Node {
 	}
 }
 
-// Seen reports whether n was returned recently: with the same or a newer
-// record, or with an older record when a newer one was already returned again
-// within the ttl.
+// Seen reports whether n was returned recently, with the same or a newer
+// record, or whether its one re-delivery with a newer record was already used.
 func (f *SearchFilter) Seen(n *enode.Node) bool {
 	f.expire()
 	el, ok := f.seen[n.ID()]
@@ -208,7 +195,7 @@ func (f *SearchFilter) Add(n *enode.Node) {
 	if el, ok := f.seen[n.ID()]; ok {
 		e := el.Value.(*searchFilterEntry)
 		if n.Seq() > e.seq {
-			e.returned = true // the one re-delivery of a newer record
+			e.returned = true
 		}
 		e.seq, e.expiry = n.Seq(), expiry
 		f.order.MoveToBack(el)
