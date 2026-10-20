@@ -20,6 +20,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
@@ -32,8 +33,6 @@ const (
 	// Should there be any nodes which are closer than this, they just go into the last
 	// (closest) bucket.
 	searchTableDepth = 18
-	// SearchTableDepth is searchTableDepth for the search loop.
-	SearchTableDepth = searchTableDepth
 
 	// IP subnet limit.
 	searchBucketSubnet, searchBucketIPLimit = 24, 1
@@ -62,13 +61,12 @@ type Search struct {
 
 	active   int
 	asked    *AskedSet                // nodes queried within the last ad lifetime
-	spare    map[enode.ID]*enode.Node // asked nodes, re-asked if nothing else is left
+	spare    map[enode.ID]*enode.Node // asked nodes, re-asked oldest ask first if nothing else is left
 	spares   int                      // spares asked in this pass
-	moved    bool                     // a density sample moved the active bucket in this pass
+	placed   bool                     // a density sample placed the active bucket in this pass
 	replies  int                      // queries answered or failed in this pass
-	askedNow map[enode.ID]struct{}    // nodes asked in this pass, not re-asked as spares
+	askedNow map[enode.ID]struct{}    // nodes that answered or failed in this pass, not asked again in it
 	ads      int                      // ads the replies of this pass carried
-	failed   map[enode.ID]struct{}    // nodes that failed in this pass, not re-admitted before the next one
 
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
@@ -94,7 +92,6 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		resultSeen:  make(map[enode.ID]uint64),
 		asked:       NewAskedSet(cfg),
 		spare:       make(map[enode.ID]*enode.Node),
-		failed:      make(map[enode.ID]struct{}),
 		askedNow:    make(map[enode.ID]struct{}),
 		bucketCheck: make(map[int]struct{}, searchTableDepth),
 	}
@@ -155,12 +152,19 @@ func (s *Search) IsDone() bool {
 
 // NextPassBucket returns the bucket the next pass starts from once this one
 // is done: the active one, or the next one in when the pass ran out of
-// nodes to ask before any density sample placed the active bucket.
+// nodes to ask before any density sample placed the active bucket. Empty
+// replies push the search toward the topic, so a topic with no ads at all
+// walks to the closest bucket; from there such a pass starts the next one
+// wide again, so that advertisers appearing later are found.
 func (s *Search) NextPassBucket() int {
-	if s.activeDone() || s.moved {
-		return s.active
+	next := s.active
+	if !s.activeDone() && !s.placed {
+		next = min(s.active+1, len(s.buckets)-1)
 	}
-	return min(s.active+1, len(s.buckets)-1)
+	if s.ads == 0 && next == len(s.buckets)-1 {
+		return 0
+	}
+	return next
 }
 
 // activeDone reports whether the pass is over: the active bucket is exhausted
@@ -198,11 +202,8 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
 
-		if _, ok := s.failed[id]; ok {
-			continue
-		}
 		if _, ok := s.askedNow[id]; ok {
-			continue // answered in this pass: nothing new to ask it yet
+			continue
 		}
 		if s.asked.Has(n.ID()) {
 			s.spare[id] = n
@@ -232,13 +233,13 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 }
 
 // HandleErrorResponse drops a failed node from the table for the rest of the
-// pass, freeing its slot and IP-limit entry. It is not recorded as asked: a
-// node that did not answer may have dropped one packet, and the next pass
-// may ask it again, while a dead one leaves the routing table on its own.
+// pass, freeing its slot and IP-limit entry. It is not recorded as asked
+// beyond the pass: a node that did not answer may have dropped one packet,
+// and the next pass may ask it again, while a dead one leaves the routing
+// table on its own.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
 	s.replies++
-	s.failed[from.ID()] = struct{}{}
 	s.askedNow[from.ID()] = struct{}{}
 	s.removeNode(from.ID())
 }
@@ -270,12 +271,18 @@ func (s *Search) QueryTarget() *enode.Node {
 			}
 		}
 	}
-	if s.spares < searchSpareQueries {
-		for id, n := range s.spare {
-			s.spares++
-			delete(s.spare, id)
-			return n
+	// Spares go oldest ask first: their ads are the likeliest to have changed.
+	if s.spares < searchSpareQueries && len(s.spare) > 0 {
+		var pick *enode.Node
+		var at mclock.AbsTime
+		for _, n := range s.spare {
+			if t := s.asked.AskedAt(n.ID()); pick == nil || t < at {
+				pick, at = n, t
+			}
 		}
+		s.spares++
+		delete(s.spare, pick.ID())
+		return pick
 	}
 	return nil
 }
@@ -316,9 +323,7 @@ func (s *Search) observe(bi int, ads int) {
 	default:
 		return
 	}
-	if next != s.active {
-		s.active, s.moved = next, true
-	}
+	s.active, s.placed = next, true
 }
 
 // AddReply adds the results of a topic query response. ads is the number of
@@ -338,7 +343,6 @@ func (s *Search) addReply(from *enode.Node, results []*enode.Node, ads int, samp
 	s.replies++
 	s.ads += ads
 	s.askedNow[from.ID()] = struct{}{}
-	delete(s.spare, from.ID())
 	s.buckets[s.bucketIndex(from.ID())].answered++
 	if sample {
 		s.observe(s.bucketIndex(from.ID()), ads)

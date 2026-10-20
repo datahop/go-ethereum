@@ -813,8 +813,9 @@ func TestTopicSearchDrainsTableFeed(t *testing.T) {
 }
 
 // TestTopicSearchNextPassEmptyTopic checks that a pass without a single ad
-// starts the next one wide once the search has walked to the closest bucket,
-// and counts as idle either way, while a pass with ads keeps its bucket.
+// counts as idle wherever it lands, and that the search state starts it wide
+// again from the closest bucket, while a pass with ads that moved counts as
+// a move.
 func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 	s := &topicSearch{activeBucket: 3}
 	state := topicindex.NewSearch(topicindex.TopicID{1}, topicindex.Config{})

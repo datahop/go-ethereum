@@ -458,21 +458,11 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 }
 
 // nextPass sets where the next pass starts from the state of the one that
-// ended, and reports whether the active bucket moved. Empty replies push the
-// search toward the topic, so a topic with no ads at all walks to the closest
-// bucket and would stay there, asking only the few nodes next to the topic:
-// such a pass starts the next one wide again, and counts as idle so that the
-// back-off still grows.
+// ended, and reports whether it moved. A pass that saw no ads counts as idle
+// wherever it lands, so that the back-off grows on an empty topic.
 func (s *topicSearch) nextPass(state *topicindex.Search) (moved bool) {
 	next := state.NextPassBucket()
-	if state.AdsSeen() == 0 {
-		if next == topicindex.SearchTableDepth-1 {
-			next = 0
-		}
-		s.activeBucket = next
-		return false
-	}
-	moved = next != s.activeBucket
+	moved = next != s.activeBucket && state.AdsSeen() > 0
 	s.activeBucket = next
 	return moved
 }

@@ -53,6 +53,12 @@ func (a *AskedSet) Add(id enode.ID) {
 	}
 }
 
+// AskedAt returns when id was first asked, or zero when it is not in the set.
+func (a *AskedSet) AskedAt(id enode.ID) mclock.AbsTime {
+	a.expire()
+	return a.at[id]
+}
+
 // expire drops the entries past the ttl, at most once a second.
 func (a *AskedSet) expire() {
 	now := a.clock.Now()

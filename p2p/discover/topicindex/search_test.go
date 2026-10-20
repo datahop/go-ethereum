@@ -20,7 +20,9 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 )
@@ -529,9 +531,10 @@ func TestSearchAdaptiveWalkedDry(t *testing.T) {
 	if s.NextPassBucket() != 1 {
 		t.Fatalf("next pass at %d after walking bucket 0 dry, want 1", s.NextPassBucket())
 	}
+	// At the closest bucket with no ads seen, the next pass starts wide again.
 	s.SetActiveBucket(len(s.buckets) - 1)
-	if !s.IsDone() || s.NextPassBucket() != len(s.buckets)-1 {
-		t.Fatalf("next pass at %d, want to stay at the closest bucket", s.NextPassBucket())
+	if !s.IsDone() || s.NextPassBucket() != 0 {
+		t.Fatalf("next pass at %d, want 0 from the closest bucket of an empty topic", s.NextPassBucket())
 	}
 }
 
@@ -789,5 +792,64 @@ func TestSearchAdaptiveNoReaskInPass(t *testing.T) {
 	}
 	if got := s.QueryTarget(); got != nil {
 		t.Fatalf("node %v re-asked in the pass it answered", got.ID())
+	}
+}
+
+// A pass with no ads that reached the closest bucket starts the next one at
+// the far end, so a topic that gets its first advertisers later is found.
+func TestSearchAdaptiveEmptyTopicRestartsWide(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(len(s.buckets) - 1)
+	if got := s.NextPassBucket(); got != 0 {
+		t.Fatalf("next pass at %d after an empty pass at the closest bucket, want 0", got)
+	}
+	s.SetActiveBucket(3)
+	if got := s.NextPassBucket(); got != 4 {
+		t.Fatalf("next pass at %d after an empty pass at bucket 3, want 4", got)
+	}
+}
+
+// A sample that confirms the active bucket places it as much as one that
+// moves it: the next pass starts there, not one bucket in.
+func TestSearchAdaptiveConfirmedBucketHolds(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(5)
+	reply(t, s, 5, searchYieldFloor)
+	reply(t, s, 5, searchYieldFloor)
+	for s.PeekResult() != nil {
+		s.PopResult()
+	}
+	if s.ActiveBucket() != 5 {
+		t.Fatalf("active bucket %d after two replies at the floor, want 5", s.ActiveBucket())
+	}
+	for n := s.QueryTarget(); n != nil; n = s.QueryTarget() {
+		s.HandleErrorResponse(n, errors.New("timeout"))
+	}
+	if got := s.NextPassBucket(); got != 5 {
+		t.Fatalf("next pass at %d, want 5: the samples placed the bucket", got)
+	}
+}
+
+// Spares are re-asked oldest ask first.
+func TestSearchAdaptiveSpareOrder(t *testing.T) {
+	clock := new(mclock.Simulated)
+	config := testConfig(t)
+	config.Clock = clock
+	s := NewSearch(topic1, config)
+	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 3, 1)
+	s.AddNodes(nil, seeds)
+	var order []*enode.Node
+	for range seeds {
+		order = append(order, reply(t, s, 0, 0))
+		clock.Run(time.Second)
+	}
+
+	next := NewSearch(topic1, config)
+	next.SetAsked(s.asked)
+	next.AddNodes(nil, seeds)
+	for i, want := range order {
+		if got := next.QueryTarget(); got == nil || got.ID() != want.ID() {
+			t.Fatalf("spare %d is %v, want the one asked %d-th", i, got, i)
+		}
 	}
 }
