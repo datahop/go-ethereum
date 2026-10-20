@@ -511,10 +511,10 @@ func TestSearchAdaptiveWalkedDry(t *testing.T) {
 	if s.NextPassBucket() != 1 {
 		t.Fatalf("next pass at %d after walking bucket 0 dry, want 1", s.NextPassBucket())
 	}
-	// At the closest bucket, unasked, the next pass stays to ask it.
-	s.SetActiveBucket(len(s.buckets) - 1)
+	// Walking dry onto the closest bucket lands there: the next pass asks it.
+	s.SetActiveBucket(len(s.buckets) - 2)
 	if !s.IsDone() || s.NextPassBucket() != len(s.buckets)-1 {
-		t.Fatalf("next pass at %d, want to stay at the closest bucket until it is asked", s.NextPassBucket())
+		t.Fatalf("next pass at %d, want to land at the closest bucket", s.NextPassBucket())
 	}
 }
 
@@ -775,16 +775,17 @@ func TestSearchAdaptiveNoReaskInPass(t *testing.T) {
 	}
 }
 
-// A pass with no ads that reached the closest bucket starts the next one at
-// the far end, so a topic that gets its first advertisers later is found.
+// A pass with no ads that started at the closest bucket starts the next one
+// at the far end, so a topic that gets its first advertisers later is found.
 func TestSearchAdaptiveEmptyTopicRestartsWide(t *testing.T) {
 	s := adaptiveSearch(t)
 	last := len(s.buckets) - 1
-	s.SetActiveBucket(last)
-	// Landing at the closest bucket is not enough: it has to be asked.
+	s.SetActiveBucket(last - 1)
+	// Landing at the closest bucket is not enough: a pass has to be spent there.
 	if got := s.NextPassBucket(); got != last {
-		t.Fatalf("next pass at %d with the closest bucket unasked, want %d", got, last)
+		t.Fatalf("next pass at %d after landing at the closest bucket, want %d", got, last)
 	}
+	s.SetActiveBucket(last)
 	s.AddNodes(nil, nodesAtDistanceFrom(enode.ID(s.topic), s.buckets[last].dist, 1, 70))
 	reply(t, s, last, 0)
 	if got := s.NextPassBucket(); got != 0 {
@@ -793,6 +794,22 @@ func TestSearchAdaptiveEmptyTopicRestartsWide(t *testing.T) {
 	s.SetActiveBucket(3)
 	if got := s.NextPassBucket(); got != 4 {
 		t.Fatalf("next pass at %d after an empty pass at bucket 3, want 4", got)
+	}
+}
+
+// A pass started at an empty closest bucket that saw no ads starts wide again:
+// the closest bucket rarely holds a node to ask.
+func TestSearchAdaptiveEmptyClosestRestartsWide(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(len(s.buckets) - 1)
+	for n := s.QueryTarget(); n != nil; n = s.QueryTarget() {
+		s.AddReply(n, nil, 0)
+	}
+	if !s.IsDone() {
+		t.Fatal("pass not done with every node asked")
+	}
+	if got := s.NextPassBucket(); got != 0 {
+		t.Fatalf("next pass at %d after an empty pass at the closest bucket, want 0", got)
 	}
 }
 

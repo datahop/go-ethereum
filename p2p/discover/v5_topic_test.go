@@ -21,6 +21,7 @@ import (
 	"crypto/ecdsa"
 	"net"
 	"net/netip"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -815,8 +816,8 @@ func TestTopicSearchDrainsTableFeed(t *testing.T) {
 
 // TestTopicSearchNextPassEmptyTopic checks that a pass without a single ad
 // counts as idle wherever it lands, and that the search state starts it wide
-// again from the closest bucket, while a pass with ads that moved counts as
-// a move.
+// again once a pass at the closest bucket saw none, while a pass with ads that
+// moved counts as a move.
 func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 	s := &topicSearch{activeBucket: 3}
 	state := topicindex.NewSearch(topicindex.TopicID{1}, topicindex.Config{})
@@ -829,10 +830,12 @@ func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 	}
 	state.SetActiveBucket(1 << 10) // clamps to the closest bucket
 	last := state.ActiveBucket()
+	state.SetActiveBucket(last - 1)
 	if s.nextPass(state) || s.activeBucket != last {
-		t.Fatalf("next pass at %d with the closest bucket unasked, want %d", s.activeBucket, last)
+		t.Fatalf("next pass at %d after landing at the closest bucket, want %d", s.activeBucket, last)
 	}
-	// Asked at the closest bucket with nothing found: start wide again.
+	// A pass at the closest bucket with nothing found: start wide again.
+	state.SetActiveBucket(last)
 	near := enode.SignNull(new(enr.Record), enode.ID{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
 	state.AddReply(near, nil, 0)
 	if s.nextPass(state) || s.activeBucket != 0 {
@@ -844,6 +847,73 @@ func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 	s.activeBucket = 2
 	if !s.nextPass(state) || s.activeBucket != 1 {
 		t.Fatalf("next pass at %d after a pass with ads that ran dry, want 1 and a move", s.activeBucket)
+	}
+}
+
+// TestTopicSearchNextPassDeadFrontier checks that a bucket whose only node
+// never answers is retried by one pass, not more: the search then walks on.
+func TestTopicSearchNextPassDeadFrontier(t *testing.T) {
+	topic := topicindex.TopicID{1}
+	dead := nodeAtDistance(enode.ID(topic), 256-10, net.IP{203, 0, 113, 1})
+	helper := nodeAtDistance(enode.ID(topic), 256-3, net.IP{198, 51, 100, 1})
+	s := &topicSearch{activeBucket: 10, asked: topicindex.NewAskedSet(topicindex.Config{})}
+	var got []int
+	for range 6 {
+		state := topicindex.NewSearch(topic, topicindex.Config{})
+		state.SetActiveBucket(s.activeBucket)
+		state.SetAsked(s.asked)
+		state.AddNodes(nil, []*enode.Node{dead, helper})
+		for n := state.QueryTarget(); n != nil; n = state.QueryTarget() {
+			if n.ID() == dead.ID() {
+				state.HandleErrorResponse(n, errTimeout)
+			} else {
+				state.AddReply(n, nil, 0)
+			}
+		}
+		if !state.IsDone() {
+			t.Fatal("pass not done with every node asked")
+		}
+		s.nextPass(state)
+		got = append(got, s.activeBucket)
+	}
+	if want := []int{10, 11, 12, 13, 14, 15}; !slices.Equal(got, want) {
+		t.Fatalf("passes went to %v, want %v", got, want)
+	}
+}
+
+// TestTopicSearchNextPassPlacedFailures checks that a bucket placed by density
+// samples is kept even when every query to it failed: it is no retry.
+func TestTopicSearchNextPassPlacedFailures(t *testing.T) {
+	topic := topicindex.TopicID{1}
+	dead := nodeAtDistance(enode.ID(topic), 256-10, net.IP{203, 0, 113, 1})
+	helpers := []*enode.Node{
+		nodeAtDistance(enode.ID(topic), 256-11, net.IP{198, 51, 100, 1}),
+		nodeAtDistance(enode.ID(topic), 256-11, net.IP{192, 0, 2, 1}),
+	}
+	s := &topicSearch{activeBucket: 10, asked: topicindex.NewAskedSet(topicindex.Config{})}
+	var got []int
+	for range 2 {
+		state := topicindex.NewSearch(topic, topicindex.Config{})
+		state.SetActiveBucket(s.activeBucket)
+		state.SetAsked(s.asked)
+		state.AddNodes(nil, append([]*enode.Node{dead}, helpers...))
+		for n := state.QueryTarget(); n != nil; n = state.QueryTarget() {
+			if n.ID() == dead.ID() {
+				state.HandleErrorResponse(n, errTimeout)
+			} else {
+				state.AddReply(n, nil, topicindex.TopicNodesLimit)
+			}
+		}
+		if !state.IsDone() {
+			t.Fatal("pass not done with every node asked")
+		}
+		if s.nextPass(state) {
+			t.Fatal("a pass placed at its own bucket counted as a move")
+		}
+		got = append(got, s.activeBucket)
+	}
+	if want := []int{10, 10}; !slices.Equal(got, want) {
+		t.Fatalf("passes went to %v, want %v", got, want)
 	}
 }
 

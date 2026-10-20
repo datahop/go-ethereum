@@ -386,6 +386,7 @@ type topicSearch struct {
 	readCh       chan struct{} // the consumer took a result
 	resultFilter *topicindex.SearchFilter
 	activeBucket int
+	retried      bool          // the last pass kept its bucket because every query to it failed
 	idlePasses   int           // passes in a row that neither returned anything new nor moved the active bucket
 	queries      atomic.Uint64 // TOPICQUERY requests sent, read by tests
 	asked        *topicindex.AskedSet
@@ -459,9 +460,17 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 
 // nextPass sets where the next pass starts from the state of the one that
 // ended, and reports whether it moved. A pass that saw no ads counts as idle
-// wherever it lands, so that the back-off grows on an empty topic.
+// wherever it lands, so that the back-off grows on an empty topic. A bucket
+// whose queries all failed is kept for one retry pass only, so that a dead
+// node cannot pin the search.
 func (s *topicSearch) nextPass(state *topicindex.Search) (moved bool) {
 	next := state.NextPassBucket()
+	retry := next == s.activeBucket && state.ActiveFailed()
+	if retry && s.retried {
+		state.SetActiveBucket(next + 1)
+		next, retry = state.ActiveBucket(), false
+	}
+	s.retried = retry
 	moved = next != s.activeBucket && state.AdsSeen() > 0
 	s.activeBucket = next
 	return moved

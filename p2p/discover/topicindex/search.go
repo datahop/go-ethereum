@@ -60,6 +60,7 @@ type Search struct {
 	buckets [searchTableDepth]searchBucket
 
 	active   int
+	start    int                      // the bucket this pass started at
 	asked    *AskedSet                // nodes queried within the last ad lifetime
 	spare    map[enode.ID]*enode.Node // asked nodes, re-asked longest unasked first if nothing else is left
 	spares   int                      // spares asked in this pass
@@ -119,6 +120,14 @@ func (s *Search) ActiveBucket() int {
 // SetActiveBucket sets the bucket to query first.
 func (s *Search) SetActiveBucket(i int) {
 	s.active = max(0, min(i, len(s.buckets)-1))
+	s.start = s.active
+}
+
+// ActiveFailed reports whether the active bucket was asked in this pass and
+// every query to it failed, with no density sample placing it.
+func (s *Search) ActiveFailed() bool {
+	b := &s.buckets[s.active]
+	return !s.placed && b.done == 0 && b.failed > 0
 }
 
 // AdsSeen returns the number of ads the replies of this pass carried.
@@ -154,15 +163,15 @@ func (s *Search) IsDone() bool {
 // NextPassBucket returns the bucket the next pass starts from once this one
 // is done: the active one, or the next one in when the pass ran dry before
 // the bucket could decide, unless every query to it failed and its density
-// is still unknown. A pass that asked the closest bucket and saw no ads
+// is still unknown. A pass that started at the closest bucket and saw no ads
 // anywhere starts wide again, so that an empty topic's first advertisers
 // are found.
 func (s *Search) NextPassBucket() int {
 	next := s.active
-	if b := &s.buckets[s.active]; !s.activeDone() && !s.placed && !(b.done == 0 && b.failed > 0) {
+	if !s.activeDone() && !s.placed && !s.ActiveFailed() {
 		next = min(s.active+1, len(s.buckets)-1)
 	}
-	if last := len(s.buckets) - 1; s.ads == 0 && next == last && s.buckets[last].done > 0 {
+	if last := len(s.buckets) - 1; s.ads == 0 && next == last && s.start == last {
 		return 0
 	}
 	return next
