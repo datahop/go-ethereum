@@ -266,8 +266,8 @@ func TestSearchBucketsWithFreeSpace(t *testing.T) {
 	}
 }
 
-// The end of a pass moves the active bucket once, however often IsDone is
-// asked. The search loop asks again after it hands out held results.
+// IsDone never moves the active bucket, however often it is asked; a pass
+// that ran dry starts the next one a bucket in, through NextPassBucket.
 func TestSearchAdaptiveIsDoneOnce(t *testing.T) {
 	config := testConfig(t)
 	s := NewSearch(topic1, config)
@@ -536,15 +536,16 @@ func TestSearchAdaptiveWalkedDry(t *testing.T) {
 }
 
 // TestSearchAdaptiveSpare checks that a pass with every known node already
-// asked re-asks one of them, once, to fetch aux nodes, and walks on from any
-// unasked node those bring.
+// asked re-asks up to searchSpareQueries of them to fetch aux nodes, and
+// walks on from any unasked node those bring.
 func TestSearchAdaptiveSpare(t *testing.T) {
 	config := testConfig(t)
 	s := NewSearch(topic1, config)
-	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 2, 1)
+	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, searchSpareQueries+1, 1)
 	s.AddNodes(nil, seeds)
-	reply(t, s, 0, 0)
-	reply(t, s, 0, 0)
+	for range seeds {
+		reply(t, s, 0, 0)
+	}
 
 	next := NewSearch(topic1, config)
 	next.SetAsked(s.asked)
@@ -552,16 +553,17 @@ func TestSearchAdaptiveSpare(t *testing.T) {
 	if next.IsDone() {
 		t.Fatal("done with spare nodes still to ask")
 	}
-	helper := next.QueryTarget()
-	if helper == nil {
-		t.Fatal("no spare node offered")
-	}
-	// Both seeds are spares: the pass may re-ask up to searchSpareQueries.
-	if n := next.QueryTarget(); n == nil || n.ID() == helper.ID() {
-		t.Fatalf("second spare not offered, got %v", n)
+	// Every seed is a spare: the pass re-asks searchSpareQueries of them.
+	var helper *enode.Node
+	for i := 0; i < searchSpareQueries; i++ {
+		n := next.QueryTarget()
+		if n == nil {
+			t.Fatalf("spare %d not offered", i+1)
+		}
+		helper = n
 	}
 	if n := next.QueryTarget(); n != nil {
-		t.Fatalf("a third node %v offered with only two spares", n.ID())
+		t.Fatalf("spare %d offered, want at most %d per pass", searchSpareQueries+1, searchSpareQueries)
 	}
 	fresh := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 50)
 	next.AddNodes(helper, fresh)
@@ -644,8 +646,8 @@ func TestSearchAdaptivePassBudget(t *testing.T) {
 	}
 }
 
-// TestSearchAdaptiveFailedAsked checks that a node whose query failed is not
-// asked again by the next pass within the ad lifetime.
+// TestSearchAdaptiveFailedAsked checks that a node whose query failed is left
+// alone for the rest of the pass and asked again by the next one.
 func TestSearchAdaptiveFailedAsked(t *testing.T) {
 	config := testConfig(t)
 	s := NewSearch(topic1, config)
@@ -745,5 +747,47 @@ func TestSearchAdaptivePartialReply(t *testing.T) {
 	s.AddPartialReply(more[0], nil, TopicNodesLimit)
 	if s.ActiveBucket() != 2 {
 		t.Fatalf("active bucket %d after two full partial replies, want 2: full samples move the search out", s.ActiveBucket())
+	}
+}
+
+// A density sample that moved the active bucket places the next pass: a pass
+// that then runs dry must not undo the move by stepping in again.
+func TestSearchAdaptiveMoveSurvivesPassEnd(t *testing.T) {
+	s := adaptiveSearch(t)
+	s.SetActiveBucket(5)
+	reply(t, s, 5, TopicNodesLimit)
+	reply(t, s, 5, TopicNodesLimit)
+	if s.ActiveBucket() != 4 {
+		t.Fatalf("active bucket %d after two full replies, want 4", s.ActiveBucket())
+	}
+	for s.PeekResult() != nil {
+		s.PopResult()
+	}
+	// The rest of the pass fails without a sample and runs dry.
+	for n := s.QueryTarget(); n != nil; n = s.QueryTarget() {
+		s.HandleErrorResponse(n, errors.New("timeout"))
+	}
+	if !s.IsDone() {
+		t.Fatal("pass not done with nothing left to ask")
+	}
+	if got := s.NextPassBucket(); got != 4 {
+		t.Fatalf("next pass at %d, want 4: the move out must survive the pass end", got)
+	}
+}
+
+// A node that answered in this pass is not re-asked as a spare when it comes
+// back as an aux node.
+func TestSearchAdaptiveNoReaskInPass(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
+	s.AddNodes(nil, seeds)
+	n := reply(t, s, 0, 0)
+	s.AddNodes(n, []*enode.Node{n}) // its own record among the aux nodes
+	if len(s.spare) != 0 {
+		t.Fatal("a node that answered in this pass was queued as a spare")
+	}
+	if got := s.QueryTarget(); got != nil {
+		t.Fatalf("node %v re-asked in the pass it answered", got.ID())
 	}
 }

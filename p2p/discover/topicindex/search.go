@@ -60,13 +60,15 @@ type Search struct {
 	// Note: search buckets are ordered far -> close.
 	buckets [searchTableDepth]searchBucket
 
-	active  int
-	asked   *AskedSet                // nodes queried within the last ad lifetime
-	spare   map[enode.ID]*enode.Node // asked nodes, re-asked if nothing else is left
-	spares  int                      // spares asked in this pass
-	replies int                      // queries answered or failed in this pass
-	ads     int                      // ads the replies of this pass carried
-	failed  map[enode.ID]struct{}    // nodes that failed in this pass, not re-admitted before the next one
+	active   int
+	asked    *AskedSet                // nodes queried within the last ad lifetime
+	spare    map[enode.ID]*enode.Node // asked nodes, re-asked if nothing else is left
+	spares   int                      // spares asked in this pass
+	moved    bool                     // a density sample moved the active bucket in this pass
+	replies  int                      // queries answered or failed in this pass
+	askedNow map[enode.ID]struct{}    // nodes asked in this pass, not re-asked as spares
+	ads      int                      // ads the replies of this pass carried
+	failed   map[enode.ID]struct{}    // nodes that failed in this pass, not re-admitted before the next one
 
 	bucketCheck  map[int]struct{}
 	resultBuffer []*enode.Node
@@ -93,6 +95,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		asked:       NewAskedSet(cfg),
 		spare:       make(map[enode.ID]*enode.Node),
 		failed:      make(map[enode.ID]struct{}),
+		askedNow:    make(map[enode.ID]struct{}),
 		bucketCheck: make(map[int]struct{}, searchTableDepth),
 	}
 	dist := 256
@@ -152,9 +155,9 @@ func (s *Search) IsDone() bool {
 
 // NextPassBucket returns the bucket the next pass starts from once this one
 // is done: the active one, or the next one in when the pass ran out of
-// nodes to ask before the active bucket could decide.
+// nodes to ask before any density sample placed the active bucket.
 func (s *Search) NextPassBucket() int {
-	if s.activeDone() {
+	if s.activeDone() || s.moved {
 		return s.active
 	}
 	return min(s.active+1, len(s.buckets)-1)
@@ -198,6 +201,9 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		if _, ok := s.failed[id]; ok {
 			continue
 		}
+		if _, ok := s.askedNow[id]; ok {
+			continue // answered in this pass: nothing new to ask it yet
+		}
 		if s.asked.Has(n.ID()) {
 			s.spare[id] = n
 			continue
@@ -233,6 +239,7 @@ func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
 	s.replies++
 	s.failed[from.ID()] = struct{}{}
+	s.askedNow[from.ID()] = struct{}{}
 	s.removeNode(from.ID())
 }
 
@@ -309,7 +316,9 @@ func (s *Search) observe(bi int, ads int) {
 	default:
 		return
 	}
-	s.active = next
+	if next != s.active {
+		s.active, s.moved = next, true
+	}
 }
 
 // AddReply adds the results of a topic query response. ads is the number of
@@ -328,6 +337,8 @@ func (s *Search) AddPartialReply(from *enode.Node, results []*enode.Node, ads in
 func (s *Search) addReply(from *enode.Node, results []*enode.Node, ads int, sample bool) {
 	s.replies++
 	s.ads += ads
+	s.askedNow[from.ID()] = struct{}{}
+	delete(s.spare, from.ID())
 	s.buckets[s.bucketIndex(from.ID())].answered++
 	if sample {
 		s.observe(s.bucketIndex(from.ID()), ads)
