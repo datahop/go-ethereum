@@ -19,6 +19,7 @@ package discover
 import (
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -375,6 +376,16 @@ func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 	}
 }
 
+const (
+	// searchPassBackoff caps the gap between passes that change nothing
+	// (the default of Config.SearchPassBackoff).
+	searchPassBackoff = time.Minute
+	// searchUnreadLimit is the number of results that may wait unread before
+	// the search stops querying. It resumes when the consumer reads again.
+	// The search uses Config.TopicNodesLimit, of which this is the default.
+	searchUnreadLimit = topicindex.TopicNodesLimit
+)
+
 // topicSearch handles searching in a single topic.
 type topicSearch struct {
 	topic  topicindex.TopicID
@@ -389,17 +400,18 @@ type topicSearch struct {
 	resultCh     chan *enode.Node
 	readCh       chan struct{} // the consumer took a result
 	resultFilter *topicindex.SearchFilter
-	activeBucket int                      // where the last adaptive pass settled
-	idlePasses   int                      // passes in a row that neither returned anything new nor moved the active bucket
-	askedFilter  *topicindex.SearchFilter // nodes adaptive passes have queried
+	activeBucket int
+	retried      bool          // the last pass kept its bucket because every query to it failed
+	idlePasses   int           // passes in a row that neither returned anything new nor moved the active bucket
+	queries      atomic.Uint64 // TOPICQUERY requests sent, read by tests
+	asked        *topicindex.AskedSet
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
 
-	// contacts counts TOPICQUERY requests and distinct nodes queried; stats the
-	// rest of the search's progress.
+	// contacted counts distinct nodes queried; stats the rest of the
+	// search's progress.
 	contactsMu sync.Mutex
-	queries    int
 	contacted  map[enode.ID]struct{}
 	stats      TopicSearchStats
 	started    mclock.AbsTime
@@ -420,8 +432,8 @@ type TopicSearchStats struct {
 
 	// QueriesByBucket counts TOPICQUERY requests by the search-table bucket of
 	// the queried node, index 0 the farthest from the topic. ActiveTrace records
-	// every move of an adaptive search's active bucket, and the bucket each
-	// pass starts in, in milliseconds since the search began.
+	// every move of the search's active bucket, and the bucket each pass
+	// starts in, in milliseconds since the search began.
 	QueriesByBucket []int        `json:"queriesByBucket,omitempty"`
 	ActiveTrace     []BucketStep `json:"activeTrace,omitempty"`
 }
@@ -440,7 +452,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 		quit:         make(chan struct{}),
 		resultCh:     out,
 		resultFilter: topicindex.NewSearchFilter(sys.config),
-		askedFilter:  topicindex.NewSearchFilter(sys.config),
+		asked:        topicindex.NewAskedSet(sys.config),
 		started:      sys.config.Clock.Now(),
 
 		queryCh:     make(chan topicQueryJob),
@@ -483,7 +495,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		state.SetCycle(cycle)
 		cycle++
 		state.SetActiveBucket(s.activeBucket)
-		state.SetAskedFilter(s.askedFilter)
+		state.SetAsked(s.asked)
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
@@ -496,8 +508,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		s.contactsMu.Unlock()
 
 		exit, nresults := s.run(sys, state)
-		moved := state.ActiveBucket() != s.activeBucket
-		s.activeBucket = state.ActiveBucket()
+		moved := s.nextPass(state)
 		if exit {
 			return
 		}
@@ -505,9 +516,27 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 	}
 }
 
+// nextPass sets where the next pass starts from the state of the one that
+// ended, and reports whether it moved. A pass that saw no ads counts as idle
+// wherever it lands, so that the back-off grows on an empty topic. A bucket
+// whose queries all failed is kept for one retry pass only, so that a dead
+// node cannot pin the search.
+func (s *topicSearch) nextPass(state *topicindex.Search) (moved bool) {
+	next := state.NextPassBucket()
+	retry := next == s.activeBucket && state.ActiveFailed()
+	if retry && s.retried {
+		state.SetActiveBucket(next + 1)
+		next, retry = state.ActiveBucket(), false
+	}
+	s.retried = retry
+	moved = next != s.activeBucket && state.AdsSeen() > 0
+	s.activeBucket = next
+	return moved
+}
+
 // passGap is the minimum length of the next pass: regloopMinTime, doubling
 // after every pass that neither returned anything new nor moved the active
-// bucket, up to SearchPassBackoff.
+// bucket, up to searchPassBackoff.
 func (s *topicSearch) passGap(nresults int, moved bool) time.Duration {
 	backoff := s.config.PassBackoff()
 	if nresults > 0 || moved || backoff <= 0 {
@@ -553,7 +582,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		nextQuery topicQueryJob
 		resultCh  chan<- *enode.Node
 		result    *enode.Node
-		released  bool // the pass is over and its held results are handed out
+		released  bool // the pass is over and its waiting results are handed out
 	)
 	lastActive := state.ActiveBucket()
 
@@ -564,7 +593,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 	unread := func() int { return state.Buffered() + len(s.resultCh) }
 	for {
 		if queryCh == nil && unread() == 0 && state.IsDone() {
-			// The pass is over: hand out what the registrar limit held back.
+			// The pass is over: hand out the results that still wait in the filter.
 			if held := s.resultFilter.Release(); len(held) > 0 {
 				added := state.AddResults(held)
 				s.contactsMu.Lock()
@@ -593,12 +622,17 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 		case <-s.quit:
 			return true, nresults
 
+		case <-s.newNodesCh:
+			// Drained here as in pause: the table's feed sends under its
+			// mutex and would stall every lookup once the channel is full.
 		case <-s.readCh:
-			// The consumer read a result: the unread count changed.
 
 		case queryCh <- nextQuery:
+			s.queries.Add(1)
 			s.contactsMu.Lock()
-			s.queries++
+			if s.contacted == nil { // tests build topicSearch by hand
+				s.contacted = make(map[enode.ID]struct{})
+			}
 			s.contacted[nextQuery.dst.ID()] = struct{}{}
 			s.countQueryBucket(state.BucketIndex(nextQuery.dst.ID()), state.NumBuckets())
 			s.contactsMu.Unlock()
@@ -613,6 +647,8 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				if resp.err == errTimeout {
 					sys.transport.trackTopicRequest(resp.src, false)
 				}
+				// Results waiting in the filter may be due by now.
+				state.AddResults(s.resultFilter.Take(resp.src.ID(), nil))
 			default:
 				if resp.err != nil {
 					// Partial response: nodes arrived before the error, so the
@@ -621,17 +657,23 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				}
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
-				topicNodes := filterTopicDiscovery(resp.topicNodes)
-				state.RecordReach(resp.src, topicNodes)
+				// The density sample is the reply's size as the registrar sent
+				// it, before the searcher's own filtering drops records.
+				ads := filterTopicDiscovery(resp.topicNodes)
+				nads, sent := len(ads), len(resp.topicNodes)
+				state.RecordReach(resp.src, ads)
 				dropped := s.resultFilter.Dropped()
-				taken := s.resultFilter.Take(resp.src.ID(), topicNodes)
+				taken := s.resultFilter.Take(resp.src.ID(), ads)
 				dropped = s.resultFilter.Dropped() - dropped
-				// The density sample is the capable ads of the reply, not what Take let through.
-				added := state.AddReply(resp.src, taken, len(topicNodes))
-				// AddReply first frees the node's slot for an aux node.
+				var added int
+				if resp.err != nil {
+					added = state.AddPartialReply(resp.src, taken, nads, sent)
+				} else {
+					added = state.AddReply(resp.src, taken, nads, sent)
+				}
 				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
 				s.contactsMu.Lock()
-				s.stats.Received += len(topicNodes)
+				s.stats.Received += nads
 				s.stats.Duplicate += len(taken) - added
 				s.stats.Filtered += dropped
 				s.stats.MaxTopicPerReply = max(s.stats.MaxTopicPerReply, len(resp.topicNodes))
@@ -736,7 +778,7 @@ func (tsi *topicSearchIterator) Node() *enode.Node {
 func (tsi *topicSearchIterator) Contacts() (queries, nodes int) {
 	tsi.search.contactsMu.Lock()
 	defer tsi.search.contactsMu.Unlock()
-	return tsi.search.queries, len(tsi.search.contacted)
+	return int(tsi.search.queries.Load()), len(tsi.search.contacted)
 }
 
 // Stats reports the search's progress counters.
@@ -744,7 +786,7 @@ func (tsi *topicSearchIterator) Stats() TopicSearchStats {
 	tsi.search.contactsMu.Lock()
 	defer tsi.search.contactsMu.Unlock()
 	st := tsi.search.stats
-	st.Queries, st.Contacted = tsi.search.queries, len(tsi.search.contacted)
+	st.Queries, st.Contacted = int(tsi.search.queries.Load()), len(tsi.search.contacted)
 	st.QueriesByBucket = append([]int(nil), st.QueriesByBucket...)
 	st.ActiveTrace = append([]BucketStep(nil), st.ActiveTrace...)
 	return st

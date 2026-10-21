@@ -32,7 +32,13 @@ const (
 	// IP subnet limit.
 	regBucketSubnet, regBucketIPLimit = 24, 1
 
-	// maxTableDepth bounds Config.RegTableDepth / SearchTableDepth.
+	// regTableDepth is the default number of buckets kept in the registration
+	// table (Config.RegTableDepth, bounded by maxTableDepth).
+	//
+	// The table only keeps nodes at logdist(topic, n) > (256 - regTableDepth).
+	// Should there be any nodes which are closer than this, they just go into the last
+	// (closest) bucket.
+	regTableDepth = 18
 	maxTableDepth = 32
 )
 

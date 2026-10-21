@@ -186,7 +186,6 @@ func TestGenesisHashes(t *testing.T) {
 	}{
 		{DefaultGenesisBlock(), params.MainnetGenesisHash},
 		{DefaultSepoliaGenesisBlock(), params.SepoliaGenesisHash},
-		{DefaultHoleskyGenesisBlock(), params.HoleskyGenesisHash},
 		{DefaultHoodiGenesisBlock(), params.HoodiGenesisHash},
 	} {
 		// Test via MustCommit
@@ -196,7 +195,7 @@ func TestGenesisHashes(t *testing.T) {
 		}
 		// Test via ToBlock
 		if have := c.genesis.ToBlock().Hash(); have != c.want {
-			t.Errorf("case: %d a), want: %s, got: %s", i, c.want.Hex(), have.Hex())
+			t.Errorf("case: %d b), want: %s, got: %s", i, c.want.Hex(), have.Hex())
 		}
 	}
 }
@@ -261,9 +260,9 @@ func newDbConfig(scheme string) *triedb.Config {
 	return &triedb.Config{PathDB: &config}
 }
 
-func TestVerkleGenesisCommit(t *testing.T) {
-	var verkleTime uint64 = 0
-	verkleConfig := &params.ChainConfig{
+func TestBinaryGenesisCommit(t *testing.T) {
+	var ubtTime uint64 = 0
+	ubtConfig := &params.ChainConfig{
 		ChainID:                 big.NewInt(1),
 		HomesteadBlock:          big.NewInt(0),
 		DAOForkBlock:            nil,
@@ -281,11 +280,11 @@ func TestVerkleGenesisCommit(t *testing.T) {
 		ArrowGlacierBlock:       big.NewInt(0),
 		GrayGlacierBlock:        big.NewInt(0),
 		MergeNetsplitBlock:      nil,
-		ShanghaiTime:            &verkleTime,
-		CancunTime:              &verkleTime,
-		PragueTime:              &verkleTime,
-		OsakaTime:               &verkleTime,
-		UBTTime:                 &verkleTime,
+		ShanghaiTime:            &ubtTime,
+		CancunTime:              &ubtTime,
+		PragueTime:              &ubtTime,
+		OsakaTime:               &ubtTime,
+		UBTTime:                 &ubtTime,
 		TerminalTotalDifficulty: big.NewInt(0),
 		EnableUBTAtGenesis:      true,
 		Ethash:                  nil,
@@ -293,15 +292,13 @@ func TestVerkleGenesisCommit(t *testing.T) {
 		BlobScheduleConfig: &params.BlobScheduleConfig{
 			Cancun: params.DefaultCancunBlobConfig,
 			Prague: params.DefaultPragueBlobConfig,
-			Osaka:  params.DefaultOsakaBlobConfig,
-			UBT:    params.DefaultPragueBlobConfig,
 		},
 	}
 
 	genesis := &Genesis{
 		BaseFee:    big.NewInt(params.InitialBaseFee),
-		Config:     verkleConfig,
-		Timestamp:  verkleTime,
+		Config:     ubtConfig,
+		Timestamp:  ubtTime,
 		Difficulty: big.NewInt(0),
 		Alloc: types.GenesisAlloc{
 			{1}: {Balance: big.NewInt(1), Storage: map[common.Hash]common.Hash{{1}: {1}}},
@@ -320,17 +317,18 @@ func TestVerkleGenesisCommit(t *testing.T) {
 	config.NoAsyncFlush = true
 
 	triedb := triedb.NewDatabase(db, &triedb.Config{
-		IsUBT:  true,
-		PathDB: &config,
+		IsUBT:             true,
+		PathDB:            &config,
+		BinTrieGroupDepth: triedb.DefaultBinTrieGroupDepth,
 	})
 	block := genesis.MustCommit(db, triedb)
 	if !bytes.Equal(block.Root().Bytes(), expected) {
 		t.Fatalf("invalid genesis state root, expected %x, got %x", expected, block.Root())
 	}
 
-	// Test that the trie is verkle
+	// Test that the trie is a unified binary trie
 	if !triedb.IsUBT() {
-		t.Fatalf("expected trie to be verkle")
+		t.Fatalf("expected trie to be a unified binary trie")
 	}
 	vdb := rawdb.NewTable(db, string(rawdb.VerklePrefix))
 	if !rawdb.HasAccountTrieNode(vdb, nil) {

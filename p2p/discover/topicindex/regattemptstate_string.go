@@ -18,8 +18,9 @@ const _RegAttemptState_name = "StandbyWaitingRegistered"
 var _RegAttemptState_index = [...]uint8{0, 7, 14, 24}
 
 func (i RegAttemptState) String() string {
-	if i < 0 || i >= RegAttemptState(len(_RegAttemptState_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_RegAttemptState_index)-1 {
 		return "RegAttemptState(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _RegAttemptState_name[_RegAttemptState_index[i]:_RegAttemptState_index[i+1]]
+	return _RegAttemptState_name[_RegAttemptState_index[idx]:_RegAttemptState_index[idx+1]]
 }

@@ -90,7 +90,7 @@ func TestInternalNodeGetWithResolver(t *testing.T) {
 			ref := rs.newStemRef(stem, 1)
 			sn := rs.getStem(ref.Index())
 			sn.setValue(5, common.HexToHash("0xabcd").Bytes())
-			return rs.serializeNode(ref), nil
+			return rs.serializeNode(ref, 8), nil
 		}
 		return nil, errors.New("node not found")
 	}
@@ -283,17 +283,13 @@ func TestInternalNodeCollectNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var collectedPaths [][]byte
-	flushFn := func(path []byte, hash common.Hash, serialized []byte) {
-		pathCopy := make([]byte, len(path))
-		copy(pathCopy, path)
-		collectedPaths = append(collectedPaths, pathCopy)
+	var collectedPaths []BitArray
+	flushFn := func(path BitArray, hash common.Hash, serialized []byte) {
+		collectedPaths = append(collectedPaths, path)
 	}
 
-	err := s.collectNodes(s.root, []byte{1}, flushFn)
-	if err != nil {
-		t.Fatalf("Failed to collect nodes: %v", err)
-	}
+	initialPath := NewBitArray(1, 1)
+	s.collectNodes(s.root, initialPath, flushFn, 8)
 
 	// Should have collected 3 nodes: left stem, right stem, and the internal node itself
 	if len(collectedPaths) != 3 {

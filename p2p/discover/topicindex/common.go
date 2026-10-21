@@ -53,8 +53,7 @@ type Config struct {
 	AuxNodesLimit   int
 
 	// SearchYieldFloor is the number of ads per reply below which the search
-	// moves closer to the topic. Zero selects the default of 8. A negative
-	// value disables the adaptive distance.
+	// moves closer to the topic. Zero or negative selects the default of 8.
 	SearchYieldFloor int
 
 	// SearchAuxRadius is the number of buckets on each side of the active one
@@ -89,31 +88,31 @@ func (cfg Config) withDefaults() Config {
 		cfg.RegAttemptTimeout = cfg.AdLifetime + cfg.AdLifetime/2
 	}
 	if cfg.RegTableDepth == 0 {
-		cfg.RegTableDepth = 10
+		cfg.RegTableDepth = regTableDepth
 	}
 	if cfg.SearchTableDepth == 0 {
-		cfg.SearchTableDepth = 10
+		cfg.SearchTableDepth = searchTableDepth
 	}
 	if cfg.RegBucketSize == 0 {
-		cfg.RegBucketSize = 5
+		cfg.RegBucketSize = 10
 	}
 	if cfg.RegBucketStandbyLimit == 0 {
 		cfg.RegBucketStandbyLimit = 20
 	}
 	if cfg.SearchBucketSize == 0 {
-		cfg.SearchBucketSize = 16
+		cfg.SearchBucketSize = 8
 	}
 	if cfg.TopicNodesLimit == 0 {
-		cfg.TopicNodesLimit = 16
+		cfg.TopicNodesLimit = TopicNodesLimit
 	}
 	if cfg.AuxNodesLimit == 0 {
 		cfg.AuxNodesLimit = 8
 	}
-	if cfg.SearchYieldFloor == 0 {
-		cfg.SearchYieldFloor = 8
+	if cfg.SearchYieldFloor <= 0 {
+		cfg.SearchYieldFloor = searchYieldFloor
 	}
 	if cfg.SearchAuxRadius == 0 {
-		cfg.SearchAuxRadius = 1
+		cfg.SearchAuxRadius = searchAuxRadius
 	}
 	cfg.SearchPassBackoff = cfg.PassBackoff()
 
@@ -140,6 +139,10 @@ func (cfg Config) PassBackoff() time.Duration {
 	}
 	return cfg.SearchPassBackoff
 }
+
+// TopicNodesLimit is the default number of ads in a TOPICNODES reply
+// (Config.TopicNodesLimit).
+const TopicNodesLimit = 16
 
 // TopicID represents a topic.
 type TopicID [32]byte

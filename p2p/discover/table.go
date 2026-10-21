@@ -291,28 +291,33 @@ func (tab *Table) refresh() <-chan struct{} {
 // preferLive is true and the table contains any verified nodes, the result will not
 // contain unverified nodes. However, if there are no verified nodes at all, the result
 // will contain unverified nodes.
-func (tab *Table) findnodeByID(target enode.ID, nresults int, preferLive bool) *nodesByDistance {
+func (tab *Table) findnodeByID(target enode.ID, nresults int, preferLive bool) (nodes nodesByDistance) {
+	nodes.target = target
 	tab.mutex.Lock()
 	defer tab.mutex.Unlock()
 
 	// Scan all buckets. There might be a better way to do this, but there aren't that many
 	// buckets, so this solution should be fine. The worst-case complexity of this loop
 	// is O(tab.len() * nresults).
-	nodes := &nodesByDistance{target: target}
-	liveNodes := &nodesByDistance{target: target}
-	for _, b := range &tab.buckets {
-		for _, n := range b.entries {
-			nodes.push(n.Node, nresults)
-			if preferLive && n.isValidatedLive {
-				liveNodes.push(n.Node, nresults)
+	if preferLive {
+		for _, b := range &tab.buckets {
+			for _, n := range b.entries {
+				if n.isValidatedLive {
+					nodes.push(n.Node, nresults)
+				}
 			}
+		}
+		if len(nodes.entries) > 0 {
+			return
 		}
 	}
 
-	if preferLive && len(liveNodes.entries) > 0 {
-		return liveNodes
+	for _, b := range &tab.buckets {
+		for _, n := range b.entries {
+			nodes.push(n.Node, nresults)
+		}
 	}
-	return nodes
+	return
 }
 
 // appendBucketNodes adds nodes at the given distance to the result slice.
@@ -776,7 +781,7 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check fun
 	tab.mutex.Lock()
 	defer tab.mutex.Unlock()
 
-	// Build the set of still-wanted distances. Each is dropped once filled.
+	// Build the set of wanted distances.
 	want := make(map[uint]struct{}, len(distances))
 	for _, dist := range distances {
 		if dist == 0 || dist > 256 {
@@ -785,30 +790,31 @@ func (tab *Table) collectOnePerDist(target enode.ID, distances []uint, check fun
 		want[dist] = struct{}{}
 	}
 
-	// Single pass over the table, reservoir-sampling one checked node per
-	// wanted distance. A random pick, rather than the first entry, means the
-	// requester learns a different node each time it asks, so a search can
-	// walk a distance through many registrars instead of being handed the
-	// same few nodes by all of them.
-	pick := make(map[uint]*enode.Node, len(want))
-	seen := make(map[uint]int, len(want))
+	// Gather the candidates per distance, then pick at random among them so
+	// repeated queries walk different nodes: check decodes the record, so it
+	// runs on the picks until one passes, not on the whole table.
+	cands := make(map[uint][]*enode.Node, len(want))
 	for bi := 0; bi < len(tab.buckets); bi++ {
 		for _, n := range tab.buckets[bi].entries {
 			d := uint(enode.LogDist(target, n.ID()))
-			if _, ok := want[d]; !ok || !check(n.Node) {
-				continue
-			}
-			seen[d]++
-			if tab.rand.Intn(seen[d]) == 0 {
-				pick[d] = n.Node
+			if _, ok := want[d]; ok {
+				cands[d] = append(cands[d], n.Node)
 			}
 		}
 	}
-	nodes := make([]*enode.Node, 0, len(pick))
+	nodes := make([]*enode.Node, 0, len(want))
 	for _, dist := range distances {
-		if n, ok := pick[dist]; ok {
-			nodes = append(nodes, n)
-			delete(pick, dist)
+		c, ok := cands[dist]
+		if !ok {
+			continue
+		}
+		delete(cands, dist)
+		tab.rand.Shuffle(len(c), func(i, j int) { c[i], c[j] = c[j], c[i] })
+		for _, n := range c {
+			if check(n) {
+				nodes = append(nodes, n)
+				break
+			}
 		}
 	}
 	return nodes
@@ -824,6 +830,41 @@ func (tab *Table) deleteNode(n *enode.Node) {
 
 // waitForNodes blocks until the table contains at least n nodes.
 func (tab *Table) waitForNodes(ctx context.Context, n int) error {
+	// Wrap ctx so the forwarder goroutine exits when waitForNodes returns,
+	// regardless of whether the caller's ctx is canceled.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Set up a notification channel that gets unblocked when there was any activity on
+	// the table. Ultimately this reads from the table's nodeFeed, but can't use the feed
+	// directly on the same goroutine that takes Table.mutex, it would deadlock.
+	var notify chan struct{}
+	var notifyErr error
+	initsub := func() event.Subscription {
+		notify = make(chan struct{}, 1)
+		newnode := make(chan *enode.Node, 1)
+		sub := tab.nodeFeed.Subscribe(newnode)
+		go func() {
+			defer close(notify)
+			for {
+				select {
+				case <-newnode:
+					select {
+					case notify <- struct{}{}:
+					default:
+					}
+				case <-ctx.Done():
+					notifyErr = ctx.Err()
+					return
+				case <-tab.closeReq:
+					notifyErr = errClosed
+					return
+				}
+			}
+		}()
+		return sub
+	}
+
 	getlength := func() (count int) {
 		for _, b := range &tab.buckets {
 			count += len(b.entries)
@@ -831,28 +872,24 @@ func (tab *Table) waitForNodes(ctx context.Context, n int) error {
 		return count
 	}
 
-	var ch chan *enode.Node
 	for {
 		tab.mutex.Lock()
 		if getlength() >= n {
 			tab.mutex.Unlock()
 			return nil
 		}
-		if ch == nil {
-			// Init subscription.
-			ch = make(chan *enode.Node)
-			sub := tab.nodeFeed.Subscribe(ch)
+		if notify == nil {
+			// Lazily init the subscription. Do this while holding the
+			// lock so we don't miss any events that change the node count.
+			sub := initsub()
 			defer sub.Unsubscribe()
 		}
 		tab.mutex.Unlock()
 
-		// Wait for a node add event.
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-tab.closeReq:
-			return errClosed
+		// Wait for table event.
+		if _, ok := <-notify; !ok {
+			break
 		}
 	}
+	return notifyErr
 }

@@ -17,6 +17,7 @@
 package discover
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"fmt"
 	"math/rand"
@@ -550,6 +551,45 @@ func TestSetFallbackNodes_DNSHostname(t *testing.T) {
 	t.Logf("resolved localhost to %v", resolved.IPAddr())
 }
 
+// This test checks that waitForNodes does not block addFoundNode.
+// See https://github.com/ethereum/go-ethereum/issues/34881.
+func TestTable_waitForNodesLocking(t *testing.T) {
+	transport := newPingRecorder()
+	tab, db := newTestTable(transport, Config{})
+	defer db.Close()
+	defer tab.close()
+	<-tab.initDone
+
+	// waitForNodes will never reach this count, so it stays subscribed
+	// to nodeFeed and looping for the duration of the test.
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	defer cancelWait()
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		tab.waitForNodes(waitCtx, 1<<20)
+	}()
+
+	// Call addFoundNode in loop to send to the feed.
+	addDone := make(chan struct{})
+	go func() {
+		defer close(addDone)
+		for i := range 10000 {
+			d := 240 + (i % 17)
+			n := nodeAtDistance(tab.self().ID(), d, intIP(i))
+			tab.addFoundNode(n, true)
+		}
+	}()
+
+	select {
+	case <-addDone:
+		cancelWait()
+		<-waitDone
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlock detected: add loop did not finish within 10s")
+	}
+}
+
 // TestTable_collectOnePerDist checks that collectOnePerDist returns nodes at the
 // requested log-distances from the given target, not from the local node.
 // Regression test for #55: previously the target parameter was ignored and
@@ -699,4 +739,107 @@ func newkey() *ecdsa.PrivateKey {
 		panic("couldn't generate key: " + err.Error())
 	}
 	return key
+}
+
+// BenchmarkTable_findnodeByID exercises findnodeByID across table sizes, result
+// counts, and liveness ratios. The _PreferLive_NoLive cases cover the fallback
+// path where preferLive is requested but no validated-live nodes exist.
+func BenchmarkTable_findnodeByID(b *testing.B) {
+	benchmarks := []struct {
+		name       string
+		tableSize  int
+		nresults   int
+		preferLive bool
+		liveRatio  float64 // fraction of nodes marked validated-live
+	}{
+		{"SmallTable_5Results_NoPreferLive", 50, 5, false, 0.0},
+		{"SmallTable_16Results_NoPreferLive", 50, 16, false, 0.0},
+		{"SmallTable_5Results_PreferLive_AllLive", 50, 5, true, 1.0},
+		{"SmallTable_16Results_PreferLive_AllLive", 50, 16, true, 1.0},
+		{"SmallTable_5Results_PreferLive_HalfLive", 50, 5, true, 0.5},
+		{"SmallTable_16Results_PreferLive_HalfLive", 50, 16, true, 0.5},
+		{"SmallTable_5Results_PreferLive_NoLive", 50, 5, true, 0.0},
+		{"SmallTable_16Results_PreferLive_NoLive", 50, 16, true, 0.0},
+
+		{"MediumTable_5Results_NoPreferLive", 200, 5, false, 0.0},
+		{"MediumTable_16Results_NoPreferLive", 200, 16, false, 0.0},
+		{"MediumTable_5Results_PreferLive_AllLive", 200, 5, true, 1.0},
+		{"MediumTable_16Results_PreferLive_AllLive", 200, 16, true, 1.0},
+		{"MediumTable_5Results_PreferLive_HalfLive", 200, 5, true, 0.5},
+		{"MediumTable_16Results_PreferLive_HalfLive", 200, 16, true, 0.5},
+		{"MediumTable_5Results_PreferLive_NoLive", 200, 5, true, 0.0},
+		{"MediumTable_16Results_PreferLive_NoLive", 200, 16, true, 0.0},
+
+		{"FullTable_5Results_NoPreferLive", nBuckets * bucketSize, 5, false, 0.0},
+		{"FullTable_16Results_NoPreferLive", nBuckets * bucketSize, 16, false, 0.0},
+		{"FullTable_5Results_PreferLive_AllLive", nBuckets * bucketSize, 5, true, 1.0},
+		{"FullTable_16Results_PreferLive_AllLive", nBuckets * bucketSize, 16, true, 1.0},
+		{"FullTable_5Results_PreferLive_HalfLive", nBuckets * bucketSize, 5, true, 0.5},
+		{"FullTable_16Results_PreferLive_HalfLive", nBuckets * bucketSize, 16, true, 0.5},
+		{"FullTable_5Results_PreferLive_NoLive", nBuckets * bucketSize, 5, true, 0.0},
+		{"FullTable_16Results_PreferLive_NoLive", nBuckets * bucketSize, 16, true, 0.0},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			tab, db := newTestTable(newPingRecorder(), Config{})
+			defer db.Close()
+			defer tab.close()
+			<-tab.initDone
+
+			self := tab.self().ID()
+			nodes := make([]*enode.Node, bm.tableSize)
+			for i := range nodes {
+				// Spread across buckets by varying log-distance in the valid range.
+				d := bucketMinDistance + 1 + i%nBuckets
+				nodes[i] = nodeAtDistance(self, d, intIP(i))
+			}
+
+			liveCount := int(float64(len(nodes)) * bm.liveRatio)
+			if liveCount > 0 {
+				fillTable(tab, nodes[:liveCount], true)
+			}
+			if liveCount < len(nodes) {
+				fillTable(tab, nodes[liveCount:], false)
+			}
+
+			var target enode.ID
+			rand.Read(target[:])
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_ = tab.findnodeByID(target, bm.nresults, bm.preferLive)
+			}
+		})
+	}
+}
+
+// collectOnePerDist keeps looking past candidates the check rejects: a
+// distance whose first nodes lack the capability still yields the one that
+// has it.
+func TestTable_collectOnePerDistRejects(t *testing.T) {
+	transport := newPingRecorder()
+	tab, db := newTestTable(transport, Config{})
+	defer db.Close()
+	defer tab.close()
+
+	target := idAtDistance(tab.self().ID(), 256)
+	var last *enode.Node
+	for i := 0; i < 20; i++ {
+		n := nodeAtDistance(target, 250, net.IP{10, 9, byte(i), 1})
+		if tab.addFoundNode(n, true) {
+			last = n
+		}
+	}
+	if last == nil {
+		t.Fatal("no node inserted")
+	}
+	only := func(n *enode.Node) bool { return n.ID() == last.ID() }
+	for i := 0; i < 20; i++ {
+		got := tab.collectOnePerDist(target, []uint{250}, only)
+		if len(got) != 1 || got[0].ID() != last.ID() {
+			t.Fatalf("got %v, want the one node the check accepts", got)
+		}
+	}
 }

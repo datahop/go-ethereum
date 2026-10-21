@@ -612,7 +612,7 @@ func (t *UDPv5) waitForNodes(c *callV5, distances []uint) ([]*enode.Node, error)
 			if total == -1 {
 				total = min(int(response.RespCount), totalNodesResponseLimit)
 			}
-			if received++; received == total {
+			if received++; received >= total {
 				return nodes, nil
 			}
 		case err := <-c.err:
@@ -1055,9 +1055,11 @@ func (t *UDPv5) handlePacket(rawpacket []byte, fromAddr netip.AddrPort) error {
 			t.unhandled <- up
 			return nil
 		}
+		v5BadPacketMeter.Mark(1)
 		t.log.Debug("Bad discv5 packet", "id", fromID, "addr", addr, "err", err)
 		return err
 	}
+	markInbound(packet.Name())
 	if t.wireStats != nil {
 		name := wireStatsName(packet)
 		if r, ok := packet.(*v5wire.Regtopic); ok && t.topicTable.WasAdmitted(fromID, r.Topic) {

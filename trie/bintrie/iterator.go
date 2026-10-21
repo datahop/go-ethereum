@@ -188,24 +188,24 @@ func (it *binaryNodeIterator) Parent() common.Hash {
 	return it.store.computeHash(it.stack[len(it.stack)-2].Node)
 }
 
-// Path returns the bit-path to the current node.
+// Path returns the bit-packed path to the current node.
 // Callers must not retain references to the returned slice after calling Next.
 func (it *binaryNodeIterator) Path() []byte {
 	if it.Leaf() {
 		return it.LeafKey()
 	}
-	var path []byte
+	var path BitArray
 	for i, state := range it.stack {
 		if i >= len(it.stack)-1 {
 			break
 		}
-		path = append(path, byte(state.Index))
+		path.AppendBit(&path, uint8(state.Index))
 	}
-	return path
+	return path.KeyBytes()
 }
 
 func (it *binaryNodeIterator) NodeBlob() []byte {
-	return it.store.serializeNode(it.current)
+	return it.store.serializeNode(it.current, it.trie.groupDepth)
 }
 
 // Leaf reports whether the iterator is currently positioned at a leaf value.

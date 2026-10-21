@@ -18,26 +18,37 @@ package topicindex
 
 import (
 	"math"
-	"math/rand"
 	"slices"
 	"sync"
 	"sync/atomic"
 
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 )
 
 const (
+	// searchTableDepth is the default number of buckets kept in the search
+	// table (Config.SearchTableDepth, bounded by maxTableDepth).
+	//
+	// The table only keeps nodes at logdist(topic, n) > (256 - searchTableDepth).
+	// Should there be any nodes which are closer than this, they just go into the last
+	// (closest) bucket.
+	searchTableDepth = 18
+
 	// IP subnet limit.
 	searchBucketSubnet, searchBucketIPLimit = 24, 1
 
-	// Adaptive distance: replies per bucket that estimate its ad density,
-	// and the most buckets one estimate may move the search.
+	// Adaptive distance; the floor and radius are the defaults of
+	// Config.SearchYieldFloor and Config.SearchAuxRadius.
+	searchYieldFloor  = 8
 	searchYieldWindow = 4
 	searchMaxJump     = 4
-	// searchPassQueries bounds a pass: aux nodes can refill the active bucket
-	// for as long as the search keeps asking.
+	searchAuxRadius   = 1
+	// searchPassQueries ends a pass after this many queries whatever their
+	// outcome: aux nodes can refill the active bucket for as long as the
+	// search keeps asking.
 	searchPassQueries = 32
 )
 
@@ -50,24 +61,16 @@ type Search struct {
 	// Note: search buckets are ordered far -> close.
 	buckets []searchBucket
 
-	// active is the bucket queried when SearchYieldFloor is set. Ads are
-	// placed in every bucket, and their density per node doubles with each
-	// bucket closer to the topic, so a reply's ad count from one bucket says
-	// how many buckets away the floor is met.
-	active int
-	// asked holds the nodes an adaptive search has queried. They leave the
-	// table so their slots refill with aux nodes, and stay out until the
-	// ad lifetime has passed, so the search walks its bucket once instead
-	// of re-asking the same nodes every pass.
-	asked *SearchFilter
-	// spare holds already-asked nodes offered to this pass. When nothing
-	// unasked is left, one of them is asked again, once per pass, only for
-	// the aux nodes its reply carries: the walk resumes from those.
-	spare     map[enode.ID]*enode.Node
-	spareUsed bool
-	advanced  bool // the pass moved the active bucket at its end
-	sampled   bool // the pass added its bucket occupancy to the statistics
-	replies   int  // queries answered or failed in this pass
+	active    int
+	start     int                      // the bucket this pass started at
+	asked     *AskedSet                // nodes queried within the last ad lifetime
+	spare     map[enode.ID]*enode.Node // asked nodes; the longest unasked is re-asked once if nothing else is left
+	spareUsed bool                     // the pass re-asked its one spare
+	placed    bool                     // a density sample placed the active bucket in this pass
+	replies   int                      // queries answered or failed in this pass
+	askedNow  map[enode.ID]struct{}    // nodes that answered or failed in this pass, not asked again in it
+	ads       int                      // ads the replies of this pass carried
+	sampled   bool                     // the pass added its bucket occupancy to the statistics
 
 	bucketCheck  map[int]struct{}
 	cycle        int               // search-cycle index, set by runLoop each rollover
@@ -77,11 +80,11 @@ type Search struct {
 }
 
 type searchBucket struct {
-	dist        int
-	new         map[enode.ID]*enode.Node
-	asked       map[enode.ID]*enode.Node
-	numRequests int
-	yield       []int // ad counts of the last searchYieldWindow replies
+	dist   int
+	new    map[enode.ID]*enode.Node
+	yield  []int // ad counts of the last searchYieldWindow replies
+	done   int   // replies from this bucket in the pass, cut short or not
+	failed int   // queries to this bucket that failed in the pass
 
 	ips netutil.DistinctNetSet
 }
@@ -94,8 +97,9 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		log:         cfg.Log.New("topic", topic),
 		topic:       topic,
 		resultSeen:  make(map[enode.ID]uint64),
-		asked:       NewSearchFilter(cfg),
+		asked:       NewAskedSet(cfg),
 		spare:       make(map[enode.ID]*enode.Node),
+		askedNow:    make(map[enode.ID]struct{}),
 		bucketCheck: make(map[int]struct{}, cfg.SearchTableDepth),
 		origin:      make(map[enode.ID]bool),
 		buckets:     make([]searchBucket, cfg.SearchTableDepth),
@@ -103,9 +107,8 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 	dist := 256
 	for i := range s.buckets {
 		s.buckets[i] = searchBucket{
-			dist:  dist,
-			new:   make(map[enode.ID]*enode.Node, cfg.SearchBucketSize),
-			asked: make(map[enode.ID]*enode.Node, cfg.SearchBucketSize),
+			dist: dist,
+			new:  make(map[enode.ID]*enode.Node, cfg.SearchBucketSize),
 			ips: netutil.DistinctNetSet{
 				Subnet: searchBucketSubnet,
 				Limit:  searchBucketIPLimit,
@@ -116,39 +119,44 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 	return s
 }
 
-func (s *Search) adaptive() bool {
-	return s.cfg.SearchYieldFloor > 0
-}
-
-// ActiveBucket returns the bucket an adaptive search queries.
+// ActiveBucket returns the bucket the search queries.
 func (s *Search) ActiveBucket() int {
 	return s.active
 }
 
-// SetActiveBucket sets the bucket to query first, so a new search pass can
-// start where the previous one settled.
+// SetActiveBucket sets the bucket to query first.
 func (s *Search) SetActiveBucket(i int) {
 	s.active = max(0, min(i, len(s.buckets)-1))
+	s.start = s.active
 }
 
-// SetAskedFilter shares the record of queried nodes between search passes.
-func (s *Search) SetAskedFilter(f *SearchFilter) {
-	s.asked = f
+// ActiveFailed reports whether the active bucket was asked in this pass and
+// every query to it failed, with no density sample placing it.
+func (s *Search) ActiveFailed() bool {
+	b := &s.buckets[s.active]
+	return !s.placed && b.done == 0 && b.failed > 0
 }
 
-// IsDone reports when the search table peers are all consumed. When it returns true,
-// this search state should be abandoned and a new search started using a
-// fresh Search instance.
+// AdsSeen returns the number of ads the replies of this pass carried.
+func (s *Search) AdsSeen() int {
+	return s.ads
+}
+
+// SetAsked shares the record of queried nodes between search passes.
+func (s *Search) SetAsked(a *AskedSet) {
+	s.asked = a
+}
+
+// IsDone reports when the pass is over. When it returns true, this search
+// state should be abandoned and a new search started using a fresh Search
+// instance, at NextPassBucket.
 func (s *Search) IsDone() bool {
 	// The search cannot be done while there are unused results in the buffer.
 	if len(s.resultBuffer) > 0 {
 		return false
 	}
-	// An adaptive pass ends when the active bucket has been worked through
-	// and had enough replies to decide where the next pass goes. A bucket
-	// too sparse to decide falls through: the search keeps asking the
-	// nearest populated buckets until one of them settles it.
-	if s.adaptive() && s.activeDone() {
+	if s.activeDone() {
+		s.sample()
 		return true
 	}
 	// The search cannot be done while there are still nodes that could be asked.
@@ -157,52 +165,63 @@ func (s *Search) IsDone() bool {
 			return false
 		}
 	}
-	if s.adaptive() && !s.spareUsed && len(s.spare) > 0 {
-		return false
+	done := s.spareUsed || len(s.spare) == 0
+	if done {
+		s.sample()
 	}
-	// No unasked nodes remain and no results are buffered: the search is
-	// done. There is no more nodes to query.
-	if !s.sampled {
-		s.sampled = true
-		for i := range s.buckets {
-			provBucketOcc[i].Add(int64(s.buckets[i].count()))
-		}
-		provBucketCount.Store(int64(len(s.buckets)))
-		provBucketSamples.Add(1)
-	}
-	// An adaptive search that walked everything it could reach continues one
-	// bucket closer next pass, where the ads are denser and the nodes differ.
-	// IsDone can be asked again after held results are handed out: move once.
-	if s.adaptive() && !s.advanced && s.active < len(s.buckets)-1 {
-		s.active++
-		s.advanced = true
-	}
-	return true
+	return done
 }
 
-// activeDone reports whether the pass is over: the active bucket is exhausted
-// with enough replies to place the next pass, or the pass spent its queries.
+// sample adds the pass's bucket occupancy to the statistics, once.
+func (s *Search) sample() {
+	if s.sampled {
+		return
+	}
+	s.sampled = true
+	for i := range s.buckets {
+		provBucketOcc[i].Add(int64(s.buckets[i].count()))
+	}
+	provBucketCount.Store(int64(len(s.buckets)))
+	provBucketSamples.Add(1)
+}
+
+// NextPassBucket returns the bucket the next pass starts from once this one
+// is done: the active one, or the next one in when the pass ran dry before
+// the bucket could decide, unless every query to it failed and its density
+// is still unknown. A pass that started at the closest bucket and saw no ads
+// anywhere starts wide again, so that an empty topic's first advertisers
+// are found.
+func (s *Search) NextPassBucket() int {
+	next := s.active
+	if !s.activeDone() && !s.placed && !s.ActiveFailed() {
+		next = min(s.active+1, len(s.buckets)-1)
+	}
+	if last := len(s.buckets) - 1; s.ads == 0 && next == last && s.start == last {
+		return 0
+	}
+	return next
+}
+
+// activeDone reports whether the pass is over: the pass spent its queries, or
+// the active bucket is exhausted with enough samples to place the next pass.
 func (s *Search) activeDone() bool {
 	b := &s.buckets[s.active]
 	return s.replies >= searchPassQueries || (len(b.new) == 0 && len(b.yield) >= 2)
 }
 
-// BucketsWithFreeSpace gives n distances from the topic at which
-// the table has space available. An adaptive search lists the distances
-// within SearchAuxRadius of its active bucket, and only those unless the
-// radius is negative.
+// BucketsWithFreeSpace gives the distances from the topic within
+// SearchAuxRadius of the active bucket at which the table has space
+// available, and every such distance when the radius is negative.
 func (s *Search) BucketsWithFreeSpace(dists []uint) []uint {
 	free := func(i int) bool { return s.buckets[i].count() < s.cfg.SearchBucketSize }
-	if s.adaptive() {
-		r := max(1, s.cfg.SearchAuxRadius)
-		for i := max(0, s.active-r); i <= min(len(s.buckets)-1, s.active+r); i++ {
-			if free(i) {
-				dists = append(dists, uint(s.buckets[i].dist))
-			}
+	r := max(1, s.cfg.SearchAuxRadius)
+	for i := max(0, s.active-r); i <= min(len(s.buckets)-1, s.active+r); i++ {
+		if free(i) {
+			dists = append(dists, uint(s.buckets[i].dist))
 		}
-		if s.cfg.SearchAuxRadius > 0 {
-			return dists
-		}
+	}
+	if s.cfg.SearchAuxRadius > 0 {
+		return dists
 	}
 	for i := range s.buckets {
 		if free(i) && !slices.Contains(dists, uint(s.buckets[i].dist)) {
@@ -229,7 +248,10 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
 
-		if s.adaptive() && s.asked.Has(n.ID()) {
+		if _, ok := s.askedNow[id]; ok {
+			continue
+		}
+		if s.asked.Has(n.ID()) {
 			s.spare[id] = n
 			continue
 		}
@@ -270,69 +292,34 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
-// HandleErrorResponse drops a failed node from the table, freeing its slot and
-// IP-limit entry.
+// HandleErrorResponse drops a failed node from the table for the rest of the
+// pass. It is not recorded as asked beyond the pass: one dropped packet is no
+// reason to lose a registrar for an ad lifetime.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
 	s.replies++
-	if s.adaptive() {
-		s.asked.Add(from)
-	}
-	s.removeNode(from.ID())
+	s.askedNow[from.ID()] = struct{}{}
+	delete(s.spare, from.ID())
+	s.buckets[s.bucketIndex(from.ID())].failed++
+	s.removeNode(from.ID(), false)
 }
 
-// removeNode drops a node from the search table. The node is removed from both
-// the unasked ('new') and asked sets of its bucket, and its IP-limit entry is
-// released regardless of which set it was in.
-func (s *Search) removeNode(id enode.ID) {
+// removeNode drops a node from its bucket. With keepIP its subnet stays
+// counted against the bucket's IP limit for the pass, so a node that
+// answered cannot be replaced by another from its own subnet.
+func (s *Search) removeNode(id enode.ID, keepIP bool) {
 	b := s.bucket(id)
-	n, ok := b.new[id]
-	if !ok {
-		n, ok = b.asked[id]
-	}
-	if ok {
+	if n, ok := b.new[id]; ok && !keepIP {
 		if ip := n.IP(); ip != nil && !netutil.IsLAN(ip) {
 			b.ips.Remove(ip)
 		}
 	}
 	delete(b.new, id)
-	delete(b.asked, id)
 }
 
-// QueryTarget returns a random node to which a topic query should be sent.
-// Random nodes are collected from buckets progressively: only buckets with unasked nodes
-// that have received at least one response, plus the next unqueried bucket
-// with candidates, join the random pool.
+// QueryTarget picks an unasked node in the active bucket, or in the nearest
+// bucket that has one. It returns nil once the pass is over.
 func (s *Search) QueryTarget() *enode.Node {
-	if s.adaptive() {
-		return s.adaptiveTarget()
-	}
-	// Collect buckets with new nodes.
-	withnew := make([]*searchBucket, 0, len(s.buckets))
-	for i := range s.buckets {
-		if len(s.buckets[i].new) > 0 {
-			withnew = append(withnew, &s.buckets[i])
-			// Stop here if no request was ever sent in this bucket.
-			if s.buckets[i].numRequests == 0 {
-				break
-			}
-		}
-	}
-
-	if len(withnew) > 0 {
-		// Select an unasked node in a random bucket.
-		b := withnew[rand.Intn(len(withnew))]
-		for _, n := range b.new {
-			return n
-		}
-	}
-	return nil
-}
-
-// adaptiveTarget picks an unasked node in the active bucket. While that bucket
-// has no candidates, it asks the nearest bucket that has some, farther side
-// first: the reply carries nodes at the active distance.
-func (s *Search) adaptiveTarget() *enode.Node {
 	if s.activeDone() {
 		return nil
 	}
@@ -346,20 +333,27 @@ func (s *Search) adaptiveTarget() *enode.Node {
 			}
 		}
 	}
+	// Spares go longest unasked first: their ads are the likeliest to have
+	// changed.
 	if !s.spareUsed {
+		var pick *enode.Node
+		var at mclock.AbsTime
 		for id, n := range s.spare {
+			if t := s.asked.LastAsked(id); pick == nil || t < at {
+				pick, at = n, t
+			}
+		}
+		if pick != nil {
 			s.spareUsed = true
-			delete(s.spare, id)
-			return n
+			delete(s.spare, pick.ID())
+			return pick
 		}
 	}
 	return nil
 }
 
-// observe records a reply's ad count for the bucket it came from and moves
-// the active bucket once the bucket has two samples: one closer to the topic
-// per halving of the density needed to reach the floor, one farther when
-// replies are full. Medians keep a single lying reply from steering.
+// observe records the ad count of a reply and moves the active bucket by
+// the median of the recent replies from that bucket.
 func (s *Search) observe(bi int, ads int) {
 	b := &s.buckets[bi]
 	b.yield = append(b.yield, ads)
@@ -395,14 +389,15 @@ func (s *Search) observe(bi int, ads int) {
 	default:
 		return
 	}
-	s.active = next
+	s.active, s.placed = next, true
 }
 
-// AddQueryResults adds the response nodes for a topic query to the table.
-// AddQueryResults returns how many results were new to this search.
-func (s *Search) AddQueryResults(from *enode.Node, results []*enode.Node) int {
-	s.RecordReach(from, results)
-	return s.AddReply(from, results, len(results))
+// AddReply adds the results of a topic query response. ads is the number of
+// usable ads the response carried, counted by AdsSeen. sent is the number of
+// records as the registrar sent them, the density sample that moves the
+// active bucket. It returns how many results were new to this search.
+func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads, sent int) int {
+	return s.addReply(from, results, ads, sent, true)
 }
 
 // RecordReach records the ads of a registrar's reply (reach instrumentation).
@@ -410,33 +405,30 @@ func (s *Search) RecordReach(from *enode.Node, ads []*enode.Node) {
 	recordReach(s.cfg.Self, from.ID(), s.cycle, ads)
 }
 
-// AddReply adds the results taken from a topic query response. ads is the
-// number of ads the response carried, which can be more than the results
-// taken from it. It is the density sample of an adaptive search. AddReply
-// returns how many results were new to this search.
-func (s *Search) AddReply(from *enode.Node, results []*enode.Node, ads int) int {
-	s.replies++
-	b := s.bucket(from.ID())
-	b.setAsked(from)
-	b.numRequests++
-	if s.adaptive() {
-		s.observe(s.bucketIndex(from.ID()), ads)
-		s.asked.Add(from)
-		s.removeNode(from.ID())
-	}
+// AddPartialReply adds the results of a response cut short by an error. Its
+// record count is a lower bound: it counts as a density sample only when it
+// reaches the floor on its own.
+func (s *Search) AddPartialReply(from *enode.Node, results []*enode.Node, ads, sent int) int {
+	return s.addReply(from, results, ads, sent, sent >= s.cfg.SearchYieldFloor)
+}
 
-	referral := s.origin[from.ID()]
-	newAds := 0
-	for _, n := range results {
-		if n.ID() == s.cfg.Self {
-			continue
-		}
-		s.cfg.Log.Debug("Added topic search result", "topic", s.topic, "fromid", from.ID(), "rid", n.ID())
-		if s.addResult(n) {
-			newAds++
-		}
+func (s *Search) addReply(from *enode.Node, results []*enode.Node, ads, sent int, sample bool) int {
+	s.replies++
+	s.ads += ads
+	s.askedNow[from.ID()] = struct{}{}
+	delete(s.spare, from.ID())
+	s.buckets[s.bucketIndex(from.ID())].done++
+	if sample {
+		s.observe(s.bucketIndex(from.ID()), sent)
 	}
-	if referral {
+	s.asked.Add(from.ID())
+	s.removeNode(from.ID(), true)
+
+	// The results may come from several registrars when the filter mixes
+	// them, so they are not attributed to from.
+	s.cfg.Log.Debug("Topic query answered", "topic", s.topic, "fromid", from.ID(), "n", len(results))
+	newAds := s.AddResults(results)
+	if s.origin[from.ID()] {
 		provQueriedReferral.Add(1)
 		provAdsReferral.Add(int64(newAds))
 	} else {
@@ -458,9 +450,10 @@ func (s *Search) AddResults(nodes []*enode.Node) int {
 }
 
 // addResult buffers a result unless the node was already a result of this
-// search with a record at least as new. It reports whether n was buffered.
+// search. A newer record of a node is left for the next pass. It reports
+// whether n was buffered.
 func (s *Search) addResult(n *enode.Node) bool {
-	if seq, seen := s.resultSeen[n.ID()]; seen && seq >= n.Seq() {
+	if _, seen := s.resultSeen[n.ID()]; seen {
 		return false
 	}
 	s.resultSeen[n.ID()] = n.Seq()
@@ -510,18 +503,12 @@ func (s *Search) bucket(id enode.ID) *searchBucket {
 }
 
 func (b *searchBucket) contains(id enode.ID) bool {
-	_, inNew := b.new[id]
-	_, inAsked := b.asked[id]
-	return inNew || inAsked
+	_, ok := b.new[id]
+	return ok
 }
 
 func (b *searchBucket) count() int {
-	return len(b.new) + len(b.asked)
-}
-
-func (b *searchBucket) setAsked(n *enode.Node) {
-	b.asked[n.ID()] = n
-	delete(b.new, n.ID())
+	return len(b.new)
 }
 
 // reachData records, per searcher (self ID), the set of registrars it queried,

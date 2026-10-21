@@ -17,21 +17,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"slices"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/devp2p/internal/v5test"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/enode"
-	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/urfave/cli/v2"
 )
 
@@ -65,6 +63,7 @@ var (
 		Action: discv5Crawl,
 		Flags: slices.Concat(discoveryNodeFlags, []cli.Flag{
 			crawlTimeoutFlag,
+			crawlParallelismFlag,
 		}),
 	}
 	discv5TestCommand = &cli.Command{
@@ -163,25 +162,14 @@ func discv5Listen(ctx *cli.Context) error {
 
 	fmt.Println(disc.Self())
 
-	rpcAddr := ctx.String(httpAddrFlag.Name)
-	if rpcAddr == "" {
-		// Non-RPC mode: just wait forever.
-		select {}
-	}
-
 	api := &discAPI{
-		host:          disc,
+		discv5API:     &discv5API{disc},
 		searchTimeout: defaultSearchTimeout,
 	}
 	if extConfig != nil && extConfig.SearchTimeoutSeconds > 0 {
 		api.searchTimeout = time.Duration(extConfig.SearchTimeoutSeconds) * time.Second
 	}
-	log.Info("Starting RPC API server", "addr", rpcAddr)
-	srv := rpc.NewServer()
-	srv.RegisterName("discv5", api)
-	http.DefaultServeMux.Handle("/", srv)
-	httpsrv := http.Server{Addr: rpcAddr, Handler: http.DefaultServeMux}
-	return httpsrv.ListenAndServe()
+	return runRPCServer(ctx.String(httpAddrFlag.Name), map[string]any{"discv5": api})
 }
 
 // startV5 starts an ephemeral discovery v5 node.
@@ -212,6 +200,25 @@ func startV5(ctx *cli.Context, extConfig *discv5NodeConfig) (*discover.UDPv5, di
 		exit(err)
 	}
 	return disc, config
+}
+
+type discv5API struct {
+	host *discover.UDPv5
+}
+
+func (api *discv5API) LookupRandom(ctx context.Context, n int) []*enode.Node {
+	n = min(n, maxLookupResults)
+	it := api.host.RandomNodes()
+	defer it.Close()
+	go func() {
+		<-ctx.Done()
+		it.Close()
+	}()
+	return enode.ReadNodes(it, n)
+}
+
+func (api *discv5API) Self() *enode.Node {
+	return api.host.Self()
 }
 
 // --- Topic discovery config and RPC API ---
@@ -252,7 +259,7 @@ func loadDiscv5Config(file string) (*discv5NodeConfig, error) {
 }
 
 type discAPI struct {
-	host          *discover.UDPv5
+	*discv5API
 	searchTimeout time.Duration
 }
 
