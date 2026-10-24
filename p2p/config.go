@@ -20,6 +20,7 @@ import (
 	"crypto/ecdsa"
 	"encoding"
 	"fmt"
+
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -61,6 +62,8 @@ type Config struct {
 	DiscoveryV5 bool `toml:",omitempty"`
 	// DiscoveryV5Topic configures topic discovery on the discv5 listener.
 	DiscoveryV5Topic topicindex.Config `toml:"-"`
+	// DiscoveryV5Pinned are kept in the discv5 table as live and never evicted.
+	DiscoveryV5Pinned []*enode.Node `toml:"-"`
 
 	// Name sets the node name of this server.
 	Name string `toml:"-"`

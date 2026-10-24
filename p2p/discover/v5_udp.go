@@ -868,6 +868,10 @@ func (t *UDPv5) dispatch() {
 		case ct := <-t.respTimeoutCh:
 			active := t.activeCallByNode[ct.c.id]
 			if ct.c == active && ct.timer == active.timeout {
+				if t.wireStats != nil {
+					ghost := ct.c.node != nil && IsTestbedGhost(ct.c.node)
+					t.wireStats.countTimeout(t.wireStats.txName(ct.c.packet), ghost, ghost && t.tab.isPinned(ct.c.id))
+				}
 				ct.c.err <- errTimeout
 			}
 

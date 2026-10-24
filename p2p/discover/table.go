@@ -114,6 +114,7 @@ type addNodeOp struct {
 	node         *enode.Node
 	isInbound    bool
 	forceSetLive bool // for tests
+	pinned       bool
 }
 
 type trackRequestOp struct {
@@ -152,6 +153,7 @@ func newTable(t transport, db *enode.DB, cfg Config) (*Table, error) {
 	if err := tab.setFallbackNodes(cfg.Bootnodes); err != nil {
 		return nil, err
 	}
+	tab.addPinnedNodes(cfg.PinnedNodes)
 	tab.loadSeedNodes()
 
 	return tab, nil
@@ -510,6 +512,36 @@ func (tab *Table) loadSeedNodes() {
 	}
 }
 
+// addPinnedNodes inserts cfg.PinnedNodes while the buckets are still empty.
+func (tab *Table) addPinnedNodes(nodes []*enode.Node) {
+	tab.mutex.Lock()
+	defer tab.mutex.Unlock()
+	for _, n := range nodes {
+		if err := n.ValidateComplete(); err != nil {
+			tab.log.Debug("Rejected pinned node", "id", n.ID(), "err", err)
+			continue
+		}
+		if n.ID() == tab.self().ID() {
+			continue
+		}
+		if !tab.handleAddNode(addNodeOp{node: n, pinned: true}) {
+			tab.log.Debug("Pinned node not added", "id", n.ID(), "ip", n.IPAddr())
+		}
+	}
+}
+
+// isPinned reports whether the table holds id as a pinned entry.
+func (tab *Table) isPinned(id enode.ID) bool {
+	tab.mutex.Lock()
+	defer tab.mutex.Unlock()
+	for _, e := range tab.bucket(id).entries {
+		if e.ID() == id {
+			return e.pinned
+		}
+	}
+	return false
+}
+
 func (tab *Table) nextRefreshTime() time.Duration {
 	half := tab.cfg.RefreshInterval / 2
 	return half + time.Duration(tab.rand.Int63n(int64(half)))
@@ -585,10 +617,11 @@ func (tab *Table) handleAddNode(req addNodeOp) bool {
 
 	// Add to bucket.
 	wn := &tableNode{Node: req.node}
-	if req.forceSetLive {
+	if req.forceSetLive || req.pinned {
 		wn.livenessChecks = 1
 		wn.isValidatedLive = true
 	}
+	wn.pinned = req.pinned
 	b.entries = append(b.entries, wn)
 	b.replacements = deleteNode(b.replacements, wn.ID())
 	tab.nodeAdded(b, wn)
@@ -649,8 +682,12 @@ func (tab *Table) deleteInBucket(b *bucket, id enode.ID) *tableNode {
 		return nil
 	}
 
-	// Remove the node.
 	n := b.entries[index]
+	if n.pinned {
+		return nil // pinned entries leave only with the table
+	}
+
+	// Remove the node.
 	b.entries = slices.Delete(b.entries, index, index+1)
 	tab.removeIP(b, n.IPAddr())
 	tab.nodeRemoved(b, n)
@@ -679,6 +716,9 @@ func (tab *Table) bumpInBucket(b *bucket, newRecord *enode.Node, isInbound bool)
 		return nil, false // not in bucket
 	}
 	n = b.entries[i]
+	if n.pinned {
+		return n, false
+	}
 
 	// For inbound updates (from the node itself) we accept any change, even if it sets
 	// back the sequence number. For found nodes (!isInbound), seq has to advance. Note
@@ -735,7 +775,7 @@ func (tab *Table) handleTrackRequest(op trackRequestOp) {
 
 	// Add found nodes.
 	for _, n := range op.foundNodes {
-		tab.handleAddNode(addNodeOp{n, false, false})
+		tab.handleAddNode(addNodeOp{node: n})
 	}
 }
 

@@ -41,6 +41,25 @@ type WireCounter struct {
 	TxBytes int64 `json:"txBytes"`
 	RxMsgs  int64 `json:"rxMsgs"`
 	RxBytes int64 `json:"rxBytes"`
+
+	Timeouts         int64 `json:"timeouts"`
+	GhostTimeouts    int64 `json:"ghostTimeouts"`    // calls to records carrying TestbedGhost
+	OwnGhostTimeouts int64 `json:"ownGhostTimeouts"` // of which to a ghost pinned in this table
+}
+
+// TestbedGhost is the "ghost" ENR entry the testbed sets on unreachable records
+// it pins into tables. Only the wire counters read it.
+type TestbedGhost uint
+
+// TestbedGhostMark is the value of the entry on testbed ghost records.
+const TestbedGhostMark TestbedGhost = 1
+
+func (TestbedGhost) ENRKey() string { return "ghost" }
+
+// IsTestbedGhost reports whether n is a testbed ghost record.
+func IsTestbedGhost(n *enode.Node) bool {
+	var v TestbedGhost
+	return n.Record().Load(&v) == nil && v == TestbedGhostMark
 }
 
 // renewalRegtopicName is the counter key for REGTOPIC requests to a registrar
@@ -236,6 +255,22 @@ func (ws *wireStats) countTx(name string, bytes int) {
 	c := ws.counter(name)
 	c.TxMsgs++
 	c.TxBytes += int64(bytes)
+	ws.mu.Unlock()
+}
+
+func (ws *wireStats) countTimeout(name string, ghost, own bool) {
+	if ws == nil {
+		return
+	}
+	ws.mu.Lock()
+	c := ws.counter(name)
+	c.Timeouts++
+	if ghost {
+		c.GhostTimeouts++
+	}
+	if own {
+		c.OwnGhostTimeouts++
+	}
 	ws.mu.Unlock()
 }
 

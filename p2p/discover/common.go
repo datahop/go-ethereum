@@ -63,6 +63,10 @@ type Config struct {
 	RefreshInterval         time.Duration // used in bucket refresh
 	NoFindnodeLivenessCheck bool          // turns off validation of table nodes in FINDNODE handler
 
+	// PinnedNodes are kept as validated-live table entries that are never
+	// revalidated or evicted. The testbed uses them for unreachable records.
+	PinnedNodes []*enode.Node
+
 	// Topic system configuration:
 	Topic topicindex.Config
 

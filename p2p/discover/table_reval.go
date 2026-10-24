@@ -56,6 +56,9 @@ func (tr *tableRevalidation) init(cfg *Config) {
 
 // nodeAdded is called when the table receives a new node.
 func (tr *tableRevalidation) nodeAdded(tab *Table, n *tableNode) {
+	if n.pinned {
+		return
+	}
 	tr.fast.push(n, tab.cfg.Clock.Now(), &tab.rand)
 }
 
