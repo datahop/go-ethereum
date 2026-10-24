@@ -86,6 +86,9 @@ type UDPv5 struct {
 	// misc buffers used during message handling
 	logcontext []interface{}
 
+	// per-message-type wire counters (nil unless enabled)
+	wireStats *wireStats
+
 	// talkreq handler registry
 	talk *talkSystem
 
@@ -187,6 +190,7 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		closeCtx:       closeCtx,
 		cancelCloseCtx: cancelCloseCtx,
 	}
+	t.wireStats = newWireStats()
 	t.talk = newTalkSystem(t)
 	tab, err := newTable(t, t.db, cfg)
 	if err != nil {
@@ -579,6 +583,10 @@ func (t *UDPv5) dispatch() {
 		case ct := <-t.respTimeoutCh:
 			active := t.activeCallByNode[ct.c.id]
 			if ct.c == active && ct.timer == active.timeout {
+				if t.wireStats != nil {
+					ghost := ct.c.node != nil && IsTestbedGhost(ct.c.node)
+					t.wireStats.countTimeout(ct.c.packet.Name(), ghost, ghost && t.tab.isPinned(ct.c.id))
+				}
 				ct.c.err <- errTimeout
 			}
 
@@ -697,6 +705,7 @@ func (t *UDPv5) send(toID enode.ID, toAddr netip.AddrPort, packet v5wire.Packet,
 	}
 
 	_, err = t.conn.WriteToUDPAddrPort(enc, toAddr)
+	t.wireStats.countTx(packet.Name(), len(enc))
 	t.log.Trace(">> "+packet.Name(), t.logcontext...)
 	return nonce, err
 }
@@ -755,6 +764,7 @@ func (t *UDPv5) handlePacket(rawpacket []byte, fromAddr netip.AddrPort) error {
 		return err
 	}
 	markInbound(packet.Name())
+	t.wireStats.countRx(wireStatsName(packet), len(rawpacket))
 	if fromNode != nil {
 		// Handshake succeeded, add to table.
 		t.tab.addInboundNode(fromNode)
