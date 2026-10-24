@@ -530,6 +530,23 @@ func TestUDPv5_multipleHandshakeRounds(t *testing.T) {
 	}
 }
 
+// pinNode inserts n as a pinned entry through the table loop.
+func pinNode(tab *Table, n *enode.Node) {
+	tab.addNodeCh <- addNodeOp{node: n, pinned: true}
+	<-tab.addNodeHandled
+}
+
+func TestUDPv5_findnodePinned(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	pinned := nodeAtDistance(test.table.self().ID(), 253, net.IP{10, 0, 2, 1})
+	pinNode(test.table, pinned)
+	test.packetIn(&v5wire.Findnode{ReqID: []byte{0}, Distances: []uint{253}})
+	test.expectNodes([]byte{0}, 1, []*enode.Node{pinned})
+}
+
 // This test checks that calls with n replies may take up to n * respTimeout.
 func TestUDPv5_callTimeoutReset(t *testing.T) {
 	t.Parallel()

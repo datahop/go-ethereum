@@ -460,6 +460,7 @@ func (srv *Server) setupDiscovery() error {
 			PrivateKey:  srv.PrivateKey,
 			NetRestrict: srv.NetRestrict,
 			Bootnodes:   srv.BootstrapNodesV5,
+			PinnedNodes: srv.DiscoveryV5Pinned,
 			Log:         srv.log,
 		}
 		srv.discv5, err = discover.ListenV5(sconn, srv.localnode, cfg)

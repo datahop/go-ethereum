@@ -40,6 +40,7 @@ type tableNode struct {
 	addedToBucket   time.Time // time it was added in the actual bucket
 	livenessChecks  uint      // how often liveness was checked
 	isValidatedLive bool      // true if existence of node is considered validated right now
+	pinned          bool      // never revalidated, updated or removed (Config.PinnedNodes)
 }
 
 func unwrapNodes(ns []*tableNode) []*enode.Node {

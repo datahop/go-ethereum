@@ -58,6 +58,8 @@ type Config struct {
 	// DiscoveryV5 specifies whether the new topic-discovery based V5 discovery
 	// protocol should be started or not.
 	DiscoveryV5 bool `toml:",omitempty"`
+	// DiscoveryV5Pinned are kept in the discv5 table as live and never evicted.
+	DiscoveryV5Pinned []*enode.Node `toml:"-"`
 
 	// Name sets the node name of this server.
 	Name string `toml:"-"`

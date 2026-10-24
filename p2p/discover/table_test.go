@@ -671,3 +671,92 @@ func BenchmarkTable_findnodeByID(b *testing.B) {
 		})
 	}
 }
+
+// pinnedNodeAtDistance returns a v4-signed node at log distance d from base.
+func pinnedNodeAtDistance(base enode.ID, d int, ip net.IP) *enode.Node {
+	for {
+		n := enode.NewV4(&newkey().PublicKey, ip, 0, 30303)
+		if enode.LogDist(base, n.ID()) == d {
+			return n
+		}
+	}
+}
+
+func TestTable_pinnedNodes(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	transport := newPingRecorder()
+	g255 := pinnedNodeAtDistance(nullNode.ID(), 255, net.IP{10, 0, 0, 1})
+	g250 := pinnedNodeAtDistance(nullNode.ID(), 250, net.IP{10, 0, 0, 2})
+	transport.dead[g255.ID()] = true
+	transport.dead[g250.ID()] = true
+	tab, db := newTestTable(transport, Config{
+		Clock:       simclock,
+		Log:         testlog.Logger(t, log.LevelTrace),
+		PinnedNodes: []*enode.Node{g255, g250},
+	})
+	defer db.Close()
+	defer tab.close()
+	<-tab.initDone
+
+	// Live neighbours in the same bucket keep revalidation busy and make the
+	// bucket large enough for the FINDNODE-failure eviction to apply.
+	for _, n := range nodesAtDistance(tab.self().ID(), 255, 4) {
+		tab.addFoundNode(n, true)
+	}
+	for i := 0; i < 20; i++ {
+		simclock.Run(tab.cfg.PingInterval * slowRevalidationFactor)
+		if p := transport.waitPing(time.Second); p != nil && (p.ID() == g255.ID() || p.ID() == g250.ID()) {
+			t.Fatalf("pinned node %v was pinged", p.ID())
+		}
+	}
+	for i := 0; i < maxFindnodeFailures+1; i++ {
+		tab.trackRequest(g255, false, nil)
+	}
+	tab.addFoundNode(g255, false) // waits for the loop to finish the track requests
+	for _, g := range []*enode.Node{g255, g250} {
+		if tab.getNode(g.ID()) == nil {
+			t.Fatalf("pinned node %v was removed", g.ID())
+		}
+	}
+	if !slices.ContainsFunc(tab.appendBucketNodes(255, nil, true), func(n *enode.Node) bool { return n.ID() == g255.ID() }) {
+		t.Fatal("pinned node missing from FINDNODE results")
+	}
+	for _, b := range tab.Nodes() {
+		for _, n := range b {
+			if (n.Node.ID() == g255.ID() || n.Node.ID() == g250.ID()) && !n.Live {
+				t.Fatalf("pinned node %v not live", n.Node.ID())
+			}
+		}
+	}
+	tab.deleteNode(g255)
+	if tab.getNode(g255.ID()) == nil {
+		t.Fatal("deleteNode removed a pinned node")
+	}
+	if !tab.isPinned(g255.ID()) || tab.isPinned(nodesAtDistance(tab.self().ID(), 255, 1)[0].ID()) {
+		t.Fatal("isPinned reports wrong entries")
+	}
+}
+
+// A table that learns a pinned record from elsewhere drops it on the first failed ping.
+func TestTable_pinnedNodeThirdParty(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	transport := newPingRecorder()
+	tab, db := newTestTable(transport, Config{Clock: simclock, Log: testlog.Logger(t, log.LevelTrace)})
+	defer db.Close()
+	defer tab.close()
+	<-tab.initDone
+
+	g255 := pinnedNodeAtDistance(tab.self().ID(), 255, net.IP{10, 0, 0, 1})
+	transport.dead[g255.ID()] = true
+	tab.mutex.Lock()
+	nodeEvents := newNodeEventRecorder(128)
+	tab.nodeAddedHook = nodeEvents.nodeAdded
+	tab.nodeRemovedHook = nodeEvents.nodeRemoved
+	tab.mutex.Unlock()
+
+	tab.addFoundNode(g255, false)
+	waitForRevalidationPing(t, transport, tab, g255.ID())
+	if !nodeEvents.waitNodeAbsent(g255.ID(), 2*time.Second) {
+		t.Fatal("unreachable node was not removed")
+	}
+}
