@@ -55,6 +55,8 @@ type Registration struct {
 	// everRegistered holds registrars that confirmed a registration before, so
 	// a later request to them is a renewal.
 	everRegistered map[enode.ID]struct{}
+
+	failed *AskedSet // nodes whose registration failed within the last ad lifetime
 }
 
 // BucketStats is the state of one registration bucket.
@@ -180,6 +182,7 @@ func NewRegistration(topic TopicID, cfg Config) *Registration {
 		cfg:            cfg,
 		log:            cfg.Log.New("topic", topic),
 		buckets:        make([]regBucket, cfg.RegTableDepth),
+		failed:         NewAskedSet(cfg),
 	}
 	dist := 256
 	for i := range r.buckets {
@@ -233,6 +236,9 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	for _, n := range nodes {
 		id := n.ID()
 		if id == r.cfg.Self {
+			continue
+		}
+		if r.failed.Has(id) {
 			continue
 		}
 
@@ -422,11 +428,13 @@ func (r *Registration) HandleRegistered(att *RegAttempt, ttl time.Duration) {
 	r.refillAttempts(att.bucket)
 }
 
-// HandleErrorResponse should be called when a registration attempt fails.
+// HandleErrorResponse should be called when a registration attempt fails. The
+// node is kept out of the table for an ad lifetime.
 func (r *Registration) HandleErrorResponse(att *RegAttempt, err error) {
 	r.validate(att)
 
 	r.log.Debug("Topic registration failed", "id", att.Node.ID(), "err", err)
+	r.failed.Add(att.Node.ID())
 	r.removeAttempt(att, "error")
 	r.refillAttempts(att.bucket)
 }

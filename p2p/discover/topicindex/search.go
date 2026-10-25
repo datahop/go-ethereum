@@ -64,6 +64,7 @@ type Search struct {
 	active    int
 	start     int                      // the bucket this pass started at
 	asked     *AskedSet                // nodes queried within the last ad lifetime
+	failed    *AskedSet                // nodes whose query failed within the last ad lifetime
 	spare     map[enode.ID]*enode.Node // asked nodes; the longest unasked is re-asked once if nothing else is left
 	spareUsed bool                     // the pass re-asked its one spare
 	placed    bool                     // a density sample placed the active bucket in this pass
@@ -98,6 +99,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 		topic:       topic,
 		resultSeen:  make(map[enode.ID]uint64),
 		asked:       NewAskedSet(cfg),
+		failed:      NewAskedSet(cfg),
 		spare:       make(map[enode.ID]*enode.Node),
 		askedNow:    make(map[enode.ID]struct{}),
 		bucketCheck: make(map[int]struct{}, cfg.SearchTableDepth),
@@ -145,6 +147,11 @@ func (s *Search) AdsSeen() int {
 // SetAsked shares the record of queried nodes between search passes.
 func (s *Search) SetAsked(a *AskedSet) {
 	s.asked = a
+}
+
+// SetFailed shares the record of failed nodes between search passes.
+func (s *Search) SetFailed(f *AskedSet) {
+	s.failed = f
 }
 
 // IsDone reports when the pass is over. When it returns true, this search
@@ -244,6 +251,9 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		if id == s.cfg.Self {
 			continue
 		}
+		if s.failed.Has(id) {
+			continue
+		}
 
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
@@ -292,13 +302,14 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 	}
 }
 
-// HandleErrorResponse drops a failed node from the table for the rest of the
-// pass. It is not recorded as asked beyond the pass: one dropped packet is no
-// reason to lose a registrar for an ad lifetime.
+// HandleErrorResponse drops a failed node from the table and keeps it out for
+// an ad lifetime, across the passes that share the failed set: a dead
+// routing-table entry would otherwise be picked again every pass.
 func (s *Search) HandleErrorResponse(from *enode.Node, err error) {
 	s.log.Debug("Topic query failed", "id", from.ID(), "err", err)
 	s.replies++
 	s.askedNow[from.ID()] = struct{}{}
+	s.failed.Add(from.ID())
 	delete(s.spare, from.ID())
 	s.buckets[s.bucketIndex(from.ID())].failed++
 	s.removeNode(from.ID(), false)

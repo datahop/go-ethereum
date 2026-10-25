@@ -62,9 +62,6 @@ func (a *AskedSet) Add(id enode.ID) {
 	a.at[id] = &asked{first: now, last: now}
 }
 
-// Remove drops id from the set.
-func (a *AskedSet) Remove(id enode.ID) { delete(a.at, id) }
-
 // LastAsked returns when id was last asked, or zero when it is not in the set.
 func (a *AskedSet) LastAsked(id enode.ID) mclock.AbsTime {
 	a.expire()

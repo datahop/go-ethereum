@@ -43,13 +43,3 @@ func TestAskedSetKeepsFirstExpiry(t *testing.T) {
 		t.Fatal("re-asking a spare extended its expiry")
 	}
 }
-
-func TestAskedSetRemove(t *testing.T) {
-	a := NewAskedSet(Config{Clock: new(mclock.Simulated)})
-	id := newNode().ID()
-	a.Add(id)
-	a.Remove(id)
-	if a.Has(id) {
-		t.Fatal("removed node still in the set")
-	}
-}
