@@ -390,6 +390,7 @@ type topicSearch struct {
 	idlePasses   int           // passes in a row that neither returned anything new nor moved the active bucket
 	queries      atomic.Uint64 // TOPICQUERY requests sent, read by tests
 	asked        *topicindex.AskedSet
+	failed       *topicindex.AskedSet
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -404,6 +405,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 		resultCh:     out,
 		resultFilter: topicindex.NewSearchFilter(sys.config),
 		asked:        topicindex.NewAskedSet(sys.config),
+		failed:       topicindex.NewAskedSet(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -442,6 +444,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		state := topicindex.NewSearch(s.topic, s.config)
 		state.SetActiveBucket(s.activeBucket)
 		state.SetAsked(s.asked)
+		state.SetFailed(s.failed)
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue

@@ -17,6 +17,7 @@
 package topicindex
 
 import (
+	"errors"
 	"math/rand"
 	"net"
 	"testing"
@@ -336,6 +337,46 @@ func TestRegistrationExpiry(t *testing.T) {
 	att = r.Update()
 	if att == nil {
 		t.Fatal("no request scheduled")
+	}
+	if att.State != Waiting {
+		t.Fatal("attempt should be in state", Waiting, "but has state", att.State)
+	}
+}
+
+// TestRegistrationFailedExcluded checks that a node whose registration failed
+// is not admitted again until an ad lifetime has passed.
+func TestRegistrationFailedExcluded(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdLifetime = time.Minute
+	r := NewRegistration(topic1, cfg)
+
+	node := nodesAtDistance(enode.ID(r.Topic()), 30, 1)
+	r.AddNodes(nil, node)
+	att := r.Update()
+	if att == nil {
+		t.Fatal("no request scheduled")
+	}
+	r.StartRequest(att)
+	r.HandleErrorResponse(att, errors.New("timeout"))
+	if n := r.NodeCount(); n != 0 {
+		t.Fatalf("%d nodes after the failure, want 0", n)
+	}
+
+	r.AddNodes(nil, node)
+	if n := r.NodeCount(); n != 0 {
+		t.Fatalf("failed node re-admitted: %d nodes, want 0", n)
+	}
+	if a := r.Update(); a != nil {
+		t.Fatalf("attempt for %v scheduled, want none", a.Node.ID())
+	}
+
+	simclock.Run(cfg.AdLifetime)
+	r.AddNodes(nil, node)
+	att = r.Update()
+	if att == nil || att.Node.ID() != node[0].ID() {
+		t.Fatal("failed node not re-admitted after an ad lifetime")
 	}
 	if att.State != Waiting {
 		t.Fatal("attempt should be in state", Waiting, "but has state", att.State)
