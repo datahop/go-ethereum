@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -519,15 +520,17 @@ func TestTopicDHTEvictionEvictsAd(t *testing.T) {
 	})
 }
 
-// TestTopicRegTimeoutTracksNotEvicts checks the local-vs-global split after
-// topic RPC failures were wired into the DHT wire-failure counter: a single
-// REGTOPIC timeout is counted toward the node's consecutive-failure tally (via
-// trackRequest) but does NOT evict the node's ad. Eviction is deferred to the
-// DHT's threshold — the old behaviour evicted on the first timeout, which this
-// test guards against.
-func TestTopicRegTimeoutTracksNotEvicts(t *testing.T) {
+// TestTopicRegTimeoutBans checks that a REGTOPIC timeout bans the registrar
+// from topic registration for an ad lifetime. The node stays in the routing
+// table and its ad stays in the ad cache: a single timeout is only counted
+// toward the DHT's consecutive wire-failure tally.
+func TestTopicRegTimeoutBans(t *testing.T) {
+	t.Parallel()
 	test := newUDPV5Test(t)
 	defer test.close()
+	const lifetime = 15 * time.Minute
+	clock := new(mclock.Simulated)
+	setBanClock(test.udp.topicSys, clock, lifetime)
 
 	topic := topicindex.TopicID{9, 9, 9}
 	key := newkey()
@@ -547,13 +550,275 @@ func TestTopicRegTimeoutTracksNotEvicts(t *testing.T) {
 	test.udp.RegisterTopic(topic, 1)
 	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {})
 
-	// The timeout is counted toward n's consecutive wire-failure tally...
+	waitForCond(t, "regtopic timeout bans the node", func() bool {
+		return test.udp.topicSys.isBanned(n.ID())
+	})
 	waitForCond(t, "regtopic timeout counted toward wire-failure tally", func() bool {
 		return test.db.FindFails(n.ID(), n.IPAddr()) >= 1
 	})
-	// ...but must not evict n's ad on the first timeout.
+	if test.table.getNode(n.ID()) == nil {
+		t.Fatal("banned node removed from the routing table")
+	}
 	if got := test.udp.LocalTopicNodes(topic); len(got) != 1 || got[0].ID() != n.ID() {
 		t.Fatalf("ad evicted on first timeout; eviction should defer to the DHT threshold: %v", got)
+	}
+	// The registration loop re-seeds from the table, but skips the banned node.
+	time.Sleep(regloopMinTime + 500*time.Millisecond)
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent to a banned node", q)
+	}
+
+	// Once the ban expires, the node is seeded again from the table.
+	clock.Run(lifetime + time.Second)
+	waitQueued(t, test, 10*time.Second)
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {})
+}
+
+// TestTopicSearchTimeoutBans checks that a TOPICQUERY timeout bans the node
+// from topic search until the ban expires.
+func TestTopicSearchTimeoutBans(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+	const lifetime = 15 * time.Minute
+	clock := new(mclock.Simulated)
+	setBanClock(test.udp.topicSys, clock, lifetime)
+
+	ln := test.getNode(newkey(), netip.MustParseAddrPort("10.0.2.56:30303"))
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+	test.table.addFoundNode(n, true)
+
+	it := test.udp.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {})
+	waitForCond(t, "topicquery timeout bans the node", func() bool {
+		return test.udp.topicSys.isBanned(n.ID())
+	})
+	// The next pass starts after a gap of 2*regloopMinTime and skips the node.
+	time.Sleep(2*regloopMinTime + 500*time.Millisecond)
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent to a banned node", q)
+	}
+
+	clock.Run(lifetime + time.Second)
+	waitQueued(t, test, 10*time.Second)
+	test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {})
+}
+
+// TestTopicBannedAuxNodeFiltered checks that a banned node arriving as an aux
+// node is not queried, and that a reply from a banned node lifts its ban.
+func TestTopicBannedAuxNodeFiltered(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	key := newkey()
+	ln := test.getNode(key, netip.MustParseAddrPort("10.0.2.57:30303"))
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+	test.table.addFoundNode(n, true)
+	auxln := test.getNode(newkey(), netip.MustParseAddrPort("10.0.2.58:30303"))
+	auxln.Set(topicindex.TopicDiscoveryVersion)
+	aux := auxln.Node()
+	test.udp.topicSys.ban(aux.ID())
+
+	it := test.udp.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	test.waitPacketOut(func(p *v5wire.TopicQuery, a netip.AddrPort, _ v5wire.Nonce) {
+		// Banned while the query is in flight: the reply lifts the ban.
+		test.udp.topicSys.ban(n.ID())
+		test.packetInFrom(key, a, &v5wire.Nodes{ReqID: p.ReqID, RespCount: 1, Nodes: []*enr.Record{aux.Record()}})
+	})
+	waitForCond(t, "reply lifts the ban", func() bool {
+		return !test.udp.topicSys.isBanned(n.ID())
+	})
+	time.Sleep(time.Second)
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent after the reply, want none to the banned aux node", q)
+	}
+	if !test.udp.topicSys.isBanned(aux.ID()) {
+		t.Fatal("aux node no longer banned")
+	}
+}
+
+// TestTopicRegDispatchSkipsBanned checks that a registration attempt whose
+// node was banned after it entered the table is dropped when it comes due.
+func TestTopicRegDispatchSkipsBanned(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+	sys := test.udp.topicSys
+
+	topic := topicindex.TopicID{8, 8, 8}
+	key := newkey()
+	ln := test.getNode(key, netip.MustParseAddrPort("10.0.2.59:30303"))
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+	test.table.addFoundNode(n, true)
+	sys.register(topic, 1)
+
+	// A ticket schedules the next attempt; the node is banned before it is due.
+	// The reply itself lifts a ban, which shows when it has been handled.
+	const wait = time.Second
+	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+		sys.ban(n.ID())
+		test.packetInFrom(key, a, &v5wire.Regconfirmation{
+			ReqID:    p.ReqID,
+			Ticket:   []byte{1},
+			WaitTime: uint(wait / time.Millisecond),
+		})
+	})
+	waitForCond(t, "reply lifts the ban", func() bool { return !sys.isBanned(n.ID()) })
+	sys.ban(n.ID())
+	time.Sleep(wait + time.Second)
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent to a banned node", q)
+	}
+
+	sys.mu.Lock()
+	reg := sys.reg[topic]
+	sys.mu.Unlock()
+	sys.stopRegister(topic)
+	if c := reg.state.NodeCount(); c != 0 {
+		t.Fatalf("registration table holds %d nodes, want the banned attempt gone", c)
+	}
+}
+
+// TestTopicSearchDispatchSkipsBanned checks that a search does not query a
+// node that was banned after the pass picked it up. The banned node is the
+// last target of the pass, which must still roll over.
+func TestTopicSearchDispatchSkipsBanned(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+	sys := test.udp.topicSys
+	const lifetime = 15 * time.Minute
+	clock := new(mclock.Simulated)
+	setBanClock(sys, clock, lifetime)
+
+	keys := map[netip.AddrPort]*ecdsa.PrivateKey{}
+	ids := map[netip.AddrPort]enode.ID{}
+	for _, a := range []string{"10.0.4.1:30303", "10.0.5.1:30303"} {
+		addr := netip.MustParseAddrPort(a)
+		keys[addr] = newkey()
+		ln := test.getNode(keys[addr], addr)
+		ln.Set(topicindex.TopicDiscoveryVersion)
+		test.table.addFoundNode(ln.Node(), true)
+		ids[addr] = ln.Node().ID()
+	}
+
+	it := test.udp.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	// Ban the other node while the first query is in flight, then answer.
+	var banned netip.AddrPort
+	test.waitPacketOut(func(p *v5wire.TopicQuery, a netip.AddrPort, _ v5wire.Nonce) {
+		for addr, id := range ids {
+			if addr != a {
+				banned = addr
+				sys.ban(id)
+			}
+		}
+		test.packetInFrom(keys[a], a, &v5wire.Nodes{ReqID: p.ReqID, RespCount: 1})
+	})
+	time.Sleep(time.Second)
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent after the reply, want none to the banned node", q)
+	}
+
+	// The pass rolls over: the next one queries the other node again.
+	waitQueued(t, test, 10*time.Second)
+	test.waitPacketOut(func(p *v5wire.TopicQuery, a netip.AddrPort, _ v5wire.Nonce) {
+		if a == banned {
+			t.Fatal("banned node queried")
+		}
+		clock.Run(lifetime + time.Second)
+		test.packetInFrom(keys[a], a, &v5wire.Nodes{ReqID: p.ReqID, RespCount: 1})
+	})
+	// Once the ban expires, the node is queried again.
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		if time.Now().After(deadline) {
+			t.Fatal("ban expired, but the node was not queried again")
+		}
+		waitQueued(t, test, 20*time.Second)
+		var to netip.AddrPort
+		test.waitPacketOut(func(p *v5wire.TopicQuery, a netip.AddrPort, _ v5wire.Nonce) {
+			if to = a; a != banned {
+				test.packetInFrom(keys[a], a, &v5wire.Nodes{ReqID: p.ReqID, RespCount: 1})
+			}
+		})
+		if to == banned {
+			return
+		}
+	}
+}
+
+// TestTopicRegBannedBeforeSend checks that an attempt banned while it waits
+// for the busy request worker is dropped without sending REGTOPIC.
+func TestTopicRegBannedBeforeSend(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+	sys := test.udp.topicSys
+
+	topic := topicindex.TopicID{6, 6, 6}
+	keys := map[netip.AddrPort]*ecdsa.PrivateKey{}
+	ids := map[netip.AddrPort]enode.ID{}
+	for _, a := range []string{"10.0.6.1:30303", "10.0.7.1:30303"} {
+		addr := netip.MustParseAddrPort(a)
+		keys[addr] = newkey()
+		ln := test.getNode(keys[addr], addr)
+		ln.Set(topicindex.TopicDiscoveryVersion)
+		test.table.addFoundNode(ln.Node(), true)
+		ids[addr] = ln.Node().ID()
+	}
+	sys.register(topic, 1)
+
+	// The worker is busy with the first REGTOPIC while the loop selects the
+	// other node's attempt. Ban that node, then release the worker.
+	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+		time.Sleep(200 * time.Millisecond)
+		for addr, id := range ids {
+			if addr != a {
+				sys.ban(id)
+			}
+		}
+		test.packetInFrom(keys[a], a, &v5wire.Regconfirmation{ReqID: p.ReqID, WaitTime: 900000})
+	})
+	time.Sleep(time.Second)
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent after the worker was released, want none to the banned node", q)
+	}
+
+	sys.mu.Lock()
+	reg := sys.reg[topic]
+	sys.mu.Unlock()
+	sys.stopRegister(topic)
+	if c := reg.state.NodeCount(); c != 1 {
+		t.Fatalf("registration table holds %d nodes, want only the registered one", c)
+	}
+}
+
+// setBanClock makes the topic system's bans expire on clock.
+func setBanClock(sys *topicSystem, clock mclock.Clock, lifetime time.Duration) {
+	sys.banMu.Lock()
+	defer sys.banMu.Unlock()
+	sys.banned = topicindex.NewAskedSet(topicindex.Config{AdLifetime: lifetime, Clock: clock})
+}
+
+func pipeQueued(test *udpV5Test) int {
+	test.pipe.mu.Lock()
+	defer test.pipe.mu.Unlock()
+	return len(test.pipe.queue)
+}
+
+// waitQueued waits up to d for a packet to be sent.
+func waitQueued(t *testing.T, test *udpV5Test, d time.Duration) {
+	t.Helper()
+	for deadline := time.Now().Add(d); pipeQueued(test) == 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no packet sent")
+		}
 	}
 }
 
@@ -613,6 +878,8 @@ func TestTopicRegSuccessResetsFailures(t *testing.T) {
 	waitForCond(t, "regtopic timeout counted toward wire-failure tally", func() bool {
 		return test.db.FindFails(n.ID(), n.IPAddr()) >= 1
 	})
+	// The timeout banned n; lift the ban so the registration retries it.
+	test.udp.topicSys.unban(n.ID())
 
 	// Retry REGTOPIC: answered with a REGCONFIRMATION → success → counter resets.
 	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {

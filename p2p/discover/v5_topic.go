@@ -17,6 +17,7 @@
 package discover
 
 import (
+	"errors"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -38,6 +39,11 @@ type topicSystem struct {
 	mu  sync.Mutex
 	reg map[topicindex.TopicID]*topicReg
 
+	// banned holds the nodes whose topic RPC timed out. They are kept out of
+	// the registration and search tables for an ad lifetime.
+	banMu  sync.Mutex
+	banned *topicindex.AskedSet
+
 	wg   sync.WaitGroup
 	quit chan struct{}
 }
@@ -50,6 +56,7 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 		transport: transport,
 		config:    config,
 		reg:       make(map[topicindex.TopicID]*topicReg),
+		banned:    topicindex.NewAskedSet(config),
 		quit:      make(chan struct{}),
 	}
 	sys.wg.Add(1)
@@ -87,6 +94,40 @@ func (sys *topicSystem) evictNode(id enode.ID) {
 	for _, r := range regs {
 		r.evict(id)
 	}
+}
+
+// ban keeps id out of topic search and registration for an ad lifetime. The
+// loops skip a banned node when they pick it as a target.
+func (sys *topicSystem) ban(id enode.ID) {
+	sys.banMu.Lock()
+	defer sys.banMu.Unlock()
+	sys.banned.Add(id)
+}
+
+func (sys *topicSystem) unban(id enode.ID) {
+	sys.banMu.Lock()
+	defer sys.banMu.Unlock()
+	sys.banned.Remove(id)
+}
+
+func (sys *topicSystem) isBanned(id enode.ID) bool {
+	sys.banMu.Lock()
+	defer sys.banMu.Unlock()
+	return sys.banned.Has(id)
+}
+
+// filterNodes returns the topic-discovery capable nodes that are not banned.
+func (sys *topicSystem) filterNodes(nodes []*enode.Node) []*enode.Node {
+	nodes = filterTopicDiscovery(nodes)
+	sys.banMu.Lock()
+	defer sys.banMu.Unlock()
+	filtered := nodes[:0]
+	for _, n := range nodes {
+		if !sys.banned.Has(n.ID()) {
+			filtered = append(filtered, n)
+		}
+	}
+	return filtered
 }
 
 func (sys *topicSystem) register(topic topicindex.TopicID, opid uint64) {
@@ -206,7 +247,7 @@ func (reg *topicReg) registrationLoop(sys *topicSystem) {
 		time = reg.clock.Now()
 
 		// Initialize the registration state with DISC-NG capable nodes only.
-		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
+		nodes := sys.filterNodes(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue // No DISC-NG capable nodes, retry later.
 		}
@@ -282,7 +323,7 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			ch <- reg.state.BucketStats()
 
 		case n := <-reg.newNodesCh:
-			if topicindex.SupportsTopicDiscovery(n) {
+			if topicindex.SupportsTopicDiscovery(n) && !sys.isBanned(n.ID()) {
 				reg.state.AddNodes(nil, []*enode.Node{n})
 			}
 
@@ -297,6 +338,10 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 
 		case <-updateCh:
 			attempt := reg.state.Update()
+			for attempt != nil && sys.isBanned(attempt.Node.ID()) {
+				reg.state.RemoveNode(attempt.Node.ID())
+				attempt = reg.state.Update()
+			}
 			if attempt != nil {
 				sendAttemptCh = reg.regRequest
 				nextAttempt = topicRegJob{
@@ -317,18 +362,20 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 				continue // shutdown cancel: liveness unknown, not a failure
 			}
 			if len(resp.nodes) > 0 {
-				reg.state.AddNodes(resp.att.Node, filterTopicDiscovery(resp.nodes))
+				reg.state.AddNodes(resp.att.Node, sys.filterNodes(resp.nodes))
 			}
 			if resp.err != nil {
 				reg.state.HandleErrorResponse(resp.att, resp.err)
 				if resp.err == errTimeout {
 					// Count the timeout toward the global eviction counter
 					sys.transport.trackTopicRequest(resp.att.Node, false)
+					sys.ban(resp.att.Node.ID())
 				}
 				continue
 			}
 			// The node responded: reset its global counter
 			sys.transport.trackTopicRequest(resp.att.Node, true)
+			sys.unban(resp.att.Node.ID())
 			wt := time.Duration(resp.msg.WaitTime) * time.Millisecond
 			if len(resp.msg.Ticket) > 0 {
 				reg.state.HandleTicketResponse(resp.att, resp.msg.Ticket, wt)
@@ -364,8 +411,13 @@ func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 	defer reg.wg.Done()
 
 	for job := range reg.regRequest {
-		topic := reg.state.Topic()
-		resp := sys.transport.regtopic(reg.quit, job.node, topic, job.ticket, job.buckets, reg.opid, job.renewal)
+		var resp topicRegResult
+		if sys.isBanned(job.node.ID()) {
+			// Banned while the job waited for the worker.
+			resp.err = errBanned
+		} else {
+			resp = sys.transport.regtopic(reg.quit, job.node, reg.state.Topic(), job.ticket, job.buckets, reg.opid, job.renewal)
+		}
 		resp.att = job.attempt
 
 		select {
@@ -375,6 +427,8 @@ func (reg *topicReg) sendRequestsLoop(sys *topicSystem) {
 		}
 	}
 }
+
+var errBanned = errors.New("banned")
 
 const (
 	// searchPassBackoff caps the gap between passes that change nothing
@@ -496,7 +550,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		cycle++
 		state.SetActiveBucket(s.activeBucket)
 		state.SetAsked(s.asked)
-		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
+		nodes := sys.filterNodes(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
 		}
@@ -606,7 +660,14 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 			return false, nresults
 		}
 		if queryCh == nil && !released && unread() < unreadLimit {
-			target := state.QueryTarget()
+			target, skipped := state.QueryTarget(), false
+			for target != nil && sys.isBanned(target.ID()) {
+				state.HandleErrorResponse(target, errBanned)
+				target, skipped = state.QueryTarget(), true
+			}
+			if skipped && target == nil {
+				continue // the skips may have ended the pass
+			}
 			if target != nil {
 				queryCh = s.queryCh
 				nextQuery = topicQueryJob{dst: target}
@@ -646,6 +707,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				state.HandleErrorResponse(resp.src, resp.err)
 				if resp.err == errTimeout {
 					sys.transport.trackTopicRequest(resp.src, false)
+					sys.ban(resp.src.ID())
 				}
 				// Results waiting in the filter may be due by now.
 				state.AddResults(s.resultFilter.Take(resp.src.ID(), nil))
@@ -657,6 +719,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				}
 				// The node responded: reset its global counter
 				sys.transport.trackTopicRequest(resp.src, true)
+				sys.unban(resp.src.ID())
 				// The density sample is the reply's size as the registrar sent
 				// it, before the searcher's own filtering drops records.
 				ads := filterTopicDiscovery(resp.topicNodes)
@@ -671,7 +734,7 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				} else {
 					added = state.AddReply(resp.src, taken, nads, sent)
 				}
-				state.AddNodes(resp.src, filterTopicDiscovery(resp.auxNodes))
+				state.AddNodes(resp.src, sys.filterNodes(resp.auxNodes))
 				s.contactsMu.Lock()
 				s.stats.Received += nads
 				s.stats.Duplicate += len(taken) - added
@@ -735,7 +798,12 @@ func (s *topicSearch) runRequests(sys *topicSystem) {
 	defer s.wg.Done()
 
 	for job := range s.queryCh {
-		result := sys.transport.topicQuery(s.quit, job.dst, s.topic, job.buckets, s.opid)
+		var result topicQueryResult
+		if sys.isBanned(job.dst.ID()) {
+			result.err = errBanned
+		} else {
+			result = sys.transport.topicQuery(s.quit, job.dst, s.topic, job.buckets, s.opid)
+		}
 		result.src = job.dst
 
 		select {
