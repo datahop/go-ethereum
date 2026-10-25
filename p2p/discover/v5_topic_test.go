@@ -555,6 +555,42 @@ func TestTopicRegTimeoutTracksNotEvicts(t *testing.T) {
 	if got := test.udp.LocalTopicNodes(topic); len(got) != 1 || got[0].ID() != n.ID() {
 		t.Fatalf("ad evicted on first timeout; eviction should defer to the DHT threshold: %v", got)
 	}
+	// The registration loop re-seeds from the table, but n is not admitted again.
+	time.Sleep(regloopMinTime + 500*time.Millisecond)
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent to a failed node", q)
+	}
+}
+
+// TestTopicSearchTimeoutNotReasked checks that a node whose TOPICQUERY timed
+// out is not queried again by the next search pass.
+func TestTopicSearchTimeoutNotReasked(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	ln := test.getNode(newkey(), netip.MustParseAddrPort("10.0.2.56:30303"))
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+	test.table.addFoundNode(n, true)
+
+	it := test.udp.TopicSearch(testTopic1, 0)
+	defer it.Close()
+	test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {})
+	waitForCond(t, "topicquery timeout counted toward wire-failure tally", func() bool {
+		return test.db.FindFails(n.ID(), n.IPAddr()) >= 1
+	})
+	// The next pass starts after a gap of 2*regloopMinTime and skips the node.
+	time.Sleep(2*regloopMinTime + time.Second)
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent to a failed node", q)
+	}
+}
+
+func pipeQueued(test *udpV5Test) int {
+	test.pipe.mu.Lock()
+	defer test.pipe.mu.Unlock()
+	return len(test.pipe.queue)
 }
 
 // TestFilterTopicDiscovery checks the gate that keeps non-topic-discovery nodes
@@ -590,10 +626,10 @@ func TestFilterTopicDiscovery(t *testing.T) {
 }
 
 // TestTopicRegSuccessResetsFailures checks that a successful REGTOPIC resets the
-// node's consecutive wire-failure counter: a first timeout increments it, and a
-// subsequent REGCONFIRMATION brings it back to zero. This is the reset side of
-// the local-vs-global split — a briefly-flaky node that starts responding again
-// does not accumulate toward eviction.
+// node's consecutive wire-failure counter. This is the reset side of the
+// local-vs-global split — a briefly-flaky node that starts responding again
+// does not accumulate toward eviction. The increment side is covered by
+// TestTopicRegTimeoutTracksNotEvicts.
 func TestTopicRegSuccessResetsFailures(t *testing.T) {
 	test := newUDPV5Test(t)
 	defer test.close()
@@ -606,15 +642,10 @@ func TestTopicRegSuccessResetsFailures(t *testing.T) {
 	n := ln.Node()
 
 	test.table.addFoundNode(n, true)
+	test.db.UpdateFindFails(n.ID(), n.IPAddr(), 1)
 	test.udp.RegisterTopic(topic, 1)
 
-	// First REGTOPIC: never answered → timeout → counter increments.
-	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {})
-	waitForCond(t, "regtopic timeout counted toward wire-failure tally", func() bool {
-		return test.db.FindFails(n.ID(), n.IPAddr()) >= 1
-	})
-
-	// Retry REGTOPIC: answered with a REGCONFIRMATION → success → counter resets.
+	// REGTOPIC answered with a REGCONFIRMATION → success → counter resets.
 	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
 		test.packetInFrom(key, a, &v5wire.Regconfirmation{
 			ReqID:    p.ReqID,
@@ -851,20 +882,28 @@ func TestTopicSearchNextPassEmptyTopic(t *testing.T) {
 }
 
 // TestTopicSearchNextPassDeadFrontier checks that a bucket whose only node
-// never answers is retried by one pass, not more: the search then walks on.
+// never answers is kept for one more pass, which does not ask the dead node
+// again, and not more: the search then walks on.
 func TestTopicSearchNextPassDeadFrontier(t *testing.T) {
 	topic := topicindex.TopicID{1}
 	dead := nodeAtDistance(enode.ID(topic), 256-10, net.IP{203, 0, 113, 1})
 	helper := nodeAtDistance(enode.ID(topic), 256-3, net.IP{198, 51, 100, 1})
-	s := &topicSearch{activeBucket: 10, asked: topicindex.NewAskedSet(topicindex.Config{})}
+	s := &topicSearch{
+		activeBucket: 10,
+		asked:        topicindex.NewAskedSet(topicindex.Config{}),
+		failed:       topicindex.NewAskedSet(topicindex.Config{}),
+	}
 	var got []int
+	var deadAsked int
 	for range 6 {
 		state := topicindex.NewSearch(topic, topicindex.Config{})
 		state.SetActiveBucket(s.activeBucket)
 		state.SetAsked(s.asked)
+		state.SetFailed(s.failed)
 		state.AddNodes(nil, []*enode.Node{dead, helper})
 		for n := state.QueryTarget(); n != nil; n = state.QueryTarget() {
 			if n.ID() == dead.ID() {
+				deadAsked++
 				state.HandleErrorResponse(n, errTimeout)
 			} else {
 				state.AddReply(n, nil, 0, 0)
@@ -878,6 +917,9 @@ func TestTopicSearchNextPassDeadFrontier(t *testing.T) {
 	}
 	if want := []int{10, 11, 12, 13, 14, 15}; !slices.Equal(got, want) {
 		t.Fatalf("passes went to %v, want %v", got, want)
+	}
+	if deadAsked != 1 {
+		t.Fatalf("dead node asked %d times, want once", deadAsked)
 	}
 }
 

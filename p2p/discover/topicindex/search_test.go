@@ -638,27 +638,77 @@ func TestSearchAdaptivePassBudget(t *testing.T) {
 	}
 }
 
-// TestSearchAdaptiveFailedAsked checks that a node whose query failed is left
-// alone for the rest of the pass and asked again by the next one.
-func TestSearchAdaptiveFailedAsked(t *testing.T) {
+// TestSearchFailedExcluded checks that a node whose query failed is kept out
+// of the table for an ad lifetime, in the same pass and in the passes that
+// share the failed set, without stalling them.
+func TestSearchFailedExcluded(t *testing.T) {
+	clock := new(mclock.Simulated)
 	config := testConfig(t)
+	config.Clock = clock
+	config.AdLifetime = time.Minute
 	s := NewSearch(topic1, config)
 	nodes := nodesAtDistanceFrom(enode.ID(topic1), 256, 1, 1)
 	s.AddNodes(nil, nodes)
 	n := s.QueryTarget()
 	s.HandleErrorResponse(n, errors.New("timeout"))
 	s.AddNodes(nil, nodes)
-	if s.buckets[0].contains(n.ID()) {
+	if s.buckets[0].contains(n.ID()) || len(s.spare) != 0 {
 		t.Fatal("failed node re-admitted in the same pass")
 	}
 
-	// One dropped packet must not exclude a registrar for an ad lifetime:
-	// the next pass asks it again.
 	next := NewSearch(topic1, config)
 	next.SetAsked(s.asked)
+	next.SetFailed(s.failed)
 	next.AddNodes(nil, nodes)
-	if !next.buckets[0].contains(n.ID()) {
-		t.Fatal("failed node not re-admitted by the next pass")
+	if next.buckets[0].contains(n.ID()) || next.spare[n.ID()] != nil {
+		t.Fatal("failed node re-admitted by the next pass")
+	}
+	if q := next.QueryTarget(); q != nil {
+		t.Fatalf("query target %v in a pass with only a failed node", q.ID())
+	}
+	if !next.IsDone() {
+		t.Fatal("pass with only a failed node not done")
+	}
+
+	clock.Run(config.AdLifetime)
+	last := NewSearch(topic1, config)
+	last.SetAsked(s.asked)
+	last.SetFailed(s.failed)
+	last.AddNodes(nil, nodes)
+	if !last.buckets[0].contains(n.ID()) {
+		t.Fatal("failed node not re-admitted after an ad lifetime")
+	}
+}
+
+// TestSearchFailedSpare checks that a spare whose re-ask failed is not
+// offered as a spare again.
+func TestSearchFailedSpare(t *testing.T) {
+	config := testConfig(t)
+	s := NewSearch(topic1, config)
+	seeds := nodesAtDistanceFrom(enode.ID(topic1), 256, 2, 1)
+	s.AddNodes(nil, seeds)
+	reply(t, s, 0, 0)
+	reply(t, s, 0, 0)
+
+	second := NewSearch(topic1, config)
+	second.SetAsked(s.asked)
+	second.SetFailed(s.failed)
+	second.AddNodes(nil, seeds)
+	failed := second.QueryTarget()
+	if failed == nil {
+		t.Fatal("no spare node offered")
+	}
+	second.HandleErrorResponse(failed, errors.New("timeout"))
+
+	third := NewSearch(topic1, config)
+	third.SetAsked(s.asked)
+	third.SetFailed(s.failed)
+	third.AddNodes(nil, seeds)
+	if third.spare[failed.ID()] != nil {
+		t.Fatal("failed spare offered again")
+	}
+	if n := third.QueryTarget(); n == nil || n.ID() == failed.ID() {
+		t.Fatalf("spare %v picked, want the other seed", n)
 	}
 }
 
