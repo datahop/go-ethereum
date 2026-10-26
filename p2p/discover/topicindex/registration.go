@@ -18,7 +18,6 @@ package topicindex
 
 import (
 	"container/heap"
-	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -56,10 +55,6 @@ type Registration struct {
 	// next one.
 	rrBucket int
 }
-
-// ErrWaitBelowFloor is returned by HandleTicketResponse for a quote below the
-// minimum wait time a registrar issues.
-var ErrWaitBelowFloor = errors.New("registrar quoted a wait below the floor")
 
 //go:generate go run golang.org/x/tools/cmd/stringer@latest -type RegAttemptState
 
@@ -377,25 +372,22 @@ func (r *Registration) validate(att *RegAttempt) {
 }
 
 // HandleTicketResponse should be called when a node responds to a registration
-// request with a ticket and waiting time. It returns ErrWaitBelowFloor if the
-// quote is discarded for being too short, and nil otherwise, including when the
-// attempt is dropped for exceeding the waiting budget.
-func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, waitTime time.Duration) error {
+// request with a ticket and waiting time. A wait below the floor is raised to
+// the floor; clamped reports whether that happened.
+func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, waitTime time.Duration) (clamped bool) {
 	r.validate(att)
 
-	// Register never quotes below the floor, so the registrar is broken or hostile.
-	// It is held like a failed one; the caller counts no liveness failure.
+	// Registrars quote below the floor near an ad expiry or for an early ticket,
+	// so such a quote is honoured but never retried sooner than the floor.
 	if waitTime < topicTableWaitTimeFloor {
-		r.failed.Add(att.Node.ID())
-		r.removeAttempt(att, "wtime-below-floor")
-		r.refillAttempts(att.bucket)
-		return ErrWaitBelowFloor
+		waitTime = topicTableWaitTimeFloor
+		clamped = true
 	}
 
 	// Drop the attempt when a single quote already exceeds the registrant's total allowed waiting time for the registration.
 	if waitTime > r.cfg.RegAttemptTimeout {
 		r.removeAttempt(att, "wtime-above-budget")
-		return nil
+		return clamped
 	}
 
 	att.totalWaitTime += waitTime
@@ -403,13 +395,13 @@ func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, wait
 	// Drop the attempt when cumulative waiting exceeds RegAttemptTimeout.
 	if att.totalWaitTime > r.cfg.RegAttemptTimeout {
 		r.removeAttempt(att, "wtime-too-high")
-		return nil
+		return clamped
 	}
 
 	att.Ticket = ticket
 	att.NextTime = r.cfg.Clock.Now().Add(waitTime)
 	heap.Push(&r.heap, att)
-	return nil
+	return clamped
 }
 
 // HandleRegistered should be called when a node confirms topic registration.
