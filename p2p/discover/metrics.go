@@ -41,6 +41,15 @@ var (
 	v5BadPacketMeter    = metrics.NewRegisteredMeter(moduleName+"/v5/bad", nil)
 
 	regtopicRecordIPRejectCounter = metrics.NewRegisteredCounter(moduleName+"/regtopic/recordipreject", nil)
+	regtopicBadENRCounter         = metrics.NewRegisteredCounter(moduleName+"/regtopic/reject/badenr", nil)
+	regtopicIDMismatchCounter     = metrics.NewRegisteredCounter(moduleName+"/regtopic/reject/idmismatch", nil)
+	regtopicTicketLateCounter     = metrics.NewRegisteredCounter(moduleName+"/regtopic/ticket/late", nil)
+	regtopicTicketExpiredCounter  = metrics.NewRegisteredCounter(moduleName+"/regtopic/ticket/expired", nil)
+	regtopicTicketEarlyCounter    = metrics.NewRegisteredCounter(moduleName+"/regtopic/ticket/early", nil)
+	regtopicTicketInvalidCounter  = metrics.NewRegisteredCounter(moduleName+"/regtopic/ticket/invalid", nil)
+	regtopicTicketReplayedCounter = metrics.NewRegisteredCounter(moduleName+"/regtopic/ticket/replayed", nil)
+
+	topicRegTicketBelowFloorCounter = metrics.NewRegisteredCounter(moduleName+"/topicreg/ticket/belowfloor", nil)
 )
 
 // markInbound counts a received packet by its wire name, e.g. discover/ingress/PING/v4.

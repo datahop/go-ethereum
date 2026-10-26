@@ -26,10 +26,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common/mclock"
+	"github.com/ethereum/go-ethereum/internal/testlog"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 var testTopic1 = topicindex.TopicID{1, 1, 1, 1}
@@ -759,8 +763,17 @@ func TestHandleRegtopicRecordIP(t *testing.T) {
 			ENR: signedRecord(t, honestKey, honestAddr.Addr(), netip.Addr{}, honestAddr.Port()),
 		})
 
-		// Only the honest registration is confirmed. Waiting for it also synchronizes
-		// with the dispatch goroutine, so the table is settled below.
+		// The spoofer gets a rejection, then the honest registration is confirmed.
+		// Waiting for it also synchronizes with the dispatch goroutine, so the
+		// table is settled below.
+		test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {
+			if !bytes.Equal(p.ReqID, []byte{1}) {
+				t.Errorf("got REGCONFIRMATION for ReqID %x, want 01", p.ReqID)
+			}
+			if len(p.Ticket) != 0 || p.WaitTime != 0 {
+				t.Errorf("spoofer not rejected: ticket %d bytes, wait time %d", len(p.Ticket), p.WaitTime)
+			}
+		})
 		test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {
 			if !bytes.Equal(p.ReqID, []byte{2}) {
 				t.Errorf("got REGCONFIRMATION for ReqID %x, want 02", p.ReqID)
@@ -793,6 +806,570 @@ func TestHandleRegtopicRecordIP(t *testing.T) {
 		if nodes := test.udp.LocalTopicNodes(testTopic1); len(nodes) != 1 {
 			t.Fatalf("registration from rebound port was rejected: %d ads, want 1", len(nodes))
 		}
+	})
+}
+
+// sealTicket seals a ticket with the node's ticket sealer. The work runs on the
+// dispatch goroutine, which owns the sealer.
+func sealTicket(test *udpV5Test, ticket *topicindex.Ticket) []byte {
+	test.t.Helper()
+	done := make(chan []byte, 1)
+	select {
+	case test.udp.onDispatchCh <- func() { done <- test.udp.ticketSealer.Pack(ticket) }:
+		return <-done
+	case <-test.udp.closeCtx.Done():
+		test.t.Fatal("node closed before ticket could be sealed")
+		return nil
+	}
+}
+
+// badSigRecord returns a record for the key and endpoint whose signature does
+// not verify.
+func badSigRecord(t *testing.T, key *ecdsa.PrivateKey, addr netip.AddrPort) *enr.Record {
+	t.Helper()
+	enc, err := rlp.EncodeToBytes(signedRecord(t, key, addr.Addr(), netip.Addr{}, addr.Port()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var elems []rlp.RawValue
+	if err := rlp.DecodeBytes(enc, &elems); err != nil {
+		t.Fatal(err)
+	}
+	var sig []byte
+	if err := rlp.DecodeBytes(elems[0], &sig); err != nil {
+		t.Fatal(err)
+	}
+	sig[0] ^= 0xff
+	elems[0], _ = rlp.EncodeToBytes(sig)
+	enc, _ = rlp.EncodeToBytes(elems)
+	var r enr.Record
+	if err := rlp.DecodeBytes(enc, &r); err != nil {
+		t.Fatal(err)
+	}
+	return &r
+}
+
+// TestHandleRegtopicReplies checks that the registrar answers every REGTOPIC:
+// valid and late tickets are credited, an early ticket is re-quoted for its
+// window, an invalid or expired ticket starts a new attempt, and a request with
+// an unusable record is rejected. One ad is seeded so that a new attempt has to
+// wait (about 45s) and the credited wait decides admission.
+func TestHandleRegtopicReplies(t *testing.T) {
+	t.Parallel()
+
+	type outcome int
+	const (
+		admitted outcome = iota
+		waiting
+		requoted
+		rejected
+	)
+	var (
+		key       = newkey()
+		addr      = netip.MustParseAddrPort("10.0.1.1:30303")
+		otherAddr = netip.MustParseAddrPort("10.0.1.2:30303")
+		otherKey  = newkey()
+		record    = func(t *testing.T) *enr.Record {
+			return signedRecord(t, key, addr.Addr(), netip.Addr{}, addr.Port())
+		}
+		seal = func(test *udpV5Test, topic topicindex.TopicID, lastUsed, wait, sinceFirst time.Duration) []byte {
+			now := test.udp.clock.Now()
+			return sealTicket(test, &topicindex.Ticket{
+				Topic:          topic,
+				LastUsed:       now.Add(-lastUsed),
+				WaitTimeIssued: wait,
+				FirstIssued:    now.Add(-sinceFirst),
+			})
+		}
+		onTime = func(test *udpV5Test) []byte { return seal(test, testTopic1, 2*time.Second, time.Second, time.Minute) }
+	)
+	tests := []struct {
+		name             string
+		ticket           func(test *udpV5Test) []byte
+		enr              func(t *testing.T) *enr.Record
+		want             outcome
+		minWait, maxWait uint // bounds on WaitTime in ms, if maxWait > 0
+	}{
+		{name: "no ticket", want: waiting},
+		{name: "on time", ticket: onTime, want: admitted},
+		{name: "late", ticket: func(test *udpV5Test) []byte {
+			// 10s past the window start, inside the grace: credited the scheduled 60s.
+			return seal(test, testTopic1, 20*time.Second, 10*time.Second, 70*time.Second)
+		}, want: admitted},
+		{name: "expired", ticket: func(test *udpV5Test) []byte {
+			return seal(test, testTopic1, 20*time.Minute, 50*time.Second, 20*time.Minute)
+		}, want: waiting, minWait: 40000, maxWait: 50000},
+		{name: "early", ticket: func(test *udpV5Test) []byte {
+			return seal(test, testTopic1, 0, time.Minute, 0)
+		}, want: requoted, minWait: 59000, maxWait: 61000},
+		{name: "bad mac", ticket: func(test *udpV5Test) []byte {
+			enc := onTime(test)
+			enc[0] ^= 0xff
+			return enc
+		}, want: waiting},
+		{name: "wrong topic", ticket: func(test *udpV5Test) []byte {
+			return seal(test, makeTopic("other"), 2*time.Second, time.Second, time.Minute)
+		}, want: waiting},
+		{name: "unknown key", ticket: func(test *udpV5Test) []byte {
+			enc := onTime(test)
+			enc[32], enc[33] = 0xff, 0xff
+			return enc
+		}, want: waiting},
+		{name: "wrong size", ticket: func(*udpV5Test) []byte { return []byte{1} }, want: waiting},
+		{name: "bad signature", enr: func(t *testing.T) *enr.Record { return badSigRecord(t, key, addr) }, want: rejected},
+		{name: "other key", enr: func(t *testing.T) *enr.Record {
+			return signedRecord(t, otherKey, addr.Addr(), netip.Addr{}, addr.Port())
+		}, want: rejected},
+		{name: "other address", enr: func(t *testing.T) *enr.Record {
+			return signedRecord(t, key, otherAddr.Addr(), netip.Addr{}, addr.Port())
+		}, want: rejected},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			test := newUDPV5Test(t)
+			defer test.close()
+			seedTopicTable(t, test.udp, testTopic1, enode.NewV4(&newkey().PublicKey, net.IP{10, 0, 9, 1}, 30303, 30303))
+
+			req := &v5wire.Regtopic{ReqID: []byte{1}, Topic: testTopic1, ENR: record(t)}
+			if tt.ticket != nil {
+				req.Ticket = tt.ticket(test)
+			}
+			if tt.enr != nil {
+				req.ENR = tt.enr(t)
+			}
+			test.packetInFrom(key, addr, req)
+			test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {
+				if !bytes.Equal(p.ReqID, req.ReqID) {
+					t.Errorf("wrong ReqID %x", p.ReqID)
+				}
+				if p.RespCount != 1 {
+					t.Errorf("RespCount = %d, want 1", p.RespCount)
+				}
+				switch tt.want {
+				case admitted:
+					if len(p.Ticket) != 0 || p.WaitTime != waitTimeToMs(test.udp.topicTable.AdLifetime()) {
+						t.Errorf("not admitted: ticket %d bytes, wait time %d", len(p.Ticket), p.WaitTime)
+					}
+				case waiting, requoted:
+					if len(p.Ticket) == 0 || p.WaitTime == 0 {
+						t.Errorf("no ticket issued: ticket %d bytes, wait time %d", len(p.Ticket), p.WaitTime)
+					}
+					if tt.want == requoted && !bytes.Equal(p.Ticket, req.Ticket) {
+						t.Errorf("early ticket not echoed")
+					}
+				case rejected:
+					if len(p.Ticket) != 0 || p.WaitTime != 0 {
+						t.Errorf("not rejected: ticket %d bytes, wait time %d", len(p.Ticket), p.WaitTime)
+					}
+				}
+				if tt.maxWait > 0 && (p.WaitTime < tt.minWait || p.WaitTime > tt.maxWait) {
+					t.Errorf("wait time %d, want within [%d, %d]", p.WaitTime, tt.minWait, tt.maxWait)
+				}
+			})
+			wantAds := 1
+			if tt.want == admitted {
+				wantAds = 2
+			}
+			if n := len(test.udp.LocalTopicNodes(testTopic1)); n != wantAds {
+				t.Fatalf("%d ads stored, want %d", n, wantAds)
+			}
+		})
+	}
+}
+
+// TestRegtopicTicketCredit checks the waiting time credited to a ticket: the
+// actual wait when on time, the scheduled wait when late, with FirstIssued
+// re-based so that the time past the window is not credited later, and nothing
+// when expired.
+func TestRegtopicTicketCredit(t *testing.T) {
+	t.Parallel()
+	first := mclock.AbsTime(time.Hour)
+	ticket := &topicindex.Ticket{
+		FirstIssued:    first,
+		LastUsed:       first.Add(10 * time.Second),
+		WaitTimeIssued: 20 * time.Second,
+	}
+	start := ticket.WindowStart()
+
+	now := start.Add(time.Second)
+	waited, firstIssued := regtopicCredit(ticket, topicindex.TicketOnTime, now)
+	if waited != now.Sub(first) || firstIssued != first {
+		t.Errorf("on time: got (%v, %v), want (%v, %v)", waited, firstIssued, now.Sub(first), first)
+	}
+
+	now = start.Add(10 * time.Second)
+	waited, firstIssued = regtopicCredit(ticket, topicindex.TicketLate, now)
+	if waited != start.Sub(first) || firstIssued != now.Add(-waited) {
+		t.Errorf("late: got (%v, %v), want (%v, %v)", waited, firstIssued, start.Sub(first), now.Add(-start.Sub(first)))
+	}
+
+	now = start.Add(time.Minute)
+	waited, firstIssued = regtopicCredit(ticket, topicindex.TicketExpired, now)
+	if waited != 0 || firstIssued != now {
+		t.Errorf("expired: got (%v, %v), want (0, %v)", waited, firstIssued, now)
+	}
+}
+
+// TestRegtopicTicketReplay presents one ticket again and again to a topic table
+// and ticket sealer driven the way handleRegtopic drives them. A ticket is
+// credited once: presented again, after an eviction or inside the grace, it is
+// worth nothing. Past its grace it is worth nothing either, so that it cannot
+// re-admit its holder after every ad expiry.
+func TestRegtopicTicketReplay(t *testing.T) {
+	t.Parallel()
+	topic := makeTopic("replay")
+
+	type replayEnv struct {
+		clock     *mclock.Simulated
+		tab       *topicindex.TopicTable
+		seed, adv *enode.Node
+		t0        []byte        // ticket issued to adv at time zero
+		w         time.Duration // wait quoted in t0
+		// present mirrors handleRegtopic for a ticket from adv.
+		present func(enc []byte) (admitted bool, wait time.Duration, timing topicindex.TicketTiming, replay bool)
+	}
+	setup := func(t *testing.T) *replayEnv {
+		env := &replayEnv{
+			clock: new(mclock.Simulated),
+			seed:  enode.NewV4(&newkey().PublicKey, net.IP{10, 0, 1, 1}, 30303, 30303),
+			adv:   enode.NewV4(&newkey().PublicKey, net.IP{10, 0, 2, 1}, 30303, 30303),
+		}
+		env.tab = topicindex.NewTopicTable(topicindex.Config{Clock: env.clock, Log: testlog.Logger(t, log.LvlInfo)})
+		sealer := topicindex.NewTicketSealer(env.clock)
+		used := topicindex.NewUsedTickets(env.clock)
+		env.present = func(enc []byte) (admitted bool, wait time.Duration, timing topicindex.TicketTiming, replay bool) {
+			t.Helper()
+			now := env.clock.Now()
+			ticket, err := sealer.Unpack(topic, enc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			timing = ticket.TimingAt(now)
+			credited := timing != topicindex.TicketExpired && !used.Use(enc)
+			replay = timing != topicindex.TicketExpired && !credited
+			waited, firstIssued := time.Duration(0), now
+			if credited {
+				waited, firstIssued = regtopicCredit(ticket, timing, now)
+			}
+			wait = env.tab.Register(env.adv, topic, waited)
+			if wait > 0 {
+				sealer.Pack(&topicindex.Ticket{Topic: topic, WaitTimeIssued: wait, LastUsed: now, FirstIssued: firstIssued})
+			}
+			return wait == 0, wait, timing, replay
+		}
+
+		// With one ad in the topic, a fresh attempt has to wait.
+		env.tab.Add(env.seed, topic)
+		now := env.clock.Now()
+		env.w = env.tab.Register(env.adv, topic, 0)
+		if env.w <= 0 {
+			t.Fatal("fresh attempt admitted without waiting")
+		}
+		env.t0 = sealer.Pack(&topicindex.Ticket{Topic: topic, WaitTimeIssued: env.w, LastUsed: now, FirstIssued: now})
+		t.Logf("ticket issued at %v with wait %v", time.Duration(now), env.w)
+		return env
+	}
+
+	t.Run("after ad expiry", func(t *testing.T) {
+		env := setup(t)
+		env.clock.Run(env.w)
+		if admitted, wait, timing, _ := env.present(env.t0); !admitted {
+			t.Fatalf("on-time ticket not admitted: timing %v, wait %v", timing, wait)
+		}
+		for cycle := 1; cycle <= 3; cycle++ {
+			env.clock.Run(env.tab.AdLifetime() + time.Second)
+			env.tab.Expire()
+			if n := len(env.tab.Nodes(topic)); n != 0 {
+				t.Fatalf("cycle %d: %d ads left after expiry", cycle, n)
+			}
+			env.tab.Add(env.seed, topic)
+			fresh := env.tab.WaitTime(env.adv, topic)
+			if fresh <= 0 {
+				t.Fatalf("cycle %d: fresh attempt need not wait", cycle)
+			}
+			admitted, wait, timing, _ := env.present(env.t0)
+			t.Logf("cycle %d at %v: timing %v, admitted %v, wait %v (fresh %v)", cycle, time.Duration(env.clock.Now()), timing, admitted, wait, fresh)
+			if admitted {
+				t.Errorf("cycle %d: replayed ticket admitted at %v", cycle, time.Duration(env.clock.Now()))
+				continue
+			}
+			if wait != fresh || timing != topicindex.TicketExpired {
+				t.Errorf("cycle %d: replayed ticket got timing %v and wait %v, want expired and %v", cycle, timing, wait, fresh)
+			}
+		}
+	})
+
+	t.Run("after eviction", func(t *testing.T) {
+		env := setup(t)
+		// 6s late: past the 5s window, inside the 10s grace.
+		env.clock.Run(env.w + 6*time.Second)
+		if admitted, wait, timing, _ := env.present(env.t0); !admitted || timing != topicindex.TicketLate {
+			t.Fatalf("late ticket: timing %v, admitted %v, wait %v", timing, admitted, wait)
+		}
+		env.tab.RemoveNode(env.adv.ID())
+		for i := 1; i <= 2; i++ {
+			if slices.ContainsFunc(env.tab.Nodes(topic), func(n *enode.Node) bool { return n.ID() == env.adv.ID() }) {
+				t.Fatalf("replay %d: advertiser still registered after eviction", i)
+			}
+			env.clock.Run(time.Second)
+			fresh := env.tab.WaitTime(env.adv, topic)
+			if fresh <= 0 {
+				t.Fatalf("replay %d: fresh attempt need not wait", i)
+			}
+			admitted, wait, timing, replay := env.present(env.t0)
+			t.Logf("replay %d at %v: timing %v, replay %v, admitted %v, wait %v (fresh %v)", i, time.Duration(env.clock.Now()), timing, replay, admitted, wait, fresh)
+			if admitted || !replay || wait != fresh {
+				t.Errorf("replay %d: admitted %v, replay %v, wait %v, want a new attempt waiting %v", i, admitted, replay, wait, fresh)
+			}
+			env.tab.RemoveNode(env.adv.ID())
+		}
+	})
+
+	t.Run("within grace", func(t *testing.T) {
+		env := setup(t)
+		// 6s late: past the 5s window, inside the 10s grace.
+		env.clock.Run(env.w + 6*time.Second)
+		if admitted, wait, timing, _ := env.present(env.t0); !admitted || timing != topicindex.TicketLate {
+			t.Fatalf("late ticket: timing %v, admitted %v, wait %v", timing, admitted, wait)
+		}
+		ads := len(env.tab.Nodes(topic))
+		env.clock.Run(time.Second)
+		if admitted, wait, _, replay := env.present(env.t0); !admitted || !replay {
+			t.Fatalf("second presentation not a no-op replay: admitted %v, replay %v, wait %v", admitted, replay, wait)
+		}
+		if n := len(env.tab.Nodes(topic)); n != ads {
+			t.Fatalf("second presentation changed the ads: %d, want %d", n, ads)
+		}
+	})
+}
+
+// TestHandleRegtopicReplay checks that a ticket credited once is worth nothing
+// when presented again, even after the ad it earned was evicted.
+func TestHandleRegtopicReplay(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+	seedTopicTable(t, test.udp, testTopic1, enode.NewV4(&newkey().PublicKey, net.IP{10, 0, 9, 1}, 30303, 30303))
+
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.1.1:30303")
+	now := test.udp.clock.Now()
+	ticket := sealTicket(test, &topicindex.Ticket{
+		Topic:          testTopic1,
+		LastUsed:       now.Add(-2 * time.Second),
+		WaitTimeIssued: time.Second,
+		FirstIssued:    now.Add(-time.Minute),
+	})
+	register := func(reqID byte) *v5wire.Regconfirmation {
+		var conf *v5wire.Regconfirmation
+		test.packetInFrom(key, addr, &v5wire.Regtopic{
+			ReqID: []byte{reqID}, Topic: testTopic1, Ticket: ticket,
+			ENR: signedRecord(t, key, addr.Addr(), netip.Addr{}, addr.Port()),
+		})
+		test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) { conf = p })
+		return conf
+	}
+
+	if conf := register(1); len(conf.Ticket) != 0 || conf.WaitTime != waitTimeToMs(test.udp.topicTable.AdLifetime()) {
+		t.Fatalf("on-time ticket not admitted: ticket %d bytes, wait time %d", len(conf.Ticket), conf.WaitTime)
+	}
+	if n := len(test.udp.LocalTopicNodes(testTopic1)); n != 2 {
+		t.Fatalf("%d ads after admission, want 2", n)
+	}
+	test.udp.evictTopicTableNode(enode.PubkeyToIDV4(&key.PublicKey))
+	if n := len(test.udp.LocalTopicNodes(testTopic1)); n != 1 {
+		t.Fatalf("%d ads after eviction, want 1", n)
+	}
+	conf := register(2)
+	if len(conf.Ticket) == 0 || conf.WaitTime < 40000 || conf.WaitTime > 50000 {
+		t.Errorf("replayed ticket: ticket %d bytes, wait time %d, want a new ticket and a wait in [40000, 50000]", len(conf.Ticket), conf.WaitTime)
+	}
+	if n := len(test.udp.LocalTopicNodes(testTopic1)); n != 1 {
+		t.Fatalf("%d ads after the replay, want 1", n)
+	}
+}
+
+// TestTopicRegZeroWaitTicketDiscarded checks that a ticket quoting less than
+// the wait time floor is discarded: the registrar is not asked again and no
+// liveness failure is counted.
+func TestTopicRegZeroWaitTicketDiscarded(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.3.47:30303")
+	ln := test.getNode(key, addr)
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+
+	test.table.addFoundNode(n, true)
+	test.udp.RegisterTopic(testTopic1, 1)
+	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+		test.packetInFrom(key, a, &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 1, Ticket: []byte("t"), WaitTime: 0})
+	})
+
+	time.Sleep(2*regloopMinTime + 500*time.Millisecond)
+	if q := pipeQueued(test); q != 0 {
+		t.Errorf("%d packets sent to a registrar that quoted a zero wait", q)
+	}
+	if fails := test.db.FindFails(n.ID(), n.IPAddr()); fails != 0 {
+		t.Errorf("zero-wait ticket led to %d wire failures, want 0", fails)
+	}
+}
+
+// TestTopicRegRetriesNotBlockedByDeadRegistrars checks that ticket retries go
+// out within their window while most first contacts time out at dead
+// registrars.
+func TestTopicRegRetriesNotBlockedByDeadRegistrars(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	const (
+		nlive    = 4
+		ndead    = 12
+		waitTime = 1500 * time.Millisecond
+	)
+	topic := makeTopic("retries")
+
+	// At most four registrars per registration bucket, so that every one of
+	// them is contacted right away.
+	type registrar struct {
+		key     *ecdsa.PrivateKey
+		node    *enode.Node
+		ticket  []byte
+		replied time.Time
+		retried bool
+	}
+	var (
+		regs    []*registrar
+		byAddr  = make(map[netip.AddrPort]*registrar)
+		perDist = make(map[int]int)
+	)
+	for len(regs) < nlive+ndead {
+		key := newkey()
+		d := min(256-enode.LogDist(enode.ID(topic), enode.PubkeyToIDV4(&key.PublicKey)), 17)
+		if perDist[d] == 4 {
+			continue
+		}
+		perDist[d]++
+		addr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 0, byte(len(regs) + 1), 1}), 30303)
+		ln := test.getNode(key, addr)
+		ln.Set(topicindex.TopicDiscoveryVersion)
+		r := &registrar{key: key, node: ln.Node()}
+		regs = append(regs, r)
+		byAddr[addr] = r
+	}
+	live, dead := regs[:nlive], regs[nlive:]
+
+	for _, r := range live {
+		test.table.addFoundNode(r.node, true)
+	}
+	test.udp.RegisterTopic(topic, 1)
+	for i := range live {
+		test.waitPacketOut(func(p *v5wire.Regtopic, addr netip.AddrPort, _ v5wire.Nonce) {
+			r := byAddr[addr]
+			if r.ticket != nil || len(p.Ticket) != 0 {
+				t.Fatalf("unexpected REGTOPIC to %v", addr)
+			}
+			r.ticket = []byte{byte(i + 1)}
+			r.replied = time.Now()
+			test.packetInFrom(r.key, addr, &v5wire.Regconfirmation{
+				ReqID:    p.ReqID,
+				Ticket:   r.ticket,
+				WaitTime: uint(waitTime.Milliseconds()),
+			})
+		})
+	}
+
+	for _, r := range dead {
+		test.table.addFoundNode(r.node, true)
+	}
+	var retried, deadSeen int
+	for retried < nlive || deadSeen < ndead {
+		test.waitPacketOut(func(p *v5wire.Regtopic, addr netip.AddrPort, _ v5wire.Nonce) {
+			r := byAddr[addr]
+			if r.ticket == nil {
+				deadSeen++
+				return
+			}
+			if r.retried || !bytes.Equal(p.Ticket, r.ticket) {
+				t.Fatalf("unexpected REGTOPIC to %v with ticket %x", addr, p.Ticket)
+			}
+			delay := time.Since(r.replied)
+			t.Logf("retry to %v after %v (expected below %v)", addr, delay, waitTime+2*test.udp.respTimeout)
+			if delay < waitTime || delay >= waitTime+5*time.Second {
+				t.Errorf("retry to %v after %v, want within [%v, %v)", addr, delay, waitTime, waitTime+5*time.Second)
+			}
+			r.retried = true
+			retried++
+			test.packetInFrom(r.key, addr, &v5wire.Regconfirmation{ReqID: p.ReqID, WaitTime: 900000})
+		})
+	}
+}
+
+// TestTopicRegRejectedNotPenalized checks that a rejected registration keeps
+// the registrar out of the registration table without counting toward its
+// DHT eviction.
+func TestTopicRegRejectedNotPenalized(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.3.45:30303")
+	ln := test.getNode(key, addr)
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+
+	test.table.addFoundNode(n, true)
+	test.udp.RegisterTopic(testTopic1, 1)
+	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+		test.packetInFrom(key, a, &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 1})
+	})
+
+	// The registration loop re-seeds from the table, but n is not admitted again.
+	time.Sleep(2*regloopMinTime + 500*time.Millisecond)
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent to a registrar that rejected the request", q)
+	}
+	if fails := test.db.FindFails(n.ID(), n.IPAddr()); fails != 0 {
+		t.Fatalf("rejection counted as %d wire failures, want 0", fails)
+	}
+}
+
+// TestTopicRegTicketRetry checks that the advertiser retries with the ticket
+// once the quoted wait time has passed.
+func TestTopicRegTicketRetry(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	key := newkey()
+	addr := netip.MustParseAddrPort("10.0.3.46:30303")
+	ln := test.getNode(key, addr)
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	test.table.addFoundNode(ln.Node(), true)
+	test.udp.RegisterTopic(testTopic1, 1)
+
+	// The shortest wait a registrar quotes; the advertiser discards shorter ones.
+	const waitTime = time.Second
+	ticket := []byte("ticket")
+	var replied time.Time
+	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+		replied = time.Now()
+		test.packetInFrom(key, a, &v5wire.Regconfirmation{ReqID: p.ReqID, Ticket: ticket, WaitTime: uint(waitTime.Milliseconds())})
+	})
+	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+		if !bytes.Equal(p.Ticket, ticket) {
+			t.Errorf("retry carries ticket %x, want %x", p.Ticket, ticket)
+		}
+		if d := time.Since(replied); d < waitTime {
+			t.Errorf("retry after %v, want at least %v", d, waitTime)
+		}
+		test.packetInFrom(key, a, &v5wire.Regconfirmation{ReqID: p.ReqID, WaitTime: 900000})
 	})
 }
 

@@ -431,6 +431,200 @@ func TestRegistrationRemoveNode(t *testing.T) {
 	}
 }
 
+// TestRegistrationUpdatePrefersTickets checks that within a bucket a due attempt
+// holding a ticket is returned before due first contacts, which follow in
+// NextTime order.
+func TestRegistrationUpdatePrefersTickets(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	r := NewRegistration(topic1, cfg)
+
+	holder := nodesAtDistance(enode.ID(topic1), 250, 1)[0]
+	r.AddNodes(nil, []*enode.Node{holder})
+	att := r.Update()
+	if att == nil || att.Node.ID() != holder.ID() {
+		t.Fatal("ticket holder not scheduled")
+	}
+	r.StartRequest(att)
+	r.HandleTicketResponse(att, []byte("ticket"), time.Second)
+	checkNextUpdate(t, r)
+
+	contacts := nodesAtDistanceFrom(enode.ID(topic1), 250, 4, 10)
+	for _, n := range contacts {
+		r.AddNodes(nil, []*enode.Node{n})
+		simclock.Run(10 * time.Millisecond)
+	}
+	checkNextUpdate(t, r)
+
+	simclock.Run(time.Second - 40*time.Millisecond)
+	want := append([]*enode.Node{holder}, contacts...)
+	for i, n := range want {
+		att := r.Update()
+		if att == nil {
+			t.Fatalf("Update #%d returned nothing, want %v", i, n.ID())
+		}
+		if att.Node.ID() != n.ID() {
+			t.Fatalf("Update #%d returned %v, want %v", i, att.Node.ID(), n.ID())
+		}
+		r.StartRequest(att)
+		checkNextUpdate(t, r)
+	}
+	if att := r.Update(); att != nil {
+		t.Fatalf("Update returned %v after all attempts started", att.Node.ID())
+	}
+}
+
+// checkNextUpdate checks that NextUpdateTime is the minimum NextTime in the heap.
+func checkNextUpdate(t *testing.T, r *Registration) {
+	t.Helper()
+	want := Never
+	for i, att := range r.heap {
+		if i == 0 || att.NextTime < want {
+			want = att.NextTime
+		}
+	}
+	if next := r.NextUpdateTime(); next != want {
+		t.Fatalf("NextUpdateTime = %v, want heap minimum %v", next, want)
+	}
+}
+
+// TestRegistrationUpdateBucketFairness checks that due attempts are served bucket
+// by bucket: a retry in one bucket does not wait behind ten retries in another.
+func TestRegistrationUpdateBucketFairness(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	r := NewRegistration(topic1, cfg)
+
+	hog := nodesAtDistanceFrom(enode.ID(topic1), 250, 10, 10)
+	other := nodesAtDistanceFrom(enode.ID(topic1), 249, 1, 30)[0]
+	r.AddNodes(nil, hog)
+	r.AddNodes(nil, []*enode.Node{other})
+
+	var started []*RegAttempt
+	for att := r.Update(); att != nil; att = r.Update() {
+		r.StartRequest(att)
+		started = append(started, att)
+		checkNextUpdate(t, r)
+	}
+	if len(started) != 11 {
+		t.Fatalf("%d attempts started, want 11", len(started))
+	}
+	for _, att := range started {
+		wait := time.Second
+		if att.Node.ID() == other.ID() {
+			wait += time.Millisecond
+		}
+		r.HandleTicketResponse(att, []byte("ticket"), wait)
+		checkNextUpdate(t, r)
+	}
+
+	simclock.Run(time.Second + time.Millisecond)
+	seen := make(map[enode.ID]int)
+	pos := 0
+	for att := r.Update(); att != nil; att = r.Update() {
+		r.StartRequest(att)
+		checkNextUpdate(t, r)
+		seen[att.Node.ID()]++
+		if att.Node.ID() == other.ID() {
+			pos = len(seen)
+		}
+	}
+	if len(seen) != 11 {
+		t.Fatalf("%d attempts returned, want 11", len(seen))
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("attempt %v returned %d times", id, n)
+		}
+	}
+	if pos == 0 || pos > 2 {
+		t.Fatalf("retry in the other bucket returned at position %d, want at most 2", pos)
+	}
+}
+
+// TestRegistrationUpdateHostileBucket checks that a bucket whose registrars quote
+// zero wait times cannot keep a first contact in another bucket waiting.
+func TestRegistrationUpdateHostileBucket(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	r := NewRegistration(topic1, cfg)
+
+	hostile := nodesAtDistanceFrom(enode.ID(topic1), 250, 11, 10)
+	r.AddNodes(nil, hostile)
+	simclock.Run(time.Millisecond)
+	first := nodesAtDistanceFrom(enode.ID(topic1), 249, 1, 30)[0]
+	r.AddNodes(nil, []*enode.Node{first})
+
+	step := 0
+	for i := 1; i <= 40; i++ {
+		att := r.Update()
+		if att == nil {
+			break
+		}
+		r.StartRequest(att)
+		if att.Node.ID() == first.ID() {
+			step = i
+			continue
+		}
+		r.HandleTicketResponse(att, []byte("t"), 0)
+	}
+	if step == 0 || step > 2 {
+		t.Fatalf("first contact in the other bucket returned at step %d, want at most 2", step)
+	}
+	hb := &r.buckets[r.bucketIndex(hostile[0].ID())]
+	if len(hb.att) != 0 {
+		t.Fatalf("%d attempts left in the hostile bucket, want 0", len(hb.att))
+	}
+	for _, n := range hostile {
+		if !r.failed.Has(n.ID()) {
+			t.Fatalf("hostile registrar %v not held as failed", n.ID())
+		}
+	}
+	if n := r.NodeCount(); n != 1 {
+		t.Fatalf("NodeCount = %d, want 1 (the first contact in flight)", n)
+	}
+	if len(r.heap) != 0 {
+		t.Fatalf("%d attempts left in the heap, want 0", len(r.heap))
+	}
+}
+
+// TestRegistrationAddNodesKeepsInflight checks that a newer record moving an
+// in-flight attempt into a full /24 leaves the attempt to its pending response.
+func TestRegistrationAddNodesKeepsInflight(t *testing.T) {
+	r := NewRegistration(topic1, testConfig(t))
+	nodes := []*enode.Node{
+		nodeAtDistance(enode.ID(topic1), 200, net.IP{3, 0, 2, 1}),
+		nodeAtDistance(enode.ID(topic1), 200, net.IP{4, 0, 2, 1}),
+	}
+	r.AddNodes(nil, nodes)
+	att := r.Update()
+	if att == nil {
+		t.Fatal("no attempt scheduled")
+	}
+	r.StartRequest(att)
+
+	other := nodes[0]
+	if other.ID() == att.Node.ID() {
+		other = nodes[1]
+	}
+	prev := att.Node
+	r.AddNodes(nil, []*enode.Node{nodeWithSeq(prev.ID(), other.IP(), prev.Seq()+1)})
+	if att.bucket.att[prev.ID()] != att {
+		t.Fatal("in-flight attempt removed by record update")
+	}
+	if att.Node != prev {
+		t.Fatal("in-flight attempt's record replaced")
+	}
+
+	r.HandleErrorResponse(att, errors.New("timeout"))
+	if att.bucket.att[prev.ID()] != nil {
+		t.Fatal("attempt not removed by its response")
+	}
+}
+
 // TestRegistrationHandleTicketResponseDropAboveBudget verifies that a
 // registrar quoting a wait time above RegAttemptTimeout causes the attempt
 // to be dropped, freeing the bucket slot for another registrar. Without
@@ -456,6 +650,45 @@ func TestRegistrationHandleTicketResponseDropAboveBudget(t *testing.T) {
 	r.HandleTicketResponse(att, []byte("t"), 49*24*time.Hour)
 	if att.bucket.att[node[0].ID()] != nil {
 		t.Fatal("attempt not removed after wait time above RegAttemptTimeout")
+	}
+}
+
+// TestRegistrationHandleTicketResponseBelowFloor checks that a quote below the
+// wait time floor is discarded and its registrar held as failed, while a quote
+// at the floor is kept.
+func TestRegistrationHandleTicketResponseBelowFloor(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	r := NewRegistration(topic1, cfg)
+
+	below := nodesAtDistance(enode.ID(topic1), 30, 1)
+	r.AddNodes(nil, below)
+	att := r.Update()
+	r.StartRequest(att)
+	if err := r.HandleTicketResponse(att, []byte("t"), topicTableWaitTimeFloor-time.Nanosecond); err != ErrWaitBelowFloor {
+		t.Fatalf("HandleTicketResponse returned %v, want ErrWaitBelowFloor", err)
+	}
+	if att.bucket.att[below[0].ID()] != nil {
+		t.Fatal("attempt not removed")
+	}
+	if !r.failed.Has(below[0].ID()) {
+		t.Fatal("registrar not held as failed")
+	}
+	r.AddNodes(nil, below)
+	if n := r.NodeCount(); n != 0 {
+		t.Fatalf("failed registrar re-admitted: %d nodes", n)
+	}
+
+	at := nodesAtDistance(enode.ID(topic1), 40, 1)
+	r.AddNodes(nil, at)
+	att = r.Update()
+	r.StartRequest(att)
+	if err := r.HandleTicketResponse(att, []byte("t"), topicTableWaitTimeFloor); err != nil {
+		t.Fatalf("HandleTicketResponse returned %v for a quote at the floor", err)
+	}
+	if att.bucket.att[at[0].ID()] != att || att.NextTime != simclock.Now().Add(topicTableWaitTimeFloor) {
+		t.Fatal("quote at the floor not kept")
 	}
 }
 
