@@ -46,6 +46,7 @@ type config struct {
 	HeapProfile     string
 	MemfillLevels   string
 	MemfillReps     int
+	ENRPad          int
 }
 
 func flags() config {
@@ -80,6 +81,7 @@ func flags() config {
 	flag.StringVar(&c.HeapProfile, "heap-profile", "", "optional end-of-measurement heap profile path")
 	flag.StringVar(&c.MemfillLevels, "memfill-levels", "0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1", "memfill: occupancy levels as fractions of capacity")
 	flag.IntVar(&c.MemfillReps, "memfill-reps", 5, "memfill: repetitions")
+	flag.IntVar(&c.ENRPad, "enr-pad", 0, "add an opaque ENR entry of this many bytes (records must stay within 300 bytes)")
 	flag.Parse()
 	return c
 }

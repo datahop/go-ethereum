@@ -271,7 +271,7 @@ func population(c config) (*workload, dataset, error) {
 		go func(k int) {
 			defer wg.Done()
 			for i := k; i < len(w.ads); i += workers {
-				node, enc, err := signedNode(c.Seed, i, ips[i])
+				node, enc, err := signedNode(c.Seed, i, ips[i], c.ENRPad)
 				if err != nil {
 					errOnce.Do(func() { firstErr = err })
 					return
@@ -289,10 +289,15 @@ func population(c config) (*workload, dataset, error) {
 }
 
 // signedNode creates advertiser i's deterministic, validly signed record.
-func signedNode(seed int64, i int, ip netip.Addr) (*enode.Node, []byte, error) {
+// A positive pad adds an opaque entry of that many bytes, used to approach
+// the 300-byte record size limit.
+func signedNode(seed int64, i int, ip netip.Addr, pad int) (*enode.Node, []byte, error) {
 	var record enr.Record
 	record.Set(enr.IPv4(ip.AsSlice()))
 	record.Set(enr.UDP(30303))
+	if pad > 0 {
+		record.Set(enr.WithEntry("zz", make([]byte, pad)))
+	}
 	digest := sha256.Sum256([]byte(fmt.Sprintf("registrarbench/key/%d/%d", seed, i)))
 	key, err := crypto.ToECDSA(digest[:])
 	if err != nil {

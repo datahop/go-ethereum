@@ -57,7 +57,7 @@ func runMemfill(c config, plat platform, enc *json.Encoder) error {
 		encSize += len(a.enc)
 	}
 	if err := enc.Encode(map[string]any{"type": "metadata", "schema_version": 6, "mode": "memfill", "config": c, "ip_dist": c.ipDist(), "dataset": data, "platform": plat,
-		"mean_encoded_enr_bytes": float64(encSize) / float64(len(w.ads)), "go_version": plat.GoVersion, "revision": plat.Revision, "dirty": plat.Dirty, "arch": plat.GOARCH}); err != nil {
+		"mean_encoded_enr_bytes": float64(encSize) / float64(len(w.ads)), "enr_pad": c.ENRPad, "go_version": plat.GoVersion, "revision": plat.Revision, "dirty": plat.Dirty, "arch": plat.GOARCH}); err != nil {
 		return err
 	}
 	for rep := 0; rep < c.MemfillReps; rep++ {
