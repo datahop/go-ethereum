@@ -328,14 +328,16 @@ const (
 
 // clientWait is the waiting time as received by the client: REGCONFIRMATION
 // carries it in milliseconds, rounded up (v5_udp.go:waitTimeToMs), and
-// v5_topic.go converts it back to a Duration.
+// v5_topic.go converts it back with time.Duration(ms) * time.Millisecond,
+// which wraps for waits close to the int64 limit.
 func clientWait(d time.Duration) time.Duration {
 	return time.Duration(math.Ceil(d.Seconds()*1000)) * time.Millisecond
 }
 
 // quoted applies the client's response to a ticket with waiting time wait,
 // issued at registrar time 'issued'. It returns "" if the advertiser will
-// retry, otherwise the abandonment reason ("single" or "cumulative").
+// retry, otherwise the abandonment reason ("single", "cumulative" or
+// "wrapped").
 //
 // The production policy mirrors HandleTicketResponse exactly: drop when the
 // single quote exceeds RegAttemptTimeout, otherwise add it to the sum of
@@ -343,8 +345,12 @@ func clientWait(d time.Duration) time.Duration {
 func (w *workload) quoted(id int, issued mclock.AbsTime, wait time.Duration, policy string, timeout, lifetime time.Duration) (string, error) {
 	a := &w.ads[id]
 	cw := clientWait(wait)
-	if issued.Add(cw) < issued {
-		return "", fmt.Errorf("retry due-time overflow for advertiser %d: %s", id, wait)
+	if cw <= 0 || issued.Add(cw) < issued {
+		// The decoded wait wrapped around (registrar quoted ~MaxInt64 at
+		// occupancy >= ~84%, see v5_topic_overflow_test.go) or the retry time
+		// overflows. The production client then retries at once with a ticket
+		// the registrar rejects without reply, and drops the attempt on timeout.
+		return "wrapped", nil
 	}
 	switch policy {
 	case abandonProduction:

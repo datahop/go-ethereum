@@ -12,4 +12,8 @@ case "$(file -b "$out/topicindex.test")" in
   *"$(uname -m)"*) ;;
   *) echo "test binary is not native: $(file -b "$out/topicindex.test")" >&2; exit 1 ;;
 esac
-(cd topicindex && "$out/topicindex.test" -test.run '^$' -test.bench . -test.benchmem -test.count "$count") | tee "$out/bench.txt"
+# Benchmarks that pause the timer every iteration (StopTimer reads MemStats)
+# use a fixed iteration count; the others use the default 1s benchtime.
+(cd topicindex &&
+  "$out/topicindex.test" -test.run '^$' -test.bench '^Benchmark(RegisterFresh|RegisterDuplicate|RandomNodes|IPScore|RemoveNode)$' -test.benchmem -test.count "$count" &&
+  "$out/topicindex.test" -test.run '^$' -test.bench '^Benchmark(RegisterRetryAdmit|Expire)$' -test.benchtime 20000x -test.benchmem -test.count "$count") | tee "$out/bench.txt"

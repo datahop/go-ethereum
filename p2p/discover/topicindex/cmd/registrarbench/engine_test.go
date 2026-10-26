@@ -564,3 +564,15 @@ func TestRetryHeapOrder(t *testing.T) {
 		t.Fatal("heap order")
 	}
 }
+
+// A quote near the int64 limit wraps when the client decodes it; the attempt
+// is dropped regardless of the abandonment policy.
+func TestWrappedWaitAbandons(t *testing.T) {
+	for _, policy := range []string{abandonProduction, abandonSpec, abandonNone} {
+		w := &workload{ads: make([]advertiser, 1)}
+		reason, err := w.quoted(0, mclock.AbsTime(time.Hour), time.Duration(math.MaxInt64), policy, time.Hour, time.Hour)
+		if err != nil || reason != "wrapped" || len(w.retries) != 0 {
+			t.Fatalf("%s: reason %q err %v retries %d", policy, reason, err, len(w.retries))
+		}
+	}
+}

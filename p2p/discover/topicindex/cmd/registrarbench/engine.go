@@ -336,6 +336,10 @@ func (e *engine) register(event workEvent, id int, retry bool) (operation, error
 				c.Abandoned++
 				c.AbandonedCumulative++
 				c.AbandonedAfter.add(uint64(op.Credited))
+			case "wrapped":
+				c.Abandoned++
+				c.AbandonedWrapped++
+				c.AbandonedAfter.add(uint64(op.Credited))
 			}
 		}
 	})
