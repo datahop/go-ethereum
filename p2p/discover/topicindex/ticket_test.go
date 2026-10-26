@@ -17,6 +17,7 @@
 package topicindex
 
 import (
+	"encoding/binary"
 	"reflect"
 	"testing"
 	"time"
@@ -64,8 +65,40 @@ func TestTicketSealerInvalid(t *testing.T) {
 	if _, err := ts.Unpack(topic2, enc); err != errWrongTicketTopic {
 		t.Fatal("unpacking with wrong topic did not raise correct error")
 	}
-	if _, err := ts.Unpack(topic1, enc); err != errTicketTimeInvalid {
-		t.Fatal("unpacking at wrong time did not raise correct error")
+	ticket, err := ts.Unpack(topic1, enc)
+	if err != nil {
+		t.Fatal("unpacking early ticket failed:", err)
+	}
+	if timing := ticket.TimingAt(clock.Now()); timing != TicketEarly {
+		t.Fatal("wrong timing for early ticket:", timing)
+	}
+}
+
+func TestTicketTiming(t *testing.T) {
+	var (
+		issued = mclock.AbsTime(1000)
+		wait   = time.Minute
+		start  = issued.Add(wait)
+		ticket = Ticket{LastUsed: issued, WaitTimeIssued: wait}
+	)
+	if ticket.WindowStart() != start {
+		t.Fatalf("WindowStart = %v, want %v", ticket.WindowStart(), start)
+	}
+	tests := []struct {
+		at   mclock.AbsTime
+		want TicketTiming
+	}{
+		{start - 1, TicketEarly},
+		{start, TicketOnTime},
+		{start.Add(ticketValidityWindow) - 1, TicketOnTime},
+		{start.Add(ticketValidityWindow), TicketLate},
+		{start.Add(ticketValidityWindow+ticketLateGrace) - 1, TicketLate},
+		{start.Add(ticketValidityWindow + ticketLateGrace), TicketExpired},
+	}
+	for _, test := range tests {
+		if got := ticket.TimingAt(test.at); got != test.want {
+			t.Errorf("TimingAt(start%+d) = %v, want %v", test.at-start, got, test.want)
+		}
 	}
 }
 
@@ -129,5 +162,43 @@ func TestTicketSealerKeyRotation(t *testing.T) {
 		if _, err := ts.Unpack(topic1, enc); err != errNoTicketKey {
 			t.Fatalf("Unpack returned wrong error for ticket %d with expired key: %v", i, err)
 		}
+	}
+}
+
+func TestUsedTickets(t *testing.T) {
+	clock := new(mclock.Simulated)
+	u := NewUsedTickets(clock)
+	mac := func(i int) []byte {
+		enc := make([]byte, encTicketFullSize)
+		binary.BigEndian.PutUint32(enc, uint32(i))
+		return enc
+	}
+
+	if u.Use(mac(0)) {
+		t.Fatal("first use reported as replay")
+	}
+	if !u.Use(mac(0)) {
+		t.Fatal("second use not reported as replay")
+	}
+	clock.Run(usedTicketTTL - 1)
+	if !u.Use(mac(0)) {
+		t.Fatal("ticket forgotten before its TTL")
+	}
+	clock.Run(1)
+	if u.Use(mac(0)) {
+		t.Fatal("ticket remembered past its TTL")
+	}
+
+	u = NewUsedTickets(clock)
+	for i := 0; i <= usedTicketLimit; i++ {
+		if u.Use(mac(i)) {
+			t.Fatalf("ticket %d reported as replay", i)
+		}
+	}
+	if u.Len() != usedTicketLimit {
+		t.Fatalf("Len = %d, want %d", u.Len(), usedTicketLimit)
+	}
+	if u.Use(mac(0)) {
+		t.Fatal("oldest ticket not dropped past the limit")
 	}
 }

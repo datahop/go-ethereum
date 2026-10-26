@@ -18,6 +18,7 @@ package topicindex
 
 import (
 	"container/heap"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -52,11 +53,15 @@ type Registration struct {
 	buckets []regBucket
 	heap    regHeap
 
+	failed *AskedSet // nodes whose registration failed within the last ad lifetime
+
+	// rrBucket is the bucket of the last started attempt. Update scans from the
+	// next one.
+	rrBucket int
+
 	// everRegistered holds registrars that confirmed a registration before, so
 	// a later request to them is a renewal.
 	everRegistered map[enode.ID]struct{}
-
-	failed *AskedSet // nodes whose registration failed within the last ad lifetime
 }
 
 // BucketStats is the state of one registration bucket.
@@ -101,6 +106,10 @@ func (r *Registration) WasRegistered(id enode.ID) bool {
 	_, ok := r.everRegistered[id]
 	return ok
 }
+
+// ErrWaitBelowFloor is returned by HandleTicketResponse for a quote below the
+// minimum wait time a registrar issues.
+var ErrWaitBelowFloor = errors.New("registrar quoted a wait below the floor")
 
 //go:generate go run golang.org/x/tools/cmd/stringer@latest -type RegAttemptState
 
@@ -183,6 +192,8 @@ func NewRegistration(topic TopicID, cfg Config) *Registration {
 		log:            cfg.Log.New("topic", topic),
 		buckets:        make([]regBucket, cfg.RegTableDepth),
 		failed:         NewAskedSet(cfg),
+
+		rrBucket: cfg.RegTableDepth - 1,
 	}
 	dist := 256
 	for i := range r.buckets {
@@ -246,6 +257,10 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		b := &r.buckets[bi]
 		attempt, ok := b.att[id]
 		if ok {
+			// An in-flight attempt is left for its pending response, as in RemoveNode.
+			if attempt.index == -2 {
+				continue
+			}
 			// Already scheduled: update the record if newer.
 			if attempt.Node.Seq() >= n.Seq() {
 				continue
@@ -349,10 +364,13 @@ func (r *Registration) NextUpdateTime() mclock.AbsTime {
 	return Never
 }
 
-// Update processes the attempt queue and returns the next attempt in state 'Waiting'.
+// Update processes the attempt queue and returns the next due attempt in state
+// 'Waiting'. Due attempts are served bucket by bucket, so that one bucket's
+// backlog cannot delay another's retries. Within a bucket, attempts holding a
+// ticket go first.
 func (r *Registration) Update() *RegAttempt {
 	now := r.cfg.Clock.Now()
-	for len(r.heap) > 0 && r.heap[0].NextTime <= now {
+	for len(r.heap) > 0 && r.heap[0].NextTime <= now && r.heap[0].State != Waiting {
 		att := r.heap[0]
 		switch att.State {
 		case Standby:
@@ -360,11 +378,33 @@ func (r *Registration) Update() *RegAttempt {
 		case Registered:
 			r.removeAttempt(att, "expired")
 			r.refillAttempts(att.bucket)
-		case Waiting:
+		}
+	}
+	best := make([]*RegAttempt, len(r.buckets))
+	for _, att := range r.heap {
+		if att.State != Waiting || att.NextTime > now {
+			continue
+		}
+		bi := r.bucketIndex(att.Node.ID())
+		if best[bi] == nil || betterAttempt(att, best[bi]) {
+			best[bi] = att
+		}
+	}
+	for i := 1; i <= len(best); i++ {
+		if att := best[(r.rrBucket+i)%len(best)]; att != nil {
 			return att
 		}
 	}
 	return nil
+}
+
+// betterAttempt reports whether a goes before b: ticket holders first, then the
+// earlier NextTime.
+func betterAttempt(a, b *RegAttempt) bool {
+	if hasA, hasB := len(a.Ticket) > 0, len(b.Ticket) > 0; hasA != hasB {
+		return hasA
+	}
+	return a.NextTime < b.NextTime
 }
 
 // StartRequest should be called when a registration request is sent for the attempt.
@@ -378,6 +418,7 @@ func (r *Registration) StartRequest(att *RegAttempt) {
 	heap.Remove(&r.heap, att.index)
 	att.index = -2
 	att.reqCount++
+	r.rrBucket = r.bucketIndex(att.Node.ID())
 }
 
 func (r *Registration) validate(att *RegAttempt) {
@@ -388,14 +429,25 @@ func (r *Registration) validate(att *RegAttempt) {
 }
 
 // HandleTicketResponse should be called when a node responds to a registration
-// request with a ticket and waiting time.
-func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, waitTime time.Duration) {
+// request with a ticket and waiting time. It returns ErrWaitBelowFloor if the
+// quote is discarded for being too short, and nil otherwise, including when the
+// attempt is dropped for exceeding the waiting budget.
+func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, waitTime time.Duration) error {
 	r.validate(att)
+
+	// Register never quotes below the floor, so the registrar is broken or hostile.
+	// It is held like a failed one; the caller counts no liveness failure.
+	if waitTime < topicTableWaitTimeFloor {
+		r.failed.Add(att.Node.ID())
+		r.removeAttempt(att, "wtime-below-floor")
+		r.refillAttempts(att.bucket)
+		return ErrWaitBelowFloor
+	}
 
 	// Drop the attempt when a single quote already exceeds the registrant's total allowed waiting time for the registration.
 	if waitTime > r.cfg.RegAttemptTimeout {
 		r.removeAttempt(att, "wtime-above-budget")
-		return
+		return nil
 	}
 
 	att.totalWaitTime += waitTime
@@ -403,12 +455,13 @@ func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, wait
 	// Drop the attempt when cumulative waiting exceeds RegAttemptTimeout.
 	if att.totalWaitTime > r.cfg.RegAttemptTimeout {
 		r.removeAttempt(att, "wtime-too-high")
-		return
+		return nil
 	}
 
 	att.Ticket = ticket
 	att.NextTime = r.cfg.Clock.Now().Add(waitTime)
 	heap.Push(&r.heap, att)
+	return nil
 }
 
 // HandleRegistered should be called when a node confirms topic registration.

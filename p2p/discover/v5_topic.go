@@ -17,6 +17,7 @@
 package discover
 
 import (
+	"errors"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -131,11 +132,18 @@ func (sys *topicSystem) newSearchIterator(topic topicindex.TopicID, opid uint64)
 	return newTopicSearchIterator(sys, s, resultCh)
 }
 
+// regSenders is the number of concurrent REGTOPIC requests per topic. With four,
+// a ticket retry rarely waits for a timeout to a dead registrar to finish.
+const regSenders = 4
+
+var errRegRejected = errors.New("registration rejected by registrar")
+
 // topicReg handles registering for a single topic.
 type topicReg struct {
-	state *topicindex.Registration
-	clock mclock.Clock
-	opid  uint64
+	state    *topicindex.Registration
+	clock    mclock.Clock
+	opid     uint64
+	inflight int // requests handed to the senders and not yet answered
 
 	wg   sync.WaitGroup
 	quit chan struct{}
@@ -170,7 +178,7 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 		clock:       sys.config.Clock,
 		opid:        opid,
 		quit:        make(chan struct{}),
-		regRequest:  make(chan topicRegJob),
+		regRequest:  make(chan topicRegJob, regSenders),
 		regResponse: make(chan topicRegResult),
 		evictCh:     make(chan enode.ID, 64),
 		statsCh:     make(chan chan []topicindex.BucketStats),
@@ -180,9 +188,11 @@ func newTopicReg(sys *topicSystem, topic topicindex.TopicID, opid uint64) *topic
 	reg.newNodesCh = make(chan *enode.Node, 100)
 	reg.newNodesSub = sys.transport.tab.subscribeNodes(reg.newNodesCh)
 
-	reg.wg.Add(2)
+	reg.wg.Add(1 + regSenders)
 	go reg.registrationLoop(sys)
-	go reg.sendRequestsLoop(sys)
+	for range regSenders {
+		go reg.sendRequestsLoop(sys)
+	}
 	return reg
 }
 
@@ -254,11 +264,7 @@ func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
 }
 
 func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
-	var (
-		updateEv      = mclock.NewAlarm(reg.clock)
-		nextAttempt   topicRegJob
-		sendAttemptCh chan<- topicRegJob
-	)
+	updateEv := mclock.NewAlarm(reg.clock)
 
 	for {
 		if reg.state.NodeCount() == 0 {
@@ -266,7 +272,7 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 		}
 
 		var updateCh <-chan struct{}
-		if sendAttemptCh == nil {
+		if reg.inflight < regSenders {
 			next := reg.state.NextUpdateTime()
 			if next != topicindex.Never {
 				updateEv.Schedule(next)
@@ -288,31 +294,32 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 
 		case id := <-reg.evictCh:
 			reg.state.RemoveNode(id)
-			// If the evicted node was the attempt selected for the next
-			// request, cancel the pending send: its attempt has been removed,
-			// so StartRequest would operate on a stale (removed) attempt.
-			if sendAttemptCh != nil && nextAttempt.node.ID() == id {
-				sendAttemptCh = nil
-			}
 
 		case <-updateCh:
-			attempt := reg.state.Update()
-			if attempt != nil {
-				sendAttemptCh = reg.regRequest
-				nextAttempt = topicRegJob{
+			for reg.inflight < regSenders {
+				attempt := reg.state.Update()
+				if attempt == nil {
+					break
+				}
+				reg.state.StartRequest(attempt)
+				reg.inflight++
+				job := topicRegJob{
 					attempt: attempt,
 					node:    attempt.Node,
 					ticket:  attempt.Ticket,
+					buckets: reg.state.BucketsWithFreeSpace(nil),
 					renewal: reg.state.WasRegistered(attempt.Node.ID()),
 				}
-				nextAttempt.buckets = reg.state.BucketsWithFreeSpace(nextAttempt.buckets[:0])
+				// Never blocks: regRequest has a slot for every request in flight.
+				select {
+				case reg.regRequest <- job:
+				case <-reg.quit:
+					return true
+				}
 			}
 
-		case sendAttemptCh <- nextAttempt:
-			reg.state.StartRequest(nextAttempt.attempt)
-			sendAttemptCh = nil
-
 		case resp := <-reg.regResponse:
+			reg.inflight--
 			if resp.err == errClosed {
 				continue // shutdown cancel: liveness unknown, not a failure
 			}
@@ -330,16 +337,23 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			// The node responded: reset its global counter
 			sys.transport.trackTopicRequest(resp.att.Node, true)
 			wt := time.Duration(resp.msg.WaitTime) * time.Millisecond
-			if len(resp.msg.Ticket) > 0 {
-				reg.state.HandleTicketResponse(resp.att, resp.msg.Ticket, wt)
-			} else {
+			switch {
+			case len(resp.msg.Ticket) > 0:
+				if err := reg.state.HandleTicketResponse(resp.att, resp.msg.Ticket, wt); errors.Is(err, topicindex.ErrWaitBelowFloor) {
+					topicRegTicketBelowFloorCounter.Inc(1)
+				}
+			case wt == 0:
+				// No ticket and no ad lifetime: the registrar rejected the
+				// request. It answered, so this is not a liveness failure.
+				reg.state.HandleErrorResponse(resp.att, errRegRejected)
+			default:
 				reg.state.HandleRegistered(resp.att, wt)
 			}
 		}
 	}
 }
 
-// topicRegJob is a dispatch job handed from the event loop to the request
+// topicRegJob is a dispatch job handed from the event loop to a request
 // worker. It carries a value snapshot of the attempt's node and ticket, so
 // the worker does not share *RegAttempt state with the event loop goroutine.
 // The attempt field is only used for response correlation on the way back.

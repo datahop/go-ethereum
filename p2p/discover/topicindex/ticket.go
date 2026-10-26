@@ -38,6 +38,11 @@ const (
 	ticketKeyLifetime    = 6 * time.Hour
 	ticketValidityWindow = 5 * time.Second
 	ticketMacSize        = 32
+
+	// ticketLateGrace is how long past its window a ticket is still credited its
+	// scheduled wait. It is short against the ad lifetime, so a ticket cannot be
+	// replayed once the ad it earned has expired.
+	ticketLateGrace = 10 * time.Second
 )
 
 // Ticket defines the content of generated tickets.
@@ -49,10 +54,35 @@ type Ticket struct {
 	FirstIssued    mclock.AbsTime // creation time of first ticket in this waiting session
 }
 
-func (t Ticket) isValidAt(now mclock.AbsTime) bool {
-	start := t.LastUsed.Add(t.WaitTimeIssued)
-	end := start.Add(ticketValidityWindow)
-	return now >= start && now < end
+// WindowStart is the earliest time the ticket may be used.
+func (t Ticket) WindowStart() mclock.AbsTime {
+	return t.LastUsed.Add(t.WaitTimeIssued)
+}
+
+// TicketTiming says where a time falls relative to a ticket's validity window.
+type TicketTiming int
+
+const (
+	TicketOnTime TicketTiming = iota
+	TicketEarly
+	TicketLate
+	TicketExpired
+)
+
+// TimingAt reports whether now is before the ticket's window, inside it, after
+// it within the grace, or past the grace.
+func (t Ticket) TimingAt(now mclock.AbsTime) TicketTiming {
+	start := t.WindowStart()
+	switch {
+	case now < start:
+		return TicketEarly
+	case now >= start.Add(ticketValidityWindow+ticketLateGrace):
+		return TicketExpired
+	case now >= start.Add(ticketValidityWindow):
+		return TicketLate
+	default:
+		return TicketOnTime
+	}
 }
 
 // TicketSealer can encode/decode tickets.
@@ -82,14 +112,14 @@ func NewTicketSealer(clock mclock.Clock) *TicketSealer {
 }
 
 var (
-	errBadTicketSize     = errors.New("encoded ticket has wrong size")
-	errBadTicketMAC      = errors.New("invalid ticket MAC")
-	errNoTicketKey       = errors.New("unknown ticket MAC keyID")
-	errWrongTicketTopic  = errors.New("ticket used with wrong topic")
-	errTicketTimeInvalid = errors.New("ticket used at the wrong time")
+	errBadTicketSize    = errors.New("encoded ticket has wrong size")
+	errBadTicketMAC     = errors.New("invalid ticket MAC")
+	errNoTicketKey      = errors.New("unknown ticket MAC keyID")
+	errWrongTicketTopic = errors.New("ticket used with wrong topic")
 )
 
-// Unpack decrypts, authenticates and deserializes a ticket.
+// Unpack decrypts, authenticates and deserializes a ticket. It does not check the
+// ticket's timing, see Ticket.TimingAt.
 func (ts *TicketSealer) Unpack(topic TopicID, input []byte) (*Ticket, error) {
 	// Empty input means the sender has no ticket.
 	if len(input) == 0 {
@@ -123,9 +153,6 @@ func (ts *TicketSealer) Unpack(topic TopicID, input []byte) (*Ticket, error) {
 		}
 		if ticket.Topic != topic {
 			return nil, errWrongTicketTopic
-		}
-		if !ticket.isValidAt(ts.clock.Now()) {
-			return nil, errTicketTimeInvalid
 		}
 		return &ticket, nil
 	}
@@ -207,4 +234,59 @@ func (key *ticketKey) computeMAC(data []byte) []byte {
 	key.hmac.Write(data)
 	key.macBuffer = key.hmac.Sum(key.macBuffer[:0])
 	return key.macBuffer
+}
+
+const (
+	// usedTicketTTL is how long a credited ticket is remembered: the span in
+	// which it could still be credited.
+	usedTicketTTL = ticketValidityWindow + ticketLateGrace
+	// usedTicketLimit caps the memory. Past it the oldest entry is dropped: only a
+	// flood of credited tickets reaches it, and the flooder's entries go first.
+	usedTicketLimit = 1 << 14
+)
+
+// UsedTickets remembers credited tickets by their MAC, so that a ticket is
+// credited once.
+type UsedTickets struct {
+	clock mclock.Clock
+	set   map[[ticketMacSize]byte]struct{}
+	queue []usedTicket // in insertion order
+}
+
+type usedTicket struct {
+	mac [ticketMacSize]byte
+	exp mclock.AbsTime
+}
+
+func NewUsedTickets(clock mclock.Clock) *UsedTickets {
+	return &UsedTickets{clock: clock, set: make(map[[ticketMacSize]byte]struct{})}
+}
+
+// Use records a ticket as credited and reports whether it was already. The
+// ticket must be one that TicketSealer.Unpack accepted.
+func (u *UsedTickets) Use(enc []byte) (replay bool) {
+	now := u.clock.Now()
+	for len(u.queue) > 0 && u.queue[0].exp <= now {
+		u.dropOldest()
+	}
+	mac := [ticketMacSize]byte(enc[:ticketMacSize])
+	if _, ok := u.set[mac]; ok {
+		return true
+	}
+	if len(u.queue) >= usedTicketLimit {
+		u.dropOldest()
+	}
+	u.set[mac] = struct{}{}
+	u.queue = append(u.queue, usedTicket{mac: mac, exp: now.Add(usedTicketTTL)})
+	return false
+}
+
+// Len returns the number of remembered tickets.
+func (u *UsedTickets) Len() int {
+	return len(u.queue)
+}
+
+func (u *UsedTickets) dropOldest() {
+	delete(u.set, u.queue[0].mac)
+	u.queue = u.queue[1:]
 }
