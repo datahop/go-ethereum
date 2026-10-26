@@ -47,8 +47,10 @@ func (it *ipTree) normIP(ip net.IP) net.IP {
 	}
 }
 
-// insert adds an IP address to the tree and returns the similarity score.
-func (it *ipTree) insert(ip net.IP) float64 {
+// insert adds an IP address to the tree. It returns the similarity score and
+// the number of levels below the root that were incremented, which must be
+// passed to remove.
+func (it *ipTree) insert(ip net.IP) (float64, byte) {
 	ip = it.normIP(ip)
 	sum := 0
 	node := &it.root
@@ -78,7 +80,7 @@ func (it *ipTree) insert(ip net.IP) float64 {
 		}
 		n.counter++
 	}
-	return it.computeScore(sum, effectiveDepth)
+	return it.computeScore(sum, effectiveDepth), effectiveDepth
 }
 
 // score computes the score that the addition of an IP would return.
@@ -156,12 +158,14 @@ func (it *ipTree) pathFloor(ip net.IP, now mclock.AbsTime) time.Duration {
 	return floor
 }
 
-// remove removes an IP from the tree.
-func (it *ipTree) remove(ip net.IP) {
+// remove removes an IP from the tree. levels is the value returned by the
+// matching insert: the effective depth changes with the tree size, so only
+// the levels that insert incremented may be decremented.
+func (it *ipTree) remove(ip net.IP, levels byte) {
 	ip = it.normIP(ip)
 	node := &it.root
 	it.root.counter--
-	for depth := byte(0); depth < it.bits; depth++ {
+	for depth := byte(0); depth < levels; depth++ {
 		if ipBit(ip, depth) {
 			node = &(*node).left
 		} else {
