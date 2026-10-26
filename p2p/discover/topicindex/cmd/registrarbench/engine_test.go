@@ -4,214 +4,94 @@ import (
 	"bytes"
 	"container/heap"
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"math"
+	"net"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
+	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/p2p/enr"
 )
 
-func testEngine(t *testing.T) *engine {
-	t.Helper()
+func simConfig() config {
 	c := testConfig()
 	c.Mode = "simulated"
-	c.Lifetime = time.Minute
-	c.RegRate = 10
-	c.QueryRate = 0
+	return c
+}
+
+func testEngine(t *testing.T, c config) *engine {
+	t.Helper()
 	w, _, err := population(c)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if c.AttemptTimeout == 0 {
+		c.AttemptTimeout = c.Lifetime + c.Lifetime/2
 	}
 	e := newEngine(c, w)
 	e.scheduler.start()
 	return e
 }
 
-// Distinct topics make these scheduling fixtures admit each selected identity
-// without additional waits, isolating the preloaded retry demand.
-func cappedEngine(t *testing.T, retries int) *engine {
-	t.Helper()
-	c := testConfig()
-	c.Mode = "simulated"
-	c.Advertisers = 100
-	c.Topics = 100
-	c.RegRate = 20
-	c.QueryRate = 0
-	c.Lifetime = time.Hour
-	w, _, err := population(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range w.ads {
-		w.ads[i].topic = i
-		w.population[i] = 1
-	}
-	e := newEngine(c, w)
-	e.scheduler.start()
-	for i := 0; i < retries; i++ {
-		id, _ := w.next()
-		if err := w.finish(id, 0, 0, time.Second, c.Lifetime); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if retries > 0 {
-		e.scheduler.advance(time.Second)
-		for i := 0; i < 20; i++ {
-			e.pacer.consume()
-		}
-	}
-	return e
-}
-func driveUntil(t *testing.T, e *engine, end time.Duration) []operation {
+// drive executes arrivals until end, expiring and releasing as the main loop does.
+func drive(t *testing.T, e *engine, end time.Duration) []operation {
 	t.Helper()
 	var ops []operation
-	for e.scheduler.elapsed() < end {
+	for {
+		now := e.scheduler.elapsed()
+		if e.nextExpiry() <= now {
+			e.expire()
+			continue
+		}
+		e.workload.release(e.scheduler.clock.Now())
 		event := e.nextWork()
-		if event.due >= end {
+		next := min(event.due, e.nextExpiry(), e.nextRelease())
+		if next >= end {
 			e.scheduler.advance(end)
-			break
+			return ops
 		}
-		if event.due > e.scheduler.elapsed() {
-			e.scheduler.advance(event.due)
+		if next > now {
+			e.scheduler.advance(next)
 			continue
 		}
-		if event.kind == "wake" {
-			continue
-		}
-		op, err := e.execute(event)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ops = append(ops, op)
-	}
-	return ops
-}
-func TestFreshFillsCappedCapacity(t *testing.T) {
-	e := cappedEngine(t, 5)
-	ops := driveUntil(t, e, 2*time.Second)
-	if e.total.Retries != 5 || e.total.Fresh != 15 || len(ops) != 20 {
-		t.Fatal("expected 5 retry + 15 fresh", e.total.Retries, e.total.Fresh)
-	}
-	for i, op := range ops {
-		if op.Fresh != (i >= 5) {
-			t.Fatal("retry priority", i, op)
-		}
-	}
-}
-func TestRetryOverloadQueues(t *testing.T) {
-	e := cappedEngine(t, 27)
-	ops := driveUntil(t, e, 2*time.Second)
-	if len(ops) != 20 || e.total.Retries != 20 || e.total.Fresh != 0 || len(e.queued) != 7 || e.total.MaxRetryQueue != 27 || e.total.RetriesQueued != 27 {
-		t.Fatal("retry cap/queue", len(ops), len(e.queued))
-	}
-	for i := 1; i < len(ops); i++ {
-		if ops[i].Started-ops[i-1].Started < int64(50*time.Millisecond) {
-			t.Fatal("burst")
-		}
-	}
-}
-func TestFixedRegistrationArrivals(t *testing.T) {
-	for _, delay := range []time.Duration{time.Millisecond, 80 * time.Millisecond} {
-		e := cappedEngine(t, 0)
-		e.cfg.Mode = "realtime" // injected logical clock models serial worker time deterministically
-		var previousLag int64
-		for i := 0; i < 8; i++ {
-			event := e.nextWork()
-			e.scheduler.advance(event.due)
-			event = e.nextWork()
+		if event.due <= now {
 			op, err := e.execute(event)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if op.Scheduled != int64(i)*int64(50*time.Millisecond) {
-				t.Fatal("completion shifted schedule", op)
-			}
-			if op.Queue == nil || *op.Queue != op.Started-op.Scheduled {
-				t.Fatal("original arrival lost", op)
-			}
-			if delay > 50*time.Millisecond && i > 0 && *op.Queue <= previousLag {
-				t.Fatal("overload lag did not grow")
-			}
-			previousLag = *op.Queue
-			// Stand-in for additional serial operation execution, without a real sleep.
-			e.scheduler.simulated.Run(delay)
+			ops = append(ops, op)
 		}
 	}
 }
-func TestScarcityConsumesScheduledOpportunity(t *testing.T) {
-	e := cappedEngine(t, 0)
-	e.workload.ready = e.workload.ready[:8]
-	driveUntil(t, e, 400*time.Millisecond)
-	op, err := e.execute(e.nextWork())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if op.Type != "population_scarcity" || e.total.PopulationScarcity != 1 || e.total.Registrations != 8 || e.pacer.next != 450*time.Millisecond {
-		t.Fatal("scarcity changed schedule or called Register", op)
-	}
-}
-func TestQueryArrivalIndependentOfCompletion(t *testing.T) {
-	e := cappedEngine(t, 0)
-	e.cfg.RegRate = 0
-	e.pacer = newPacer(0)
-	e.cfg.QueryRate = 20
-	e.cfg.Mode = "realtime"
-	for i := 0; i < 5; i++ {
-		event := e.nextWork()
-		op, err := e.execute(event)
-		if err != nil {
+
+func readRecords(t *testing.T, out *bytes.Buffer) []map[string]any {
+	t.Helper()
+	var recs []map[string]any
+	d := json.NewDecoder(out)
+	for d.More() {
+		var r map[string]any
+		if err := d.Decode(&r); err != nil {
 			t.Fatal(err)
 		}
-		if op.Kind != "query" || op.Scheduled != int64(i)*int64(50*time.Millisecond) || *op.Queue != int64(i)*int64(30*time.Millisecond) {
-			t.Fatal(op)
-		}
-		e.scheduler.simulated.Run(80 * time.Millisecond)
+		recs = append(recs, r)
 	}
+	return recs
 }
-func TestQueuedRetryExpiryWithoutRestart(t *testing.T) {
-	e := cappedEngine(t, 7)
-	e.cfg.RegRate = 1
-	e.pacer = newPacer(1)
-	e.pacer.consume()
-	w := e.workload
-	w.ready = w.ready[:w.head]
-	ops := driveUntil(t, e, 6*time.Second)
-	for i := 0; i < 2; i++ {
-		op, err := e.execute(e.nextWork())
-		if err != nil {
-			t.Fatal(err)
-		}
-		ops = append(ops, op)
-	}
-	if len(ops) != 7 || e.total.Retries != 5 || e.total.ExpiredRetries != 2 || e.table.Occupancy() != 5 || len(w.ready)-w.head != 2 || len(e.queued) != 0 {
-		t.Fatal("expiry sent/restarted retry", e.total.Retries, e.total.ExpiredRetries)
-	}
-	// Expiry leaves the ordinary arrival at 6s untouched. Only dispatching that
-	// opportunity can issue a fresh call, with all previous waiting credit reset.
-	index := e.pacer.index
-	for i := 0; i < 3; i++ {
-		if e.nextWork().kind != "fresh" {
-			t.Fatal("expired entry survived in retry queue")
+
+func summaryOf(t *testing.T, recs []map[string]any) map[string]any {
+	t.Helper()
+	for _, r := range recs {
+		if r["type"] == "summary" {
+			return r
 		}
 	}
-	if len(w.ready)-w.head != 2 || e.total.Registrations != 5 || e.pacer.index != index {
-		t.Fatal("expiry duplicated eligibility or issued a call")
-	}
-	op, err := e.execute(e.nextWork())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !op.Fresh || op.Credited != 0 || op.Scheduled != int64(6*time.Second) || e.total.Registrations != 6 || len(w.ready)-w.head != 1 {
-		t.Fatal("recycled advertiser did not use ordinary fresh opportunity", op)
-	}
-	for _, op := range ops {
-		if op.Type == "retry_expired" && op.Started != int64(6*time.Second) {
-			t.Fatal("late expiration", op)
-		}
-	}
+	t.Fatal("missing summary")
+	return nil
 }
+
 func TestProductionRetryValidity(t *testing.T) {
 	for _, offset := range []time.Duration{0, 5*time.Second - time.Nanosecond, 5 * time.Second} {
 		clock := new(mclock.Simulated)
@@ -226,249 +106,277 @@ func TestProductionRetryValidity(t *testing.T) {
 	}
 }
 
-func TestExpiredRealtimeRetryRecycled(t *testing.T) {
-	e := testEngine(t)
-	e.cfg.Mode = "realtime" // deterministic overloaded realtime dispatch using injected clock
-	w := e.workload
-	id, _ := w.next()
-	if err := w.finish(id, 0, 0, time.Second, e.cfg.Lifetime); err != nil {
-		t.Fatal(err)
-	}
-	e.scheduler.advance(6 * time.Second)
-	op, err := e.execute(e.nextWork())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if op.Type != "retry_expired" || e.total.ExpiredRetries != 1 || e.total.Registrations != 0 || e.table.Occupancy() != 0 || w.ads[id].waiting || w.ads[id].first != 0 {
-		t.Fatal("expired credit retained", op)
-	}
-	occurrences := 0
-	for _, readyID := range w.ready[w.head:] {
-		if readyID == id {
-			occurrences++
-		}
-	}
-	if occurrences != 1 || len(e.queued) != 0 || e.pacer.index != 0 {
-		t.Fatal("realtime expiry did not recycle exactly once")
-	}
-	if op.RetryDue != int64(time.Second) || op.Started-op.RetryDue != int64(5*time.Second) {
-		t.Fatal("queue delay", op.Queue)
-	}
-}
-
-func TestSharedLifecycle(t *testing.T) {
-	for _, mode := range []string{"simulated", "realtime"} {
-		e := testEngine(t)
-		e.cfg.Mode = mode
-		event := e.nextWork()
-		op, err := e.execute(event)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if op.Outcome != "admitted" || len(e.workload.active) != 1 {
-			t.Fatal(op)
-		}
-		id := event.id
-		e.scheduler.advance(e.cfg.Lifetime)
-		e.expire()
-		e.workload.release(e.scheduler.clock.Now())
-		if e.table.Occupancy() != 0 || e.workload.ads[id].waiting {
-			t.Fatal("expiry lifecycle", mode)
-		}
-		// Isolate the newly released advertiser to verify a fresh admission, not renewal.
-		e.workload.ready = []int{id}
-		e.workload.head = 0
-		op, err = e.execute(e.nextWork())
-		if err != nil || !op.Fresh || op.Outcome != "admitted" {
-			t.Fatal(op, err)
-		}
-	}
-}
-
-func TestSimulatedMinutesAndWarmup(t *testing.T) {
-	c := testConfig()
-	c.Mode = "simulated"
-	c.Duration = 3 * time.Minute
-	c.SampleInterval = 30 * time.Second
-	c.Lifetime = time.Minute
-	c.RegRate = 5
-	c.QueryRate = 7
-	var out bytes.Buffer
-	start := time.Now()
-	if err := run(c, &out); err != nil {
-		t.Fatal(err)
-	}
-	if time.Since(start) > 10*time.Second {
-		t.Fatal("simulation waited for wall time")
-	}
-	decoder := json.NewDecoder(&out)
-	var summary map[string]any
-	hadWarmState := false
-	retries := 0
-	for decoder.More() {
-		var r map[string]any
-		if err := decoder.Decode(&r); err != nil {
-			t.Fatal(err)
-		}
-		switch r["type"] {
-		case "sample":
-			if r["measurement"] == false && r["utilisation"].(float64) > 0 {
-				hadWarmState = true
-			}
-		case "operation":
-			if _, ok := r["queue_delay_ns"]; ok {
-				t.Fatal("simulated queue delay")
-			}
-			if r["started_ns"].(float64) < float64(c.warmup()) {
-				t.Fatal("warmup counted")
-			}
-			if r["operation"] == "registration" && r["fresh"] == false {
-				retries++
-				if delay := r["started_ns"].(float64) - r["retry_due_ns"].(float64); delay < 0 || delay >= float64(retryValidityWindow) {
-					t.Fatal("retry outside validity window")
-				}
-			}
-		case "summary":
-			summary = r
-		}
-	}
-	counts := summary["counts"].(map[string]any)
-	total := summary["total_counts"].(map[string]any)
-	if total["registrations_processed"].(float64)+total["population_scarcity_events"].(float64) != 900 || summary["pregenerated_advertisers"] != float64(c.Advertisers) || summary["population_auto_sized"] != false || summary["population_limited"] != true {
-		t.Fatal("target demand/population not sustained", summary)
-	}
-	if summary["logical_elapsed_ns"] != float64(c.Duration) || counts["queries_processed"] != float64(90*7) || !hadWarmState || retries == 0 {
-		t.Fatal("logical time/warmup/query/retry mismatch", summary)
-	}
-	if _, ok := summary["cpu_percent_one_core"]; ok {
-		t.Fatal("simulated CPU utilisation")
-	}
-	if counts["registrations_processed"] != counts["fresh_attempts"].(float64)+counts["retry_attempts"].(float64) {
-		t.Fatal("composition")
-	}
-}
-
-func runSummary(t *testing.T, c config) map[string]any {
+// productionClient drives topicindex.Registration, the production advertiser
+// state machine, through one attempt and reports whether it was dropped.
+func productionClient(t *testing.T, quotes []time.Duration, timeout time.Duration) bool {
 	t.Helper()
+	clock := new(mclock.Simulated)
+	var topic topicindex.TopicID
+	cfg := topicindex.Config{Clock: clock, AdLifetime: time.Minute, RegAttemptTimeout: timeout, RegBucketSize: 1}
+	r := topicindex.NewRegistration(topic, cfg)
+	var rec enr.Record
+	rec.Set(topicindex.TopicDiscoveryVersion)
+	rec.Set(enr.IPv4{1, 2, 3, 4})
+	var id enode.ID
+	id[0] = 0xff
+	r.AddNodes(nil, []*enode.Node{enode.SignNull(&rec, id)})
+	for _, q := range quotes {
+		att := r.Update()
+		if att == nil {
+			return true
+		}
+		r.StartRequest(att)
+		r.HandleTicketResponse(att, []byte{1}, q)
+		clock.Run(q)
+	}
+	return r.Update() == nil
+}
+
+func TestAbandonmentMatchesProductionClient(t *testing.T) {
+	const timeout = 90 * time.Second
+	cases := [][]time.Duration{
+		{timeout},
+		{timeout + time.Millisecond},
+		{60 * time.Second, 30 * time.Second},
+		{60 * time.Second, 30*time.Second + time.Millisecond},
+		{10 * time.Second, 10 * time.Second, 10 * time.Second},
+	}
+	// The 1.5E limit applies to each single quote and to the sum of quotes;
+	// both comparisons are strict.
+	expected := []bool{false, true, false, true, false}
+	for i, quotes := range cases {
+		want := productionClient(t, quotes, timeout)
+		if want != expected[i] {
+			t.Fatalf("quotes %v: production client dropped=%v, test expects %v", quotes, want, expected[i])
+		}
+		w := &workload{ads: make([]advertiser, 1)}
+		dropped := false
+		for i, q := range quotes {
+			reason, err := w.quoted(0, mclock.AbsTime(i), q, abandonProduction, timeout, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reason != "" {
+				dropped = true
+				break
+			}
+		}
+		if dropped != want {
+			t.Fatalf("quotes %v: harness dropped=%v, production client dropped=%v", quotes, dropped, want)
+		}
+	}
+}
+
+func TestAbandonPolicies(t *testing.T) {
+	const e = time.Minute
+	for _, tc := range []struct {
+		policy string
+		quotes []time.Duration
+		want   string
+	}{
+		{abandonSpec, []time.Duration{e}, ""},
+		{abandonSpec, []time.Duration{e + time.Millisecond}, "single"},
+		{abandonSpec, []time.Duration{e, e, e}, ""},
+		{abandonNone, []time.Duration{100 * e}, ""},
+		{abandonProduction, []time.Duration{e, e/2 + time.Millisecond}, "cumulative"},
+		{abandonProduction, []time.Duration{2 * e}, "single"},
+	} {
+		w := &workload{ads: make([]advertiser, 1)}
+		got := ""
+		for _, q := range tc.quotes {
+			reason, _ := w.quoted(0, 0, q, tc.policy, e+e/2, e)
+			if reason != "" {
+				got = reason
+				break
+			}
+		}
+		if got != tc.want {
+			t.Errorf("%s %v: got %q, want %q", tc.policy, tc.quotes, got, tc.want)
+		}
+	}
+}
+
+func TestClientWaitRoundsUpToMilliseconds(t *testing.T) {
+	w := &workload{ads: make([]advertiser, 1)}
+	if _, err := w.quoted(0, 0, 1500*time.Microsecond+1, abandonNone, time.Hour, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.retries[0].at; got != mclock.AbsTime(2*time.Millisecond) {
+		t.Fatalf("retry at %v, want 2ms", got)
+	}
+	if w.ads[0].quoteSum != 2*time.Millisecond {
+		t.Fatalf("quote sum %v", w.ads[0].quoteSum)
+	}
+}
+
+// An abandoned advertiser is not retried; it can only come back through a
+// fresh arrival.
+func TestAbandonedReturnsOnlyViaFreshArrival(t *testing.T) {
+	c := simConfig()
+	c.Advertisers, c.Topics, c.CacheSize = 50, 1, 1000
+	c.Lifetime = time.Hour
+	c.FreshRate, c.QueryRate = 10, 0
+	c.AttemptTimeout = time.Millisecond // every wait is abandoned
+	e := testEngine(t, c)
+	ops := drive(t, e, 2*time.Second)
+	abandoned := 0
+	for _, op := range ops {
+		if op.Kind == "registration" && !op.Fresh {
+			t.Fatal("retry issued after abandonment")
+		}
+		if op.Outcome == "abandoned_single" {
+			abandoned++
+		}
+	}
+	if abandoned == 0 || len(e.workload.retries) != 0 {
+		t.Fatalf("abandoned=%d pending retries=%d", abandoned, len(e.workload.retries))
+	}
+	if e.total.Abandoned != uint64(abandoned) || e.workload.readyCount() != c.Advertisers-int(e.total.Admissions)-0 {
+		t.Fatalf("counters %+v ready %d", e.total, e.workload.readyCount())
+	}
+}
+
+// Retries arrive at their own due time even when no fresh arrivals occur.
+func TestRetriesIndependentOfFreshArrivals(t *testing.T) {
+	c := simConfig()
+	c.Advertisers, c.Topics, c.CacheSize = 50, 1, 1000
+	c.Lifetime = time.Hour
+	c.FreshRate, c.QueryRate = 0, 0
+	c.Abandon = abandonNone
+	e := testEngine(t, c)
+	w := e.workload
+	for i := 0; i < 5; i++ {
+		id, _ := w.next()
+		if _, err := w.quoted(id, e.scheduler.clock.Now(), time.Duration(i+1)*time.Second, abandonNone, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ops := drive(t, e, 10*time.Second)
+	if len(ops) < 5 {
+		t.Fatalf("%d operations, want >= 5 retries", len(ops))
+	}
+	for i, op := range ops[:5] {
+		if op.Fresh || op.Started != op.Scheduled || op.Scheduled != int64(time.Duration(i+1)*time.Second) {
+			t.Fatalf("retry %d: %+v", i, op)
+		}
+	}
+}
+
+func TestArrivalProcesses(t *testing.T) {
+	d := newArrivals(2, false, 1)
+	for i := 0; i < 4; i++ {
+		if d.next != time.Duration(i)*500*time.Millisecond {
+			t.Fatalf("deterministic arrival %d at %v", i, d.next)
+		}
+		d.consume()
+	}
+	if d.pendingBefore(3*time.Second) != 2 {
+		t.Fatal("deterministic backlog", d.pendingBefore(3*time.Second))
+	}
+	p, q := newArrivals(100, true, 7), newArrivals(100, true, 7)
+	var gaps []time.Duration
+	last := time.Duration(0)
+	for i := 0; i < 100000; i++ {
+		if p.next != q.next || p.next < last {
+			t.Fatal("poisson arrivals not deterministic or not monotone")
+		}
+		gaps = append(gaps, p.next-last)
+		last = p.next
+		p.consume()
+		q.consume()
+	}
+	rate := float64(len(gaps)) / last.Seconds()
+	var sq float64
+	mean := last.Seconds() / float64(len(gaps))
+	for _, g := range gaps {
+		sq += (g.Seconds() - mean) * (g.Seconds() - mean)
+	}
+	cv := math.Sqrt(sq/float64(len(gaps))) / mean
+	if math.Abs(rate-100) > 2 || math.Abs(cv-1) > .02 {
+		t.Fatalf("poisson rate %.2f cv %.3f", rate, cv)
+	}
+	if z := newArrivals(0, true, 1); z.next != time.Duration(math.MaxInt64) {
+		t.Fatal("zero rate")
+	}
+}
+
+// Scarcity loses the arrival; it is never banked and the run is load-invalid.
+func TestScarcityIsNotBanked(t *testing.T) {
+	c := simConfig()
+	c.Advertisers, c.Topics = 2, 2
+	c.Lifetime = time.Hour
+	c.FreshRate, c.QueryRate = 100, 0
+	c.Duration, c.WarmupFraction = 2*time.Second, .5
+	c.SampleInterval = time.Second
 	var out bytes.Buffer
 	if err := run(c, &out); err != nil {
 		t.Fatal(err)
 	}
-	decoder := json.NewDecoder(&out)
-	var summary map[string]any
-	for decoder.More() {
-		var r map[string]any
-		if err := decoder.Decode(&r); err != nil {
-			t.Fatal(err)
-		}
-		if r["type"] == "metadata" {
-			if r["actual_advertisers"] != float64(c.Advertisers) || r["population_auto_sized"] != false {
-				t.Fatal("population expanded", r)
-			}
-		}
-		if r["type"] == "summary" {
-			summary = r
-		}
+	s := summaryOf(t, readRecords(t, &out))
+	counts := s["counts"].(map[string]any)
+	if s["load_valid"] != false || counts["population_scarcity_events"].(float64) == 0 {
+		t.Fatal("scarcity not flagged", s["load_valid"], counts)
 	}
-	if summary == nil {
-		t.Fatal("missing summary")
-	}
-	return summary
-}
-func TestFixedPopulationAndScarcitySummary(t *testing.T) {
-	c := testConfig()
-	c.Mode = "simulated"
-	c.Advertisers = 100
-	c.Duration = 3 * time.Second
-	c.RegRate = 100
-	c.Lifetime = time.Hour
-	s := runSummary(t, c)
-	if s["requested_advertisers"] != float64(100) || s["actual_advertisers"] != float64(100) {
-		t.Fatal("fixed population")
-	}
-	c.Advertisers = 1
-	c.Topics = 1
-	c.Duration = 2 * time.Second
-	c.RegRate = 20
-	s = runSummary(t, c)
-	if s["population_limited_any"] != true || s["population_limited_measurement"] != true || s["population_limited"] != true || s["population_scarcity_events"] != float64(39) || s["population_scarcity_fraction"] != 39.0/40 {
-		t.Fatal("scarcity accounting", s)
-	}
-	if s["total_counts"].(map[string]any)["registrations_processed"] != float64(1) {
-		t.Fatal("active advertiser reused")
-	}
-	c.Advertisers = 100
-	s = runSummary(t, c)
-	if s["population_limited_any"] != false || s["population_limited_measurement"] != false || s["population_limited"] != false || s["population_scarcity_events"] != float64(0) || s["total_counts"].(map[string]any)["registrations_processed"] != float64(40) {
-		t.Fatal("adequate population not serving load", s)
+	if counts["fresh_attempts"].(float64)+counts["population_scarcity_events"].(float64) != counts["fresh_arrivals"].(float64) {
+		t.Fatal("arrival accounting", counts)
 	}
 }
-func TestLongSimulationReusesFixedIdentity(t *testing.T) {
-	c := testConfig()
-	c.Mode = "simulated"
-	c.Advertisers = 1
-	c.Topics = 1
-	c.RegRate = 2
-	c.QueryRate = 0
-	c.Duration = 3 * time.Minute
-	c.Lifetime = time.Second
-	c.SampleInterval = 30 * time.Second
-	start := time.Now()
-	s := runSummary(t, c)
-	total := s["total_counts"].(map[string]any)
-	if time.Since(start) > 10*time.Second || total["new_admissions"] != float64(180) || total["population_scarcity_events"] != float64(180) || total["duplicate_results"] != float64(0) {
-		t.Fatal("fixed identity not reused correctly", total)
-	}
-}
-func TestWaitingAdvertiserNotSelectedFresh(t *testing.T) {
-	e := testEngine(t)
-	w := e.workload
-	id, _ := w.next()
-	w.ready = w.ready[:w.head]
-	if err := w.finish(id, 0, 0, time.Second, e.cfg.Lifetime); err != nil {
-		t.Fatal(err)
-	}
-	op, err := e.execute(e.nextWork())
+
+func TestIndependentENRCopies(t *testing.T) {
+	c := simConfig()
+	c.IndependentENR = true
+	e := testEngine(t, c)
+	a := &e.workload.ads[0]
+	n, err := e.requestNode(a)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if op.Type != "population_scarcity" || e.total.Registrations != 0 || len(w.retries) != 1 {
-		t.Fatal("waiting identity selected fresh", op)
+	if n == a.node || n.ID() != a.node.ID() || n.Seq() != a.node.Seq() || n.IPAddr() != a.node.IPAddr() {
+		t.Fatal("decoded node is not an independent equal copy")
+	}
+	e.cfg.IndependentENR = false
+	if n, _ := e.requestNode(a); n != a.node {
+		t.Fatal("shared mode must pass the population node")
 	}
 }
-func TestWaitingHeapIndependentOfFreshQueue(t *testing.T) {
-	e := testEngine(t)
-	w := e.workload
-	id, _ := w.next()
-	if err := w.finish(id, 0, 0, time.Second, time.Minute); err != nil {
-		t.Fatal(err)
+
+func TestQueryCallbackMatchesProduction(t *testing.T) {
+	accept := relayCheck(queryRequester)
+	mk := func(ip net.IP) *enode.Node {
+		var r enr.Record
+		r.Set(enr.IP(ip))
+		return enode.SignNull(&r, enode.ID{1})
 	}
-	item := heap.Pop(&w.retries).(wake)
-	if item.id != id || item.at != mclock.AbsTime(time.Second) {
-		t.Fatal(item)
+	if !accept(mk(net.IP{8, 8, 8, 8})) || accept(mk(net.IP{192, 168, 1, 1})) || accept(mk(net.IP{127, 0, 0, 1})) {
+		t.Fatal("relay check")
+	}
+}
+
+func TestOccupancyIntegral(t *testing.T) {
+	o := occupancyIntegral{start: 10 * time.Second, mid: 20 * time.Second, end: 30 * time.Second}
+	o.add(5*time.Second, 100) // warm-up, ignored
+	o.add(15*time.Second, 2)  // [10,15) at 2
+	o.add(25*time.Second, 4)  // [15,20) and [20,25) at 4
+	o.add(40*time.Second, 6)  // [25,30) at 6, rest clipped
+	if o.halves != [2]float64{2*5 + 4*5, 4*5 + 6*5} {
+		t.Fatal(o.halves)
 	}
 }
 
 func TestSimulatedDeterminism(t *testing.T) {
-	c := testConfig()
-	c.Mode = "simulated"
+	c := simConfig()
 	c.Duration = 30 * time.Second
 	c.Lifetime = 5 * time.Second
 	c.SampleInterval = 10 * time.Second
-	c.RegRate = 10
+	c.FreshRate = 10
 	c.QueryRate = 5
 	semantic := func() string {
 		var out bytes.Buffer
 		if err := run(c, &out); err != nil {
 			t.Fatal(err)
 		}
-		decoder := json.NewDecoder(&out)
 		var selected []map[string]any
-		for decoder.More() {
-			var r map[string]any
-			if err := decoder.Decode(&r); err != nil {
-				t.Fatal(err)
-			}
+		for _, r := range readRecords(t, &out) {
 			if r["type"] == "operation" {
 				delete(r, "latency_ns")
 				delete(r, "wall_elapsed_ns")
@@ -486,190 +394,173 @@ func TestSimulatedDeterminism(t *testing.T) {
 	}
 }
 
-func TestSupplyCountersRespectMeasurementBoundary(t *testing.T) {
-	e := testEngine(t)
-	e.workload.head = len(e.workload.ready)
-	e.checkSupply(time.Second)
-	if e.measured.FreshSupplyLimitedNS != 0 {
-		t.Fatal("warmup scarcity counted")
-	}
-	e.measuring = true
-	e.checkSupply(2 * time.Second)
-	if e.total.FreshSupplyLimitedNS != int64(2*time.Second) || e.measured.FreshSupplyLimitedNS != int64(time.Second) {
-		t.Fatal("scarcity boundary")
-	}
-}
-
-func TestRealtimeScheduledStarts(t *testing.T) {
-	c := testConfig()
-	c.Mode = "realtime"
-	c.RegRate = 20
-	c.Duration = 600 * time.Millisecond
-	c.WarmupFraction = 0
-	c.Lifetime = time.Second
+// In simulated mode every ad lives exactly E, so time-averaged occupancy must
+// equal admission rate * E up to boundary effects.
+func TestLittlesLawSimulated(t *testing.T) {
+	c := simConfig()
+	c.Advertisers, c.Topics, c.CacheSize = 2000, 50, 1000
+	c.Lifetime = time.Minute
+	c.FreshRate, c.QueryRate = 5, 1
+	c.Duration, c.Warmup = 40*time.Minute, ptr(10*time.Minute)
+	c.SampleInterval = time.Minute
+	c.RawOps = false
 	var out bytes.Buffer
 	if err := run(c, &out); err != nil {
 		t.Fatal(err)
 	}
-	decoder := json.NewDecoder(&out)
-	count := 0
-	for decoder.More() {
-		var r map[string]any
-		if err := decoder.Decode(&r); err != nil {
-			t.Fatal(err)
-		}
-		if r["type"] == "operation" && r["operation"] == "registration" {
-			scheduled := int64(r["scheduled_ns"].(float64))
-			if scheduled != int64(count)*int64(50*time.Millisecond) {
-				t.Fatal("shifted realtime arrivals")
-			}
-			if r["queue_delay_ns"].(float64) != r["started_ns"].(float64)-r["scheduled_ns"].(float64) {
-				t.Fatal("queue lag")
-			}
-
-			count++
-		}
+	s := summaryOf(t, readRecords(t, &out))
+	if r := s["littles_law_ratio"].(float64); math.Abs(r-1) > .01 {
+		t.Fatalf("Little's law ratio %v", r)
 	}
-	if count == 0 || count > 12 {
-		t.Fatal("realtime cap", count)
+	if len(s["halves"].([]any)) != 2 {
+		t.Fatal("halves")
 	}
 }
 
-func TestZeroRateStillExpiresRetries(t *testing.T) {
-	e := cappedEngine(t, 2)
-	e.cfg.RegRate = 0
-	e.pacer = newPacer(0)
-	ops := driveUntil(t, e, 7*time.Second)
-	if len(ops) != 2 || e.total.Registrations != 0 || e.total.ExpiredRetries != 2 {
-		t.Fatal("zero-rate expiry")
-	}
-}
+func ptr[T any](v T) *T { return &v }
 
-func TestExplicitIPFileRejectsEmptyOrInvalidBeforeTiming(t *testing.T) {
-	for _, input := range []string{"", "# no addresses\n\n", "invalid\n", "2001:db8::1\n", "8.8.8.8\ninvalid\n"} {
-		c := testConfig()
-		c.IPFile = filepath.Join(t.TempDir(), "ips.txt")
-		if err := os.WriteFile(c.IPFile, []byte(input), 0600); err != nil {
-			t.Fatal(err)
-		}
-		var out bytes.Buffer
-		if err := run(c, &out); err == nil || out.Len() != 0 {
-			t.Fatal("invalid empirical input did not fail before timing", input, err)
-		}
+// The hybrid clock must keep TopicTable expiry and lower bounds identical to a
+// purely simulated run across the switch to real time.
+func TestHybridTableEquivalence(t *testing.T) {
+	sim := new(mclock.Simulated)
+	wall := new(mclock.Simulated) // stands in for the system clock
+	wall.Run(12345 * time.Hour)
+	hyb := newHybridClock(wall)
+	cfg := func(c mclock.Clock) topicindex.Config {
+		return topicindex.Config{AdCacheSize: 50, AdLifetime: time.Minute, Clock: c}
 	}
-}
-
-func TestWarmupScarcityMarksWholeRun(t *testing.T) {
-	c := testConfig()
-	c.Mode = "simulated"
-	c.Advertisers = 1
-	c.Topics = 1
-	c.RegRate = 1
-	c.QueryRate = 0
-	c.Duration = 2500 * time.Millisecond
-	c.Lifetime = 1500 * time.Millisecond
-	warmup := 1750 * time.Millisecond
-	c.Warmup = &warmup
-	s := runSummary(t, c)
-	if s["population_limited_any"] != true || s["population_limited_measurement"] != false || s["population_limited"] != true || s["population_scarcity_events"] != float64(1) || s["measured_population_limited"] != false || s["measured_population_scarcity_events"] != float64(0) {
-		t.Fatal("warmup scarcity silently excluded", s)
-	}
-}
-
-// Every identity must belong to exactly one lifecycle container after each event.
-// This detects both duplicate fresh entries and population loss on retry expiry.
-func assertPopulationConserved(t *testing.T, e *engine) {
-	t.Helper()
-	w := e.workload
-	seen := make([]int, len(w.ads))
-	for _, id := range w.ready[w.head:] {
-		seen[id]++
-		if w.ads[id].waiting {
-			t.Fatal("waiting identity in fresh queue", id)
-		}
-	}
-	for _, item := range w.active {
-		seen[item.id]++
-		if w.ads[item.id].waiting {
-			t.Fatal("active identity waiting", item.id)
-		}
-	}
-	for _, queue := range []wakes{w.retries, e.queued} {
-		for _, item := range queue {
-			seen[item.id]++
-			if !w.ads[item.id].waiting {
-				t.Fatal("retry identity not waiting", item.id)
-			}
-		}
-	}
-	for id, n := range seen {
-		if n != 1 {
-			t.Fatalf("advertiser %d belongs to %d lifecycle containers", id, n)
-		}
-	}
-}
-
-func TestRepeatedExpiredRetryRecycling(t *testing.T) {
-	c := testConfig()
-	c.Mode = "simulated"
-	c.Advertisers = 2
-	c.Topics = 1
-	c.RegRate = .1
-	c.QueryRate = 0
-	c.CacheSize = 50
-	c.Lifetime = 30 * time.Second
-	c.Duration = 3 * time.Minute
+	a, b := topicindex.NewTopicTable(cfg(sim)), topicindex.NewTopicTable(cfg(hyb))
+	c := simConfig()
+	c.Advertisers, c.Topics = 60, 3
 	w, _, err := population(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := newEngine(c, w)
-	e.scheduler.start()
-	expired := make(map[int]int)
-	recycled := make(map[int]int)
-	for e.scheduler.elapsed() < c.Duration {
-		now := e.scheduler.elapsed()
-		if e.nextExpiry() <= now {
-			e.expire()
+	step := func(d time.Duration) {
+		sim.Run(d)
+		if hyb.switched {
+			wall.Run(d)
+		} else {
+			hyb.Sleep(d)
 		}
-		w.release(e.scheduler.clock.Now())
-		event := e.nextWork()
-		assertPopulationConserved(t, e)
-		next := min(event.due, e.nextExpiry(), e.nextRelease(), c.Duration)
-		if next > now {
-			e.scheduler.advance(next)
-			continue
+	}
+	check := func(i int) {
+		t.Helper()
+		if sim.Now() != hyb.Now() {
+			t.Fatalf("step %d: clocks diverged %v vs %v", i, sim.Now(), hyb.Now())
 		}
-		if event.kind == "wake" {
-			continue
+		a.Expire()
+		b.Expire()
+		if !reflect.DeepEqual(a.Stats(), b.Stats()) || a.NextExpiryTime() != b.NextExpiryTime() {
+			t.Fatalf("step %d: state diverged\n%+v\n%+v", i, a.Stats(), b.Stats())
 		}
-		calls, arrivalIndex, occupancy := e.total.Registrations, e.pacer.index, e.table.Occupancy()
-		op, err := e.execute(event)
-		if err != nil {
-			t.Fatal(err)
+	}
+	credit := make([]time.Duration, len(w.ads))
+	for i := 0; i < 400; i++ {
+		if i == 150 {
+			hyb.switchToReal()
+			check(i)
 		}
-		if op.Type == "retry_expired" {
-			if e.total.Registrations != calls || e.pacer.index != arrivalIndex || e.table.Occupancy() != occupancy {
-				t.Fatal("expiry made a registrar call or consumed a normal opportunity")
+		ad := &w.ads[i%len(w.ads)]
+		topic := w.topics[ad.topic]
+		wa := a.Register(ad.node, topic, credit[i%len(w.ads)])
+		wb := b.Register(ad.node, topic, credit[i%len(w.ads)])
+		if wa != wb {
+			t.Fatalf("step %d: wait %v vs %v", i, wa, wb)
+		}
+		if wa > 0 {
+			credit[i%len(w.ads)] += wa
+		} else {
+			credit[i%len(w.ads)] = 0
+		}
+		step(time.Duration(1+i%7) * time.Second)
+		check(i)
+	}
+	if a.Stats().TopicBounds == 0 || a.Stats().EffectiveIPBounds == 0 {
+		t.Fatal("test did not exercise lower bounds", a.Stats())
+	}
+}
+
+func TestHybridClockContinuity(t *testing.T) {
+	wall := new(mclock.Simulated)
+	wall.Run(time.Hour)
+	h := newHybridClock(wall)
+	h.Sleep(10 * time.Minute)
+	before := h.Now()
+	wall.Run(time.Hour) // real time passing before the switch is invisible
+	if h.Now() != before {
+		t.Fatal("real time leaked into simulated phase")
+	}
+	h.switchToReal()
+	if h.Now() != before {
+		t.Fatal("discontinuity at switch")
+	}
+	wall.Run(3 * time.Second)
+	if h.Now() != before.Add(3*time.Second) {
+		t.Fatal("not following real time after switch")
+	}
+}
+
+func TestPerformanceValidity(t *testing.T) {
+	p := detectPlatform()
+	if p.GOARCH == "" || p.GoVersion == "" || p.TimerResolution <= 0 || p.Revision == "" {
+		t.Fatalf("platform %+v", p)
+	}
+	c := testConfig()
+	p.Translated, p.Revision = true, "x"
+	if ok, _ := performanceValid(c, p); ok {
+		t.Fatal("translated run marked valid")
+	}
+	c.AllowTranslated = true
+	if ok, _ := performanceValid(c, p); !ok {
+		t.Fatal("override ignored")
+	}
+	c.AllocationAudit = true
+	if ok, _ := performanceValid(c, p); ok {
+		t.Fatal("audit run marked valid")
+	}
+}
+
+func TestMemfill(t *testing.T) {
+	c := testConfig()
+	c.Mode = "memfill"
+	c.Lifetime = 0 // production E, so probe waits exceed the 1s admission floor
+	c.CacheSize = 2000
+	c.Topics = 20
+	c.MemfillLevels = "0,0.5,1"
+	c.MemfillReps = 1
+	var out bytes.Buffer
+	if err := run(c, &out); err != nil {
+		t.Fatal(err)
+	}
+	heapAt := map[string][]float64{}
+	bounds := 0
+	for _, r := range readRecords(t, &out) {
+		switch r["type"] {
+		case "memfill":
+			heapAt[r["variant"].(string)] = append(heapAt[r["variant"].(string)], r["heap_bytes"].(float64))
+		case "memfill_bounds":
+			if r["topic_bounds_added"].(float64) <= 0 {
+				t.Fatal("no bounds recorded", r)
 			}
-			expired[op.Advertiser]++
-		}
-		if op.Type == "operation" && op.Kind == "registration" && op.Fresh && expired[op.Advertiser] > 0 {
-			if op.Credited != 0 || op.Scheduled != int64(arrival(arrivalIndex, c.RegRate)) {
-				t.Fatal("recycling bypassed normal fresh schedule", op)
-			}
-			recycled[op.Advertiser]++
-		}
-		assertPopulationConserved(t, e)
-	}
-	repeated := 0
-	for id, n := range recycled {
-		if n >= 2 && expired[id] >= 2 {
-			repeated++
+			bounds++
 		}
 	}
-	if e.total.ExpiredRetries == 0 || repeated == 0 {
-		t.Fatalf("fixture must expire/recycle repeatedly: expired=%d recycled=%d repeated=%d", e.total.ExpiredRetries, len(recycled), repeated)
+	sh, in := heapAt["shared"], heapAt["independent"]
+	if len(sh) != 3 || len(in) != 3 || bounds != 2 {
+		t.Fatal("records", heapAt, bounds)
 	}
-	t.Logf("expired retries=%d, recycled identities=%d, repeatedly recycled=%d", e.total.ExpiredRetries, len(recycled), repeated)
+	if !(sh[2] > sh[0] && in[2]-in[0] > sh[2]-sh[0]) {
+		t.Fatalf("independent copies should cost more per ad: shared %v independent %v", sh, in)
+	}
+}
+
+func TestRetryHeapOrder(t *testing.T) {
+	var h wakes
+	heap.Push(&h, wake{at: 3, id: 1})
+	heap.Push(&h, wake{at: 1, id: 2})
+	heap.Push(&h, wake{at: 1, id: 0})
+	if heap.Pop(&h).(wake).id != 0 || heap.Pop(&h).(wake).id != 2 {
+		t.Fatal("heap order")
+	}
 }

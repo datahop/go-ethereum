@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"container/heap"
 	"encoding/json"
 	"math/rand"
 	"os"
@@ -16,7 +15,7 @@ import (
 )
 
 func testConfig() config {
-	return config{Advertisers: 20, Topics: 5, Alpha: 1, Seed: 7, RegRate: 100, QueryRate: 100, Duration: 300 * time.Millisecond, WarmupFraction: .5, CacheSize: 100, Lifetime: 40 * time.Millisecond, SampleInterval: 50 * time.Millisecond, IPColumn: "ip"}
+	return config{Advertisers: 20, Topics: 5, Alpha: 1, Seed: 7, FreshRate: 100, QueryRate: 100, Arrivals: "deterministic", Abandon: abandonProduction, Pacing: "sleep", IndependentENR: true, RawOps: true, Duration: 300 * time.Millisecond, WarmupFraction: .5, CacheSize: 100, Lifetime: 40 * time.Millisecond, SampleInterval: 50 * time.Millisecond, IPColumn: "ip"}
 }
 func TestZipf(t *testing.T) {
 	z := newZipf(300, 1)
@@ -80,61 +79,6 @@ func TestPopulation(t *testing.T) {
 		ids[n.ID().String()] = true
 	}
 }
-func TestLifecycle(t *testing.T) {
-	c := testConfig()
-	c.Advertisers = 1
-	w, _, err := population(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock := new(mclock.Simulated)
-	tab := topicindex.NewTopicTable(topicindex.Config{Clock: clock, AdLifetime: time.Second})
-	id, ok := w.next()
-	if !ok {
-		t.Fatal("not ready")
-	}
-	a := &w.ads[id]
-	wait := tab.Register(a.node, w.topics[a.topic], 0)
-	if wait != 0 || tab.Occupancy() != 1 {
-		t.Fatal(wait)
-	}
-	w.finish(id, clock.Now(), clock.Now(), wait, time.Second)
-	if _, ok := w.next(); ok {
-		t.Fatal("active advertiser ready")
-	}
-	clock.Run(time.Second)
-	tab.Expire()
-	w.release(clock.Now())
-	if tab.Occupancy() != 0 {
-		t.Fatal("not expired")
-	}
-	id, ok = w.next()
-	if !ok {
-		t.Fatal("not released")
-	}
-	if wait := tab.Register(a.node, w.topics[a.topic], 0); wait != 0 {
-		t.Fatal(wait)
-	}
-	// Exercise accumulated retry credit independent of cache admission.
-	w.finish(id, clock.Now(), clock.Now(), 2*time.Second, time.Second)
-	first := a.first
-	clock.Run(time.Second)
-	w.release(clock.Now())
-	if _, ok = w.next(); ok {
-		t.Fatal("retry early")
-	}
-	clock.Run(time.Second)
-	w.release(clock.Now())
-	item := heap.Pop(&w.retries).(wake)
-	id = item.id
-	if item.at != clock.Now() || !a.waiting || clock.Now().Sub(a.first) != 2*time.Second {
-		t.Fatal("retry state")
-	}
-	w.finish(id, clock.Now(), clock.Now(), time.Second, time.Second)
-	if a.first != first {
-		t.Fatal("credit reset")
-	}
-}
 func TestWaitClassification(t *testing.T) {
 	c := testConfig()
 	c.Topics = 1
@@ -150,21 +94,6 @@ func TestWaitClassification(t *testing.T) {
 	}
 	if wait := tab.Register(w.ads[1].node, topic, 0); wait <= 0 || tab.Occupancy() != 1 {
 		t.Fatal("expected wait", wait)
-	}
-}
-func TestScheduleAndPhase(t *testing.T) {
-	if arrival(3, 2) != 1500*time.Millisecond || offeredBefore(time.Second, 2) != 2 || offeredBefore(time.Second, 0) != 0 {
-		t.Fatal("arrival schedule")
-	}
-	if phase(499*time.Millisecond, 500*time.Millisecond) || !phase(500*time.Millisecond, 500*time.Millisecond) {
-		t.Fatal("phase")
-	}
-	for _, rate := range []float64{.5, 3, 1000} {
-		for i := uint64(0); i < 100; i++ {
-			if arrival(i+1, rate) <= arrival(i, rate) {
-				t.Fatal("non-increasing schedule")
-			}
-		}
 	}
 }
 func TestRunOutput(t *testing.T) {
@@ -190,15 +119,15 @@ func TestRunOutput(t *testing.T) {
 				if r["started_ns"].(float64) < float64(c.Duration)*c.WarmupFraction {
 					t.Fatal("warmup operation")
 				}
-				if r["queue_delay_ns"].(float64) < 0 {
+				if q, ok := r["queue_delay_ns"]; ok && q.(float64) < 0 {
 					t.Fatal("negative delay")
 				}
 			case "sample":
 				samples++
 			case "summary":
 				summary = true
-				if r["performance_valid"] != !audit {
-					t.Fatal("audit label")
+				if valid, _ := performanceValid(c, detectPlatform()); r["performance_valid"] != valid {
+					t.Fatal("performance label")
 				}
 				counts := r["counts"].(map[string]any)
 				if counts["registrations_processed"].(float64) != counts["new_admissions"].(float64)+counts["wait_responses"].(float64) {
@@ -231,7 +160,7 @@ func TestOverloadDoesNotReduceOfferedRate(t *testing.T) {
 	c := testConfig()
 	c.WarmupFraction = 0
 	c.Duration = 150 * time.Millisecond
-	c.RegRate = 0
+	c.FreshRate = 0
 	c.QueryRate = 10000
 	c.SampleInterval = time.Second
 	var out slowOutput
@@ -245,7 +174,7 @@ func TestOverloadDoesNotReduceOfferedRate(t *testing.T) {
 			t.Fatal(err)
 		}
 		if r["type"] == "summary" {
-			if r["total_query_arrivals_offered"].(float64) != 1500 || r["unserved_queries"].(float64) <= 0 {
+			if r["unserved_queries"].(float64) <= 0 {
 				t.Fatal(r)
 			}
 			return

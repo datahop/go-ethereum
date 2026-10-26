@@ -75,7 +75,7 @@ func memorySample(baseline uint64) memory {
 type histogram struct {
 	bins  [2048]uint64
 	Count uint64
-	Sum   uint64
+	Sum   float64 // float64: wait times in ns overflow uint64 sums
 }
 
 func (h *histogram) add(ns uint64) {
@@ -86,7 +86,7 @@ func (h *histogram) add(ns uint64) {
 	}
 	h.bins[index]++
 	h.Count++
-	h.Sum += ns
+	h.Sum += float64(ns)
 }
 func (h *histogram) quantile(q float64) uint64 {
 	if h.Count == 0 {
@@ -110,39 +110,53 @@ func (h *histogram) quantile(q float64) uint64 {
 func (h *histogram) summary() map[string]any {
 	mean := 0.0
 	if h.Count > 0 {
-		mean = float64(h.Sum) / float64(h.Count)
+		mean = h.Sum / float64(h.Count)
 	}
 	return map[string]any{"count": h.Count, "mean_ns": mean, "median_ns_upper": h.quantile(.5), "p95_ns_upper": h.quantile(.95), "p99_ns_upper": h.quantile(.99)}
 }
 
 type counters struct {
-	PopulationScarcity   uint64    `json:"population_scarcity_events"`
-	ScarcityIntervalNS   int64     `json:"population_scarcity_interval_ns"`
-	Retries              uint64    `json:"retry_attempts"`
-	RetryDemand          uint64    `json:"retry_demand"`
-	RetriesQueued        uint64    `json:"retries_queued"`
-	MaxRetryQueue        uint64    `json:"max_retry_queue_length"`
-	ExpiredRetries       uint64    `json:"expired_retries"`
-	Duplicates           uint64    `json:"duplicate_results"`
-	FreshSupplyLimitedNS int64     `json:"fresh_supply_limited_ns"`
-	Registrations        uint64    `json:"registrations_processed"`
-	Admissions           uint64    `json:"new_admissions"`
-	Waits                uint64    `json:"wait_responses"`
-	Fresh                uint64    `json:"fresh_attempts"`
-	Immediate            uint64    `json:"immediate_admissions"`
-	Eventual             uint64    `json:"admissions_after_wait"`
-	Queries              uint64    `json:"queries_processed"`
-	Returned             uint64    `json:"advertisements_returned"`
-	Expiries             uint64    `json:"expiry_calls"`
-	RegLatency           histogram `json:"-"`
-	QueryLatency         histogram `json:"-"`
-	ExpiryLatency        histogram `json:"-"`
-	RegBytes             uint64    `json:"registration_alloc_bytes"`
-	RegAllocs            uint64    `json:"registration_allocations"`
-	QueryBytes           uint64    `json:"query_alloc_bytes"`
-	QueryAllocs          uint64    `json:"query_allocations"`
-	ExpiryBytes          uint64    `json:"expiry_alloc_bytes"`
-	ExpiryAllocs         uint64    `json:"expiry_allocations"`
+	FreshArrivals       uint64    `json:"fresh_arrivals"`
+	PopulationScarcity  uint64    `json:"population_scarcity_events"`
+	Registrations       uint64    `json:"registrations_processed"`
+	Fresh               uint64    `json:"fresh_attempts"`
+	Retries             uint64    `json:"retry_attempts"`
+	Admissions          uint64    `json:"new_admissions"`
+	Immediate           uint64    `json:"immediate_admissions"`
+	Eventual            uint64    `json:"admissions_after_wait"`
+	Waits               uint64    `json:"wait_responses"`
+	Abandoned           uint64    `json:"abandoned_attempts"`
+	AbandonedSingle     uint64    `json:"abandoned_single_quote"`
+	AbandonedCumulative uint64    `json:"abandoned_cumulative_quotes"`
+	ExpiredRetries      uint64    `json:"expired_retries"`
+	Queries             uint64    `json:"queries_processed"`
+	Returned            uint64    `json:"advertisements_returned"`
+	Expiries            uint64    `json:"expiry_calls"`
+	Expired             uint64    `json:"expired_entries"`
+	RegLatency          histogram `json:"-"`
+	QueryLatency        histogram `json:"-"`
+	ExpiryLatency       histogram `json:"-"`
+	QueueDelay          histogram `json:"-"`
+	QuotedWait          histogram `json:"-"` // registrar wait quotes (ns)
+	AdmittedWait        histogram `json:"-"` // registrar-credited wait at admission, 0 if immediate
+	EventualWait        histogram `json:"-"` // as AdmittedWait, admissions after waiting only
+	AbandonedAfter      histogram `json:"-"` // credited wait when the attempt was abandoned
+	RegBytes            uint64    `json:"registration_alloc_bytes"`
+	RegAllocs           uint64    `json:"registration_allocations"`
+	QueryBytes          uint64    `json:"query_alloc_bytes"`
+	QueryAllocs         uint64    `json:"query_allocations"`
+	ExpiryBytes         uint64    `json:"expiry_alloc_bytes"`
+	ExpiryAllocs        uint64    `json:"expiry_allocations"`
+}
+
+// sub returns the difference of the scalar counters c - o.
+func (c counters) sub(o counters) counters {
+	return counters{FreshArrivals: c.FreshArrivals - o.FreshArrivals, PopulationScarcity: c.PopulationScarcity - o.PopulationScarcity,
+		Registrations: c.Registrations - o.Registrations, Fresh: c.Fresh - o.Fresh, Retries: c.Retries - o.Retries,
+		Admissions: c.Admissions - o.Admissions, Immediate: c.Immediate - o.Immediate, Eventual: c.Eventual - o.Eventual,
+		Waits: c.Waits - o.Waits, Abandoned: c.Abandoned - o.Abandoned, AbandonedSingle: c.AbandonedSingle - o.AbandonedSingle,
+		AbandonedCumulative: c.AbandonedCumulative - o.AbandonedCumulative, ExpiredRetries: c.ExpiredRetries - o.ExpiredRetries,
+		Queries: c.Queries - o.Queries, Returned: c.Returned - o.Returned, Expiries: c.Expiries - o.Expiries, Expired: c.Expired - o.Expired}
 }
 
 func ratio(a, b uint64) float64 {

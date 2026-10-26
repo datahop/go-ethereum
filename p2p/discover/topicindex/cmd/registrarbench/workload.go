@@ -22,6 +22,7 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 type dataset struct {
@@ -115,12 +116,17 @@ func newZipf(n int, alpha float64) zipf {
 }
 func (z zipf) sample(r *rand.Rand) int { u := r.Float64(); return sort.SearchFloat64s(z.cdf, u) }
 
+// advertiser is one fixed identity of the population. Its client-side attempt
+// state mirrors topicindex.Registration: 'first' is the registrar-local time of
+// the first ticket (the registrar credits now-first) and 'quoteSum' is the
+// client's RegAttempt.totalWaitTime, the sum of the waits it was quoted.
 type advertiser struct {
-	node    *enode.Node
-	topic   int
-	waiting bool
-	first   mclock.AbsTime
-	readyAt mclock.AbsTime
+	node     *enode.Node
+	enc      []byte // RLP-encoded record, decoded afresh per request when ENR copies are enabled
+	topic    int
+	waiting  bool
+	first    mclock.AbsTime
+	quoteSum time.Duration
 }
 type wake struct {
 	at mclock.AbsTime
@@ -139,6 +145,10 @@ func (h wakes) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *wakes) Push(v any)   { *h = append(*h, v.(wake)) }
 func (h *wakes) Pop() any     { old := *h; v := old[len(old)-1]; *h = old[:len(old)-1]; return v }
 
+// workload holds the fixed advertiser population. An advertiser is in exactly
+// one of three places: the ready FIFO (eligible for a fresh arrival), the
+// retry heap (waiting with a ticket) or the active heap (admitted, until its
+// ad has expired from the table).
 type workload struct {
 	ads        []advertiser
 	topics     []topicindex.TopicID
@@ -148,59 +158,101 @@ type workload struct {
 	active     wakes
 	retries    wakes
 	z          zipf
-	rng        *rand.Rand
+	rng        *rand.Rand // query topic selection
 }
 
-func population(c config) (*workload, dataset, error) {
-	var ips []netip.Addr
-	meta := dataset{Source: "synthetic", AssignmentMode: "synthetic_unique_ipv4"}
-	var err error
-	if c.IPFile != "" {
-		ips, meta, err = readIPs(c.IPFile, c.IPColumn)
+const (
+	ipDistEmpirical    = "empirical"
+	ipDistDiverse      = "diverse"
+	ipDistConcentrated = "concentrated"
+)
+
+func publicIPv4(r *rand.Rand) netip.Addr {
+	for {
+		v := r.Uint32()
+		ip := netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
+		if ip.IsGlobalUnicast() && !netutil.AddrIsLAN(ip) && !netutil.AddrIsSpecialNetwork(ip) {
+			return ip
+		}
+	}
+}
+
+// addresses returns one IPv4 per advertiser for the configured distribution.
+func addresses(c config) ([]netip.Addr, dataset, error) {
+	r := rand.New(rand.NewSource(c.Seed + 2))
+	out := make([]netip.Addr, c.Advertisers)
+	assigned := make(map[netip.Addr]bool)
+	var meta dataset
+	switch c.ipDist() {
+	case ipDistEmpirical:
+		ips, m, err := readIPs(c.IPFile, c.IPColumn)
 		if err != nil {
-			return nil, meta, err
+			return nil, m, err
 		}
 		if len(ips) == 0 {
-			return nil, meta, fmt.Errorf("%s: zero usable IPv4 rows", c.IPFile)
+			return nil, m, fmt.Errorf("%s: zero usable IPv4 rows", c.IPFile)
 		}
+		meta = m
 		meta.AssignmentMode = "empirical_rows_with_replacement"
-
-	} else {
-		r := rand.New(rand.NewSource(c.Seed + 2))
+		// Rows are sampled in file order so repeated rows keep their weight.
+		for i := range out {
+			out[i] = ips[r.Intn(len(ips))]
+		}
+	case ipDistDiverse:
+		meta = dataset{Source: "synthetic", AssignmentMode: "synthetic_unique_ipv4"}
 		seen := make(map[netip.Addr]bool)
-		for len(ips) < c.Advertisers {
-			v := r.Uint32()
-			ip := netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
-			if seen[ip] || !ip.IsGlobalUnicast() || netutil.AddrIsLAN(ip) || netutil.AddrIsSpecialNetwork(ip) {
-				continue
+		for i := range out {
+			ip := publicIPv4(r)
+			for seen[ip] {
+				ip = publicIPv4(r)
 			}
 			seen[ip] = true
-			ips = append(ips, ip)
+			out[i] = ip
 		}
-		meta.Rows, meta.Distinct = len(ips), len(ips)
+	case ipDistConcentrated:
+		meta = dataset{Source: "synthetic", AssignmentMode: fmt.Sprintf("synthetic_%d_slash16", c.IPPrefixes)}
+		prefixes := make([]netip.Addr, c.IPPrefixes)
+		for i := range prefixes {
+			prefixes[i] = publicIPv4(r)
+		}
+		for i := range out {
+			p := prefixes[r.Intn(len(prefixes))].As4()
+			out[i] = netip.AddrFrom4([4]byte{p[0], p[1], byte(r.Intn(256)), byte(1 + r.Intn(254))})
+		}
+	default:
+		return nil, meta, fmt.Errorf("unknown IP distribution %q", c.IPDist)
+	}
+	if meta.Source == "synthetic" {
 		hash := sha256.New()
-		for _, ip := range ips {
+		for _, ip := range out {
 			fmt.Fprintln(hash, ip)
 		}
 		meta.SHA256 = fmt.Sprintf("%x", hash.Sum(nil))
+		meta.Rows = len(out)
+	}
+	for _, ip := range out {
+		assigned[ip] = true
+	}
+	if meta.Source == "synthetic" {
+		meta.Distinct = len(assigned)
+	}
+	meta.AssignedDistinct = len(assigned)
+	return out, meta, nil
+}
+
+func population(c config) (*workload, dataset, error) {
+	ips, meta, err := addresses(c)
+	if err != nil {
+		return nil, meta, err
 	}
 	w := &workload{ads: make([]advertiser, c.Advertisers), topics: make([]topicindex.TopicID, c.Topics), population: make([]int, c.Topics), ready: make([]int, 0, c.Advertisers), active: make(wakes, 0, c.Advertisers), retries: make(wakes, 0, c.Advertisers), z: newZipf(c.Topics, c.Alpha), rng: rand.New(rand.NewSource(c.Seed + 3))}
-	assigned := make(map[netip.Addr]bool)
-	// Independent from topic assignment and runtime query randomness. Sample rows
-	// in their original order so repeated rows retain their empirical weight.
-	ipRNG := rand.New(rand.NewSource(c.Seed + 2))
 	r := rand.New(rand.NewSource(c.Seed + 1))
 	for i := range w.topics {
 		w.topics[i] = sha256.Sum256([]byte(fmt.Sprintf("registrarbench/topic/%d", i)))
 	}
 	for i := range w.ads {
-		index := i
-		if c.IPFile != "" {
-			index = ipRNG.Intn(len(ips))
-		}
-		ip := ips[index]
 		var record enr.Record
-		record.Set(enr.IPv4(ip.AsSlice()))
+		record.Set(enr.IPv4(ips[i].AsSlice()))
 		record.Set(enr.UDP(30303))
 		digest := sha256.Sum256([]byte(fmt.Sprintf("registrarbench/key/%d/%d", c.Seed, i)))
 		key, err := crypto.ToECDSA(digest[:])
@@ -214,31 +266,42 @@ func population(c config) (*workload, dataset, error) {
 		if err != nil {
 			return nil, meta, err
 		}
+		enc, err := rlp.EncodeToBytes(&record)
+		if err != nil {
+			return nil, meta, err
+		}
 		topic := w.z.sample(r)
-		w.ads[i] = advertiser{node: node, topic: topic}
+		w.ads[i] = advertiser{node: node, enc: enc, topic: topic}
 		w.population[topic]++
 		w.ready = append(w.ready, i)
-		assigned[ip] = true
 	}
 	r.Shuffle(len(w.ready), func(i, j int) { w.ready[i], w.ready[j] = w.ready[j], w.ready[i] })
-	meta.AssignedDistinct = len(assigned)
 	return w, meta, nil
 }
 
-// Active entries are released only after TopicTable.Expire has run. For realtime,
-// release is conservatively scheduled at method completion + lifetime, no earlier
-// than the table's actual insertion expiry. Simulated start/completion are equal.
+// decodeNode returns an independent copy of the advertiser's record, as the
+// production REGTOPIC handler decodes one from every request.
+func decodeNode(enc []byte) (*enode.Node, error) {
+	var r enr.Record
+	if err := rlp.DecodeBytes(enc, &r); err != nil {
+		return nil, err
+	}
+	return enode.New(enode.ValidSchemes, &r)
+}
+
+// release returns advertisers whose ads have expired to the ready FIFO.
 func (w *workload) release(now mclock.AbsTime) {
 	for len(w.active) > 0 && w.active[0].at <= now {
 		item := heap.Pop(&w.active).(wake)
-		w.enqueueFresh(item.id, item.at)
+		w.enqueueFresh(item.id)
 	}
 }
-func (w *workload) enqueueFresh(id int, at mclock.AbsTime) {
+
+// enqueueFresh ends any attempt state and makes the advertiser eligible for a
+// later fresh arrival.
+func (w *workload) enqueueFresh(id int) {
 	a := &w.ads[id]
-	a.waiting = false
-	a.first = 0
-	a.readyAt = at
+	a.waiting, a.first, a.quoteSum = false, 0, 0
 	if len(w.ready) == cap(w.ready) {
 		copy(w.ready, w.ready[w.head:])
 		w.ready = w.ready[:len(w.ready)-w.head]
@@ -254,31 +317,122 @@ func (w *workload) next() (int, bool) {
 	w.head++
 	return id, true
 }
-func (w *workload) finish(id int, issued, completed mclock.AbsTime, wait, lifetime time.Duration) error {
-	a := &w.ads[id]
-	if wait > 0 {
-		if issued.Add(wait) < issued {
-			return fmt.Errorf("retry due-time overflow for advertiser %d: %s", id, wait)
-		}
-		if !a.waiting {
-			a.first = issued
-			a.waiting = true
-		}
-		heap.Push(&w.retries, wake{at: issued.Add(wait), id: id})
-	} else {
-		a.waiting = false
-		heap.Push(&w.active, wake{at: completed.Add(lifetime), id: id})
-	}
-	return nil
+func (w *workload) readyCount() int { return len(w.ready) - w.head }
+
+// Abandonment policies for an advertiser that has been quoted a waiting time.
+const (
+	abandonProduction = "production" // topicindex.Registration.HandleTicketResponse
+	abandonSpec       = "spec"       // a single waiting interval SHOULD NOT exceed E
+	abandonNone       = "none"       // retry after any wait (the original harness)
+)
+
+// clientWait is the waiting time as received by the client: REGCONFIRMATION
+// carries it in milliseconds, rounded up (v5_udp.go:waitTimeToMs), and
+// v5_topic.go converts it back to a Duration.
+func clientWait(d time.Duration) time.Duration {
+	return time.Duration(math.Ceil(d.Seconds()*1000)) * time.Millisecond
 }
-func arrival(index uint64, rate float64) time.Duration {
-	if rate == 0 {
+
+// quoted applies the client's response to a ticket with waiting time wait,
+// issued at registrar time 'issued'. It returns "" if the advertiser will
+// retry, otherwise the abandonment reason ("single" or "cumulative").
+//
+// The production policy mirrors HandleTicketResponse exactly: drop when the
+// single quote exceeds RegAttemptTimeout, otherwise add it to the sum of
+// quotes and drop when that sum exceeds RegAttemptTimeout.
+func (w *workload) quoted(id int, issued mclock.AbsTime, wait time.Duration, policy string, timeout, lifetime time.Duration) (string, error) {
+	a := &w.ads[id]
+	cw := clientWait(wait)
+	if issued.Add(cw) < issued {
+		return "", fmt.Errorf("retry due-time overflow for advertiser %d: %s", id, wait)
+	}
+	switch policy {
+	case abandonProduction:
+		if cw > timeout {
+			return "single", nil
+		}
+		if a.quoteSum+cw > timeout {
+			return "cumulative", nil
+		}
+	case abandonSpec:
+		if cw > lifetime {
+			return "single", nil
+		}
+	}
+	if !a.waiting {
+		a.first = issued
+		a.waiting = true
+	}
+	a.quoteSum += cw
+	heap.Push(&w.retries, wake{at: issued.Add(cw), id: id})
+	return "", nil
+}
+
+// admitted records an admission; the advertiser becomes eligible again once
+// its ad has expired.
+func (w *workload) admitted(id int, releaseAt mclock.AbsTime) {
+	a := &w.ads[id]
+	a.waiting, a.first, a.quoteSum = false, 0, 0
+	heap.Push(&w.active, wake{at: releaseAt, id: id})
+}
+
+// arrivals is a fixed-rate arrival process, either deterministic (i/rate) or
+// Poisson with exponential inter-arrival times from its own PRNG.
+type arrivals struct {
+	rate    float64
+	poisson bool
+	rng     *rand.Rand
+	index   uint64
+	next    time.Duration
+}
+
+func newArrivals(rate float64, poisson bool, seed int64) *arrivals {
+	a := &arrivals{rate: rate, poisson: poisson, rng: rand.New(rand.NewSource(seed))}
+	a.next = a.at(0)
+	if poisson && rate > 0 {
+		a.next = a.gap()
+	}
+	return a
+}
+func (a *arrivals) gap() time.Duration {
+	return time.Duration(a.rng.ExpFloat64() / a.rate * float64(time.Second))
+}
+func (a *arrivals) at(index uint64) time.Duration {
+	if a.rate == 0 {
 		return time.Duration(math.MaxInt64)
 	}
-	ns := float64(index) * float64(time.Second) / rate
+	ns := float64(index) * float64(time.Second) / a.rate
 	if ns >= float64(math.MaxInt64) {
 		return time.Duration(math.MaxInt64)
 	}
 	return time.Duration(ns)
 }
-func ipv4(n *enode.Node) bool { return n.IPAddr().Is4() }
+
+// consume advances to the next arrival.
+func (a *arrivals) consume() {
+	a.index++
+	if a.rate == 0 {
+		return
+	}
+	if a.poisson {
+		a.next += a.gap()
+	} else {
+		a.next = a.at(a.index)
+	}
+}
+
+// pendingBefore counts arrivals scheduled before end that have not been consumed.
+func (a *arrivals) pendingBefore(end time.Duration) uint64 {
+	if a.rate == 0 || a.next >= end {
+		return 0
+	}
+	if !a.poisson {
+		return uint64(math.Ceil(end.Seconds()*a.rate)) - a.index
+	}
+	// Poisson: estimate the backlog from its duration.
+	return uint64(math.Ceil((end - a.next).Seconds() * a.rate))
+}
+
+func relayCheck(requester netip.Addr) func(*enode.Node) bool {
+	return func(n *enode.Node) bool { return netutil.CheckRelayAddr(requester, n.IPAddr()) == nil }
+}
