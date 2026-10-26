@@ -435,7 +435,8 @@ def microbench(root, docs, figdir):
     write_csv(os.path.join(gen, "micro.csv"), ["benchmark", "count", "ns_op_mean", "ns_op_ci95", "B_op", "allocs_op", "ns_per_entry"], rows)
     write_md_table(os.path.join(gen, "micro.md"), ["benchmark", "ns/op", "B/op", "allocs/op", "ns/entry"], rows_md)
 
-    # Complexity fits: (family, x parameter, fixed parameters).
+    # Complexity fits: (family, x parameter, fixed parameters). Each is fitted
+    # over the cache-resident range (x <= 256 for topic size) and the full range.
     fits = [
         ("RegisterFresh", "T", {"N": 5000}, "Register, fresh ad (wait ticket) vs topic size T"),
         ("RegisterFresh", "N", {"T": 16}, "Register, fresh ad vs occupancy N"),
@@ -458,25 +459,37 @@ def microbench(root, docs, figdir):
                 pts.append((p[xk], v))
         if len(pts) < 3:
             continue
-        xs, ys = zip(*pts)
-        a, b, r2, bci = fit(xs, ys)
-        key = f"fit.{fam}.{xk}"
-        put(key, {"intercept_ns": a, "slope_ns": b, "slope_ci": bci, "r2": r2})
-        frows.append([label, fam, xk, json.dumps(fixed), a, b, bci, r2])
-        fmd.append([label, fmt_num(a, 0), fmt_ci(b, bci, 2), f"{r2:.3f}"])
-        ux = sorted(set(xs))
+        ranges = [("all", None)]
+        if xk == "T":
+            ranges.insert(0, ("small", 256))
+        ux = sorted(set(x for x, _ in pts))
         ax.errorbar(ux, [np.mean([y for x, y in pts if x == u]) for u in ux],
                     yerr=[np.std([y for x, y in pts if x == u]) for u in ux], fmt="o", capsize=3)
-        xx = np.linspace(0, max(xs), 50)
-        ax.plot(xx, a + b * xx, "k--", lw=1, label=f"{a:.0f} + {b:.2f}·{xk} ns")
+        for rname, lim in ranges:
+            sel = [(x, y) for x, y in pts if lim is None or x <= lim]
+            if len({x for x, _ in sel}) < 3:
+                continue
+            xs, ys = zip(*sel)
+            a, b, r2, bci = fit(xs, ys)
+            key = f"fit.{fam}.{xk}.{rname}"
+            put(key + ".slope", {"mean": b, "ci": bci})
+            put(key + ".intercept", a)
+            put(key + ".r2", r2)
+            rng = f"{xk} ≤ {lim}" if lim else f"{xk} ≤ {max(xs):g}"
+            frows.append([label, fam, xk, rng, json.dumps(fixed), a, b, bci, r2])
+            fmd.append([label, rng, fmt_num(a, 0), fmt_ci(b, bci, 2), f"{r2:.3f}"])
+            xx = np.linspace(0, max(xs), 50)
+            ax.plot(xx, a + b * xx, "--", lw=1, label=f"{rng}: {a:.0f} + {b:.2f}·{xk} ns")
+        ax.set_xscale("symlog", linthresh=16)
+        ax.set_yscale("log")
         ax.set_title(label, fontsize=9)
         ax.set_xlabel(xk)
         ax.set_ylabel("ns/op")
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7)
         ax.grid(alpha=.3)
     savefig(fig, figdir, "microbench_complexity")
-    write_csv(os.path.join(gen, "micro_fits.csv"), ["label", "family", "x", "fixed", "intercept_ns", "slope_ns", "slope_ci95", "r2"], frows)
-    write_md_table(os.path.join(gen, "micro_fits.md"), ["operation", "intercept (ns)", "slope (ns per entry)", "R²"], fmd)
+    write_csv(os.path.join(gen, "micro_fits.csv"), ["label", "family", "x", "range", "fixed", "intercept_ns", "slope_ns", "slope_ci95", "r2"], frows)
+    write_md_table(os.path.join(gen, "micro_fits.md"), ["operation", "fit range", "intercept (ns)", "slope (ns per entry)", "R²"], fmd)
 
 
 # ---------------------------------------------------------------- memory
