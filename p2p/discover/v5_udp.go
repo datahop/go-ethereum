@@ -1447,3 +1447,11 @@ func (t *UDPv5) collectTopicAuxNodes(topic topicindex.TopicID, reqDist []uint, r
 func waitTimeToMs(d time.Duration) uint {
 	return uint(math.Ceil(d.Seconds() * 1000))
 }
+
+// waitTimeFromMs converts a wire wait time, saturating instead of overflowing.
+func waitTimeFromMs(ms uint) time.Duration {
+	if uint64(ms) > math.MaxInt64/uint64(time.Millisecond) {
+		return math.MaxInt64
+	}
+	return time.Duration(ms) * time.Millisecond
+}
