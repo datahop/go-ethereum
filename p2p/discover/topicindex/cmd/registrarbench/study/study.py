@@ -547,10 +547,25 @@ def memory(root, docs, figdir):
 # ---------------------------------------------------------------- rendering
 
 
+def lookup(key):
+    """Returns VALUES[key], descending into dict values for dotted suffixes."""
+    if key in VALUES:
+        return VALUES[key]
+    parts = key.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        head = ".".join(parts[:i])
+        if head in VALUES:
+            v = VALUES[head]
+            for p in parts[i:]:
+                if not isinstance(v, dict) or p not in v:
+                    raise KeyError(key)
+                v = v[p]
+            return v
+    raise KeyError(key)
+
+
 def fmt_value(key, spec):
-    if key not in VALUES:
-        raise KeyError(key)
-    v = VALUES[key]
+    v = lookup(key)
     kind, _, nd = (spec or "f:2").partition(":")
     nd = int(nd or 0)
     if isinstance(v, dict) and kind in ("ci", "f", "pct", "pctci"):
@@ -574,6 +589,16 @@ def render(docs):
         return []
     text = open(tpl).read()
     missing = []
+
+    # Sections are template fragments in sections/<name>.md.in.
+    def section(mm):
+        p = os.path.join(docs, "sections", mm.group(1) + ".md.in")
+        if not os.path.exists(p):
+            missing.append("section:" + mm.group(1))
+            return "*(section not written)*"
+        return open(p).read().rstrip()
+
+    text = re.sub(r"\{\{section:([\w.-]+)\}\}", section, text)
 
     def table(mm):
         p = os.path.join(docs, "generated", mm.group(1) + ".md")
