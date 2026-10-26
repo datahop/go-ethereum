@@ -45,9 +45,13 @@ def experiments():
         yield "skew", f"C1000-fresh5-alpha{a:g}", {"zipf-alpha": a}
     for dist in ("empirical", "diverse", "concentrated"):
         yield "ipdist", f"C1000-fresh5-{dist}", {"ip-dist": dist}
+    # Without abandonment, attempts last hours: a larger population avoids
+    # scarcity and a longer warm-up reaches steady state. All policies use the
+    # same settings so they stay comparable.
     for policy in ("production", "spec", "none"):
         for r in (1, 5, 20):
-            yield "abandon", f"C1000-fresh{r:g}-{policy}", {"abandon": policy, "fresh-rate": r}
+            yield "abandon", f"C1000-fresh{r:g}-{policy}", {"abandon": policy, "fresh-rate": r,
+                                                           "advertisers": 1000000, "duration": "72h", "warmup": "48h"}
     # Bounded registrar state: high topic churn, many distinct IPs.
     for r in (5, 50):
         yield "bounded", f"C1000-fresh{r:g}-topics50000-uniform-diverse", {
