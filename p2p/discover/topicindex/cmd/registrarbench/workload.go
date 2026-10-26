@@ -12,8 +12,10 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -250,33 +252,61 @@ func population(c config) (*workload, dataset, error) {
 	for i := range w.topics {
 		w.topics[i] = sha256.Sum256([]byte(fmt.Sprintf("registrarbench/topic/%d", i)))
 	}
+	// Topics are drawn sequentially; signing is deterministic per index and
+	// runs in parallel.
 	for i := range w.ads {
-		var record enr.Record
-		record.Set(enr.IPv4(ips[i].AsSlice()))
-		record.Set(enr.UDP(30303))
-		digest := sha256.Sum256([]byte(fmt.Sprintf("registrarbench/key/%d/%d", c.Seed, i)))
-		key, err := crypto.ToECDSA(digest[:])
-		if err != nil {
-			return nil, meta, err
-		}
-		if err := enode.SignV4(&record, key); err != nil {
-			return nil, meta, err
-		}
-		node, err := enode.New(enode.ValidSchemes, &record)
-		if err != nil {
-			return nil, meta, err
-		}
-		enc, err := rlp.EncodeToBytes(&record)
-		if err != nil {
-			return nil, meta, err
-		}
 		topic := w.z.sample(r)
-		w.ads[i] = advertiser{node: node, enc: enc, topic: topic}
+		w.ads[i].topic = topic
 		w.population[topic]++
 		w.ready = append(w.ready, i)
 	}
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+		workers  = runtime.GOMAXPROCS(0)
+	)
+	for k := 0; k < workers; k++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			for i := k; i < len(w.ads); i += workers {
+				node, enc, err := signedNode(c.Seed, i, ips[i])
+				if err != nil {
+					errOnce.Do(func() { firstErr = err })
+					return
+				}
+				w.ads[i].node, w.ads[i].enc = node, enc
+			}
+		}(k)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, meta, firstErr
+	}
 	r.Shuffle(len(w.ready), func(i, j int) { w.ready[i], w.ready[j] = w.ready[j], w.ready[i] })
 	return w, meta, nil
+}
+
+// signedNode creates advertiser i's deterministic, validly signed record.
+func signedNode(seed int64, i int, ip netip.Addr) (*enode.Node, []byte, error) {
+	var record enr.Record
+	record.Set(enr.IPv4(ip.AsSlice()))
+	record.Set(enr.UDP(30303))
+	digest := sha256.Sum256([]byte(fmt.Sprintf("registrarbench/key/%d/%d", seed, i)))
+	key, err := crypto.ToECDSA(digest[:])
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := enode.SignV4(&record, key); err != nil {
+		return nil, nil, err
+	}
+	node, err := enode.New(enode.ValidSchemes, &record)
+	if err != nil {
+		return nil, nil, err
+	}
+	enc, err := rlp.EncodeToBytes(&record)
+	return node, enc, err
 }
 
 // decodeNode returns an independent copy of the advertiser's record, as the
@@ -302,7 +332,9 @@ func (w *workload) release(now mclock.AbsTime) {
 func (w *workload) enqueueFresh(id int) {
 	a := &w.ads[id]
 	a.waiting, a.first, a.quoteSum = false, 0, 0
-	if len(w.ready) == cap(w.ready) {
+	// Compact only when the consumed prefix is at least half the slice, so
+	// each element is moved O(1) times on average.
+	if len(w.ready) == cap(w.ready) && w.head >= len(w.ready)/2 {
 		copy(w.ready, w.ready[w.head:])
 		w.ready = w.ready[:len(w.ready)-w.head]
 		w.head = 0

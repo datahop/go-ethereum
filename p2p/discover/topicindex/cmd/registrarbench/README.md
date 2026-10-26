@@ -76,7 +76,10 @@ are only a few ticks long; use the `testing.B` benchmarks in `topicindex` for pe
 * **ENR copies.** With `--independent-enr` (default), each request passes a freshly
   RLP-decoded `enode.Node` to the registrar, as `handleRegtopic` does. The decode is
   outside the timed region. With `--independent-enr=false`, the population's node is
-  shared and its ENR storage is not charged to the registrar.
+  shared and its ENR storage is not charged to the registrar. The study's simulated and
+  realtime sweeps use shared nodes (decoding verifies a signature, which is handler work
+  outside the registrar core); bytes per cached ad come from `memfill`, which measures
+  both variants.
 
 ## Output (JSONL, schema 6)
 

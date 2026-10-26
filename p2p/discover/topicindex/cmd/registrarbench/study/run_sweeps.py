@@ -22,7 +22,10 @@ BASE = {
     "advertisers": 200000, "topics": 300, "zipf-alpha": 1.0, "ad-lifetime": E,
     "duration": "18h", "warmup": "6h", "sample-interval": "10s", "abandon": "production",
     "arrivals": "deterministic", "ip-dist": "empirical", "ip-file": "results/data/dnslist-ipv4.txt",
-    "raw-ops": "false", "independent-enr": "true",
+    "raw-ops": "false",
+    # ENR decoding (signature recovery) is handler work outside the timed
+    # registrar core; memory per ad is measured separately in memfill mode.
+    "independent-enr": "false",
 }
 
 FRESH = [0.25, 0.5, 1, 2, 5, 10, 20, 50, 100]
