@@ -48,6 +48,7 @@ var (
 	regtopicTicketEarlyCounter    = metrics.NewRegisteredCounter(moduleName+"/regtopic/ticket/early", nil)
 	regtopicTicketInvalidCounter  = metrics.NewRegisteredCounter(moduleName+"/regtopic/ticket/invalid", nil)
 	regtopicTicketReplayedCounter = metrics.NewRegisteredCounter(moduleName+"/regtopic/ticket/replayed", nil)
+	regtopicTicketWrongIDCounter  = metrics.NewRegisteredCounter(moduleName+"/regtopic/ticket/wrongid", nil)
 
 	topicRegTicketBelowFloorCounter = metrics.NewRegisteredCounter(moduleName+"/topicreg/ticket/belowfloor", nil)
 )
