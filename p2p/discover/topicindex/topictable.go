@@ -76,6 +76,8 @@ type topicTableEntry struct {
 
 	topicElem *list.Element
 	allElem   *list.Element
+
+	ipLevels [2]byte // IPv4/IPv6 tree levels incremented on insert
 }
 
 // NewTopicTable creates a TopicTable.
@@ -517,10 +519,10 @@ func (wt *waitTimeState) addReg(reg *topicTableEntry) {
 	var ip4 enr.IPv4
 	var ip6 enr.IPv6
 	if reg.node.Load(&ip4) == nil {
-		wt.ipv4.insert(net.IP(ip4))
+		_, reg.ipLevels[0] = wt.ipv4.insert(net.IP(ip4))
 	}
 	if reg.node.Load(&ip6) == nil {
-		wt.ipv6.insert(net.IP(ip6))
+		_, reg.ipLevels[1] = wt.ipv6.insert(net.IP(ip6))
 	}
 }
 
@@ -528,9 +530,9 @@ func (wt *waitTimeState) removeReg(reg *topicTableEntry) {
 	var ip4 enr.IPv4
 	var ip6 enr.IPv6
 	if reg.node.Load(&ip4) == nil {
-		wt.ipv4.remove(net.IP(ip4))
+		wt.ipv4.remove(net.IP(ip4), reg.ipLevels[0])
 	}
 	if reg.node.Load(&ip6) == nil {
-		wt.ipv6.remove(net.IP(ip6))
+		wt.ipv6.remove(net.IP(ip6), reg.ipLevels[1])
 	}
 }
