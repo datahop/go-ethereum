@@ -97,6 +97,7 @@ type UDPv5 struct {
 	// topic stuff
 	topicTable   *topicindex.TopicTable
 	ticketSealer *topicindex.TicketSealer
+	usedTickets  *topicindex.UsedTickets
 	topicSys     *topicSystem
 
 	// channels into dispatch
@@ -190,6 +191,7 @@ func newUDPv5(conn UDPConn, ln *enode.LocalNode, cfg Config) (*UDPv5, error) {
 		// topic stuff
 		topicTable:   topicindex.NewTopicTable(topicConfig),
 		ticketSealer: topicindex.NewTicketSealer(cfg.Clock),
+		usedTickets:  topicindex.NewUsedTickets(cfg.Clock),
 		// channels into dispatch
 		packetInCh:    make(chan ReadPacket, 1),
 		readNextCh:    make(chan struct{}, 1),
@@ -1268,51 +1270,79 @@ func addrIsRoutable(addr netip.Addr) bool {
 		!netutil.AddrIsSpecialNetwork(addr) && !netutil.AddrIsLAN(addr)
 }
 
-// handleRegtopic serves REGTOPIC messages.
+// handleRegtopic serves REGTOPIC messages. Every request is answered: a request
+// that cannot be registered gets a REGCONFIRMATION without ticket and with zero
+// wait time. A ticket used early is echoed with the remaining wait. One used on
+// time or late within the grace is credited, once: presented again, like an
+// invalid or expired ticket, it starts a new attempt.
 func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.Regtopic) {
-	ticket, err := t.ticketSealer.Unpack(p.Topic, p.Ticket)
-	if err != nil {
-		t.log.Debug("Invalid ticket in REGTOPIC/v5", "id", fromID, "addr", fromAddr, "err", err)
-		return
+	reject := func() {
+		t.sendResponse(fromID, fromAddr, &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 1})
 	}
-
 	n, err := enode.New(t.validSchemes, p.ENR)
 	if err != nil {
 		t.log.Debug("Node record in REGTOPIC/v5 is invalid", "id", fromID, "addr", fromAddr, "err", err)
+		regtopicBadENRCounter.Inc(1)
+		reject()
 		return
 	}
 	if n.ID() != fromID {
 		t.log.Debug("Node record in REGTOPIC/v5 does not match id", "id", fromID, "addr", fromAddr)
+		regtopicIDMismatchCounter.Inc(1)
+		reject()
 		return
 	}
 	if err := checkRegtopicRecordIP(n, fromAddr.Addr()); err != nil {
 		t.log.Debug("Bad address in REGTOPIC/v5 record", "id", fromID, "addr", fromAddr, "err", err)
 		regtopicRecordIPRejectCounter.Inc(1)
+		reject()
 		return
 	}
 
-	// Compute total wait time.
+	// Compute total wait time. A ticket that fails to unpack is ignored, and the
+	// request is treated as a new attempt.
 	now := t.clock.Now()
-	waitTime := time.Duration(0)
+	waitTime, firstIssued := time.Duration(0), now
 	if len(p.Ticket) > 0 {
-		waitTime = now.Sub(ticket.FirstIssued)
+		ticket, err := t.ticketSealer.Unpack(p.Topic, p.Ticket)
+		if err != nil {
+			t.log.Debug("Invalid ticket in REGTOPIC/v5", "id", fromID, "addr", fromAddr, "err", err)
+			regtopicTicketInvalidCounter.Inc(1)
+		} else {
+			timing := ticket.TimingAt(now)
+			if timing == topicindex.TicketEarly {
+				regtopicTicketEarlyCounter.Inc(1)
+				t.requoteEarlyTicket(fromID, fromAddr, p, ticket, now)
+				return
+			}
+			credited := timing != topicindex.TicketExpired && !t.usedTickets.Use(p.Ticket)
+			switch {
+			case timing == topicindex.TicketExpired:
+				t.log.Debug("Expired ticket in REGTOPIC/v5", "id", fromID, "addr", fromAddr)
+				regtopicTicketExpiredCounter.Inc(1)
+			case !credited:
+				t.log.Debug("Replayed ticket in REGTOPIC/v5", "id", fromID, "addr", fromAddr)
+				regtopicTicketReplayedCounter.Inc(1)
+			case timing == topicindex.TicketLate:
+				regtopicTicketLateCounter.Inc(1)
+			}
+			if credited {
+				waitTime, firstIssued = regtopicCredit(ticket, timing, now)
+			}
+		}
 	}
 
 	// Collect closest nodes to topic hash.
-	auxNodes := t.collectTopicAuxNodes(ticket.Topic, p.Buckets, fromAddr.Addr())
+	auxNodes := t.collectTopicAuxNodes(p.Topic, p.Buckets, fromAddr.Addr())
 	nodesResponses := packNodeRecords(auxNodes)
 	responseCount := uint8(1 + len(nodesResponses))
 
 	// Attempt to register.
-	newTime := t.topicTable.Register(n, ticket.Topic, waitTime)
+	newTime := t.topicTable.Register(n, p.Topic, waitTime)
 
 	// Build confirmation.
 	confirmation := &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: responseCount}
 	if newTime > 0 {
-		firstIssued := ticket.FirstIssued
-		if len(p.Ticket) == 0 {
-			firstIssued = now
-		}
 		confirmation.WaitTime = waitTimeToMs(newTime)
 		confirmation.Ticket = t.ticketSealer.Pack(&topicindex.Ticket{
 			Topic:          p.Topic,
@@ -1332,6 +1362,35 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 		msg := &v5wire.Nodes{ReqID: p.ReqID, RespCount: responseCount, Nodes: records}
 		t.sendResponse(fromID, fromAddr, msg)
 	}
+}
+
+// requoteEarlyTicket answers a ticket used before its window with the remaining
+// wait, so that an early retry can neither move the window nor learn the current
+// wait time. The ticket is echoed, not re-sealed: the holder keeps one MAC for
+// the window, which the used-ticket memory sees.
+func (t *UDPv5) requoteEarlyTicket(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.Regtopic, ticket *topicindex.Ticket, now mclock.AbsTime) {
+	t.sendResponse(fromID, fromAddr, &v5wire.Regconfirmation{
+		ReqID:     p.ReqID,
+		RespCount: 1,
+		WaitTime:  waitTimeToMs(ticket.WindowStart().Sub(now)),
+		Ticket:    p.Ticket,
+	})
+}
+
+// regtopicCredit returns the waiting time credited to a ticket used at now and
+// the FirstIssued time of a ticket issued in reply. A late ticket is credited
+// with the wait it was scheduled to have, and FirstIssued is moved forward so
+// that the time past its window is not credited on the next retry either. A
+// ticket past the grace proves nothing and starts a new attempt.
+func regtopicCredit(ticket *topicindex.Ticket, timing topicindex.TicketTiming, now mclock.AbsTime) (waited time.Duration, firstIssued mclock.AbsTime) {
+	switch timing {
+	case topicindex.TicketLate:
+		waited = ticket.WindowStart().Sub(ticket.FirstIssued)
+		return waited, now.Add(-waited)
+	case topicindex.TicketExpired:
+		return 0, now
+	}
+	return now.Sub(ticket.FirstIssued), ticket.FirstIssued
 }
 
 // handleTopicQuery serves TOPICQUERY messages.
