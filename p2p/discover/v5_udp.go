@@ -1388,7 +1388,8 @@ func addrIsRoutable(addr netip.Addr) bool {
 // that cannot be registered gets a REGCONFIRMATION without ticket and with zero
 // wait time. A ticket used early is echoed with the remaining wait. One used on
 // time or late within the grace is credited, once: presented again, like an
-// invalid or expired ticket, it starts a new attempt.
+// invalid or expired ticket or one issued to another node, it starts a new
+// attempt.
 func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.Regtopic) {
 	reject := func() {
 		t.sendResponse(fromID, fromAddr, &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 1})
@@ -1413,16 +1414,20 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 		return
 	}
 
-	// Compute total wait time. A ticket that fails to unpack is ignored, and the
-	// request is treated as a new attempt.
+	// Compute total wait time. A ticket that fails to unpack or was issued to
+	// another node is ignored, and the request is treated as a new attempt.
 	now := t.clock.Now()
 	waitTime, firstIssued := time.Duration(0), now
 	if len(p.Ticket) > 0 {
 		ticket, err := t.ticketSealer.Unpack(p.Topic, p.Ticket)
-		if err != nil {
+		switch {
+		case err != nil:
 			t.log.Debug("Invalid ticket in REGTOPIC/v5", "id", fromID, "addr", fromAddr, "err", err)
 			regtopicTicketInvalidCounter.Inc(1)
-		} else {
+		case ticket.Node != fromID:
+			t.log.Debug("Ticket in REGTOPIC/v5 was issued to another node", "id", fromID, "addr", fromAddr, "owner", ticket.Node)
+			regtopicTicketWrongIDCounter.Inc(1)
+		default:
 			timing := ticket.TimingAt(now)
 			if timing == topicindex.TicketEarly {
 				regtopicTicketEarlyCounter.Inc(1)
@@ -1475,6 +1480,7 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 		confirmation.WaitTime = waitTimeToMs(newTime)
 		confirmation.Ticket = t.ticketSealer.Pack(&topicindex.Ticket{
 			Topic:          p.Topic,
+			Node:           fromID,
 			WaitTimeIssued: newTime,
 			LastUsed:       now,
 			FirstIssued:    firstIssued,

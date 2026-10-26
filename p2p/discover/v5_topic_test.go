@@ -851,8 +851,8 @@ func badSigRecord(t *testing.T, key *ecdsa.PrivateKey, addr netip.AddrPort) *enr
 
 // TestHandleRegtopicReplies checks that the registrar answers every REGTOPIC:
 // valid and late tickets are credited, an early ticket is re-quoted for its
-// window, an invalid or expired ticket starts a new attempt, and a request with
-// an unusable record is rejected. One ad is seeded so that a new attempt has to
+// window, an invalid or expired ticket or one issued to another node starts a
+// new attempt, and a request with an unusable record is rejected. One ad is seeded so that a new attempt has to
 // wait (about 45s) and the credited wait decides admission.
 func TestHandleRegtopicReplies(t *testing.T) {
 	t.Parallel()
@@ -872,14 +872,18 @@ func TestHandleRegtopicReplies(t *testing.T) {
 		record    = func(t *testing.T) *enr.Record {
 			return signedRecord(t, key, addr.Addr(), netip.Addr{}, addr.Port())
 		}
-		seal = func(test *udpV5Test, topic topicindex.TopicID, lastUsed, wait, sinceFirst time.Duration) []byte {
+		sealFor = func(test *udpV5Test, node enode.ID, topic topicindex.TopicID, lastUsed, wait, sinceFirst time.Duration) []byte {
 			now := test.udp.clock.Now()
 			return sealTicket(test, &topicindex.Ticket{
 				Topic:          topic,
+				Node:           node,
 				LastUsed:       now.Add(-lastUsed),
 				WaitTimeIssued: wait,
 				FirstIssued:    now.Add(-sinceFirst),
 			})
+		}
+		seal = func(test *udpV5Test, topic topicindex.TopicID, lastUsed, wait, sinceFirst time.Duration) []byte {
+			return sealFor(test, enode.PubkeyToIDV4(&key.PublicKey), topic, lastUsed, wait, sinceFirst)
 		}
 		onTime = func(test *udpV5Test) []byte { return seal(test, testTopic1, 2*time.Second, time.Second, time.Minute) }
 	)
@@ -916,6 +920,12 @@ func TestHandleRegtopicReplies(t *testing.T) {
 			return enc
 		}, want: waiting},
 		{name: "wrong size", ticket: func(*udpV5Test) []byte { return []byte{1} }, want: waiting},
+		{name: "other node", ticket: func(test *udpV5Test) []byte {
+			return sealFor(test, enode.PubkeyToIDV4(&otherKey.PublicKey), testTopic1, 2*time.Second, time.Second, time.Minute)
+		}, want: waiting, minWait: 40000, maxWait: 50000},
+		{name: "other node early", ticket: func(test *udpV5Test) []byte {
+			return sealFor(test, enode.PubkeyToIDV4(&otherKey.PublicKey), testTopic1, 0, time.Minute, 0)
+		}, want: waiting, minWait: 40000, maxWait: 50000},
 		{name: "bad signature", enr: func(t *testing.T) *enr.Record { return badSigRecord(t, key, addr) }, want: rejected},
 		{name: "other key", enr: func(t *testing.T) *enr.Record {
 			return signedRecord(t, otherKey, addr.Addr(), netip.Addr{}, addr.Port())
@@ -957,6 +967,9 @@ func TestHandleRegtopicReplies(t *testing.T) {
 					}
 					if tt.want == requoted && !bytes.Equal(p.Ticket, req.Ticket) {
 						t.Errorf("early ticket not echoed")
+					}
+					if tt.want == waiting && bytes.Equal(p.Ticket, req.Ticket) {
+						t.Errorf("ticket echoed on a new attempt")
 					}
 				case rejected:
 					if len(p.Ticket) != 0 || p.WaitTime != 0 {
@@ -1054,7 +1067,7 @@ func TestRegtopicTicketReplay(t *testing.T) {
 			}
 			wait = env.tab.Register(env.adv, topic, waited)
 			if wait > 0 {
-				sealer.Pack(&topicindex.Ticket{Topic: topic, WaitTimeIssued: wait, LastUsed: now, FirstIssued: firstIssued})
+				sealer.Pack(&topicindex.Ticket{Topic: topic, Node: env.adv.ID(), WaitTimeIssued: wait, LastUsed: now, FirstIssued: firstIssued})
 			}
 			return wait == 0, wait, timing, replay
 		}
@@ -1066,7 +1079,7 @@ func TestRegtopicTicketReplay(t *testing.T) {
 		if env.w <= 0 {
 			t.Fatal("fresh attempt admitted without waiting")
 		}
-		env.t0 = sealer.Pack(&topicindex.Ticket{Topic: topic, WaitTimeIssued: env.w, LastUsed: now, FirstIssued: now})
+		env.t0 = sealer.Pack(&topicindex.Ticket{Topic: topic, Node: env.adv.ID(), WaitTimeIssued: env.w, LastUsed: now, FirstIssued: now})
 		t.Logf("ticket issued at %v with wait %v", time.Duration(now), env.w)
 		return env
 	}
@@ -1157,6 +1170,7 @@ func TestHandleRegtopicReplay(t *testing.T) {
 	now := test.udp.clock.Now()
 	ticket := sealTicket(test, &topicindex.Ticket{
 		Topic:          testTopic1,
+		Node:           enode.PubkeyToIDV4(&key.PublicKey),
 		LastUsed:       now.Add(-2 * time.Second),
 		WaitTimeIssued: time.Second,
 		FirstIssued:    now.Add(-time.Minute),
@@ -1187,6 +1201,67 @@ func TestHandleRegtopicReplay(t *testing.T) {
 	}
 	if n := len(test.udp.LocalTopicNodes(testTopic1)); n != 1 {
 		t.Fatalf("%d ads after the replay, want 1", n)
+	}
+}
+
+// TestHandleRegtopicForeignTicket checks that a ticket is bound to the node it
+// was issued to: presented by another node it is worth nothing and is not used
+// up, so that its owner can still redeem it in its window.
+func TestHandleRegtopicForeignTicket(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+	seedTopicTable(t, test.udp, testTopic1, enode.NewV4(&newkey().PublicKey, net.IP{10, 0, 9, 1}, 30303, 30303))
+
+	var (
+		ownerKey   = newkey()
+		ownerAddr  = netip.MustParseAddrPort("10.0.1.1:30303")
+		holderKey  = newkey()
+		holderAddr = netip.MustParseAddrPort("10.0.2.1:30303")
+		now        = test.udp.clock.Now()
+	)
+	ticket := sealTicket(test, &topicindex.Ticket{
+		Topic:          testTopic1,
+		Node:           enode.PubkeyToIDV4(&ownerKey.PublicKey),
+		LastUsed:       now.Add(-2 * time.Second),
+		WaitTimeIssued: time.Second,
+		FirstIssued:    now.Add(-time.Minute),
+	})
+	register := func(key *ecdsa.PrivateKey, addr netip.AddrPort, reqID byte) *v5wire.Regconfirmation {
+		var conf *v5wire.Regconfirmation
+		test.packetInFrom(key, addr, &v5wire.Regtopic{
+			ReqID: []byte{reqID}, Topic: testTopic1, Ticket: ticket,
+			ENR: signedRecord(t, key, addr.Addr(), netip.Addr{}, addr.Port()),
+		})
+		test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) { conf = p })
+		return conf
+	}
+
+	conf := register(holderKey, holderAddr, 1)
+	if len(conf.Ticket) == 0 || conf.WaitTime < 40000 || conf.WaitTime > 50000 {
+		t.Fatalf("foreign ticket: ticket %d bytes, wait time %d, want a new ticket and a wait in [40000, 50000]", len(conf.Ticket), conf.WaitTime)
+	}
+	if n := len(test.udp.LocalTopicNodes(testTopic1)); n != 1 {
+		t.Fatalf("%d ads after the foreign ticket, want 1", n)
+	}
+	issued := make(chan *topicindex.Ticket, 1)
+	test.udp.onDispatchCh <- func() {
+		tk, err := test.udp.ticketSealer.Unpack(testTopic1, conf.Ticket)
+		if err != nil {
+			t.Error(err)
+		}
+		issued <- tk
+	}
+	if tk := <-issued; tk == nil || tk.Node != enode.PubkeyToIDV4(&holderKey.PublicKey) {
+		t.Fatal("new ticket not issued to its holder")
+	}
+
+	conf = register(ownerKey, ownerAddr, 2)
+	if len(conf.Ticket) != 0 || conf.WaitTime != waitTimeToMs(test.udp.topicTable.AdLifetime()) {
+		t.Fatalf("owner's ticket not admitted after foreign use: ticket %d bytes, wait time %d", len(conf.Ticket), conf.WaitTime)
+	}
+	if n := len(test.udp.LocalTopicNodes(testTopic1)); n != 2 {
+		t.Fatalf("%d ads after the owner's ticket, want 2", n)
 	}
 }
 
