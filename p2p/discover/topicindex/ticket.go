@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
 // This is the maximum number of times a ticketKey can be used for encoding.
@@ -49,6 +50,7 @@ const (
 type Ticket struct {
 	KeyID          uint16
 	Topic          TopicID
+	Node           enode.ID       // advertiser the ticket was issued to
 	WaitTimeIssued time.Duration  // wait time returned in last REGCONFIRMATION
 	LastUsed       mclock.AbsTime // last request in this waiting session
 	FirstIssued    mclock.AbsTime // creation time of first ticket in this waiting session

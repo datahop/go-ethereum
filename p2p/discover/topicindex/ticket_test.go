@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
 // This test checks basic ticket encoding/decoding.
@@ -32,6 +33,7 @@ func TestTicketSealerSimple(t *testing.T) {
 
 	ticket := &Ticket{
 		Topic:          topic1,
+		Node:           enode.ID{1, 2, 3},
 		FirstIssued:    clock.Now(),
 		WaitTimeIssued: 1 * time.Minute,
 		LastUsed:       clock.Now(),
@@ -49,6 +51,12 @@ func TestTicketSealerSimple(t *testing.T) {
 	}
 	if !reflect.DeepEqual(ticket, ticket2) {
 		t.Fatal("decoded ticket not equal")
+	}
+
+	// The node is covered by the MAC.
+	enc[ticketMacSize+2+len(TopicID{})] ^= 0xff
+	if _, err := ts.Unpack(ticket.Topic, enc); err != errBadTicketMAC {
+		t.Fatal("ticket with altered node not rejected:", err)
 	}
 }
 
