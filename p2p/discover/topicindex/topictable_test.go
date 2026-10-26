@@ -382,6 +382,35 @@ func TestTopicTableEviction(t *testing.T) {
 	}
 }
 
+// TestTopicTableWaitTimeCap checks that the wait time stays positive and capped
+// at high occupancy, where the uncapped value overflows a Duration.
+func TestTopicTableWaitTimeCap(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Clock = new(mclock.Simulated)
+	cfg.AdCacheSize = 100
+	tab := NewTopicTable(cfg)
+
+	var prev time.Duration
+	for i := 0; i < 90; i++ {
+		tab.Add(newNode(), topic1)
+		wt := tab.WaitTime(newNode(), topic1)
+		if wt < prev {
+			t.Errorf("wait time decreased at %d ads: %v < %v", i+1, wt, prev)
+			break
+		}
+		prev = wt
+	}
+
+	n := newNode()
+	wt := tab.Register(n, topic1, 0)
+	if wt <= 0 || wt > maxWaitTime {
+		t.Errorf("Register at 90%% fill returned wait %v, want in (0, %v]", wt, maxWaitTime)
+	}
+	if tab.isRegistered(n, topic1) {
+		t.Error("node admitted at 90% fill without waiting")
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	return Config{
 		AdCacheSize: 20,

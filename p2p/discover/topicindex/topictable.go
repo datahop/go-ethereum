@@ -40,6 +40,10 @@ const (
 // If a node has less than this time to wait, they will be accepted anyway.
 const topicTableWaitTimeFloor = 1 * time.Second
 
+// maxWaitTime caps quoted wait times. It is far above any attempt budget and
+// keeps the float-to-Duration conversion in range.
+const maxWaitTime = 24 * time.Hour
+
 // TopicTable holds node registrations.
 type TopicTable struct {
 	all *list.List
@@ -285,7 +289,7 @@ func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (t
 	// even with free space. The wait is just the (lower-bounded) service and IP
 	// components.
 	neededTime := chargedService + chargedIP
-	return time.Duration(math.Ceil(neededTime * float64(time.Second))), comps
+	return secondsToDuration(neededTime), comps
 }
 
 // recordWaitTime updates the per-component lower bounds after a wait ticket has
@@ -314,9 +318,13 @@ func (tab *TopicTable) recordWaitTime(c waitTimeComponents, now mclock.AbsTime) 
 
 // secondsToDuration converts a wait-time value in (fractional) seconds to a
 // Duration, rounding up so a stored floor is never below the value it represents.
+// The result is capped at maxWaitTime. NaN (0*Inf on a full table) maps to 0.
 func secondsToDuration(s float64) time.Duration {
-	if s <= 0 {
+	if !(s > 0) {
 		return 0
+	}
+	if s >= maxWaitTime.Seconds() {
+		return maxWaitTime
 	}
 	return time.Duration(math.Ceil(s * float64(time.Second)))
 }
