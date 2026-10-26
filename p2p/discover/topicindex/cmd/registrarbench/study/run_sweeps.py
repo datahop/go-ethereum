@@ -12,7 +12,6 @@ import argparse
 import concurrent.futures
 import json
 import os
-import platform
 import subprocess
 import sys
 
@@ -86,14 +85,9 @@ def main():
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
-    arch = {"x86_64": "amd64", "arm64": "arm64", "aarch64": "arm64"}[platform.machine()]
     binary = os.path.join(a.root, "bin", "registrarbench")
-    os.makedirs(os.path.dirname(binary), exist_ok=True)
-    env = dict(os.environ, GOARCH=arch)
-    subprocess.check_call(["go", "build", "-o", binary, "./topicindex/cmd/registrarbench"], env=env)
-    info = subprocess.check_output(["file", "-b", binary]).decode()
-    if platform.machine() not in info:
-        sys.exit(f"binary is not native: {info}")
+    here = os.path.dirname(os.path.abspath(__file__))
+    subprocess.check_call([os.path.join(here, "build.sh"), binary])
     jobs = []
     for exp, point, over in experiments():
         if a.only and exp not in a.only:

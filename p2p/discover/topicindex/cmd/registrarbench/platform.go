@@ -47,9 +47,20 @@ func atoi(s string) int {
 	return n
 }
 
-// buildRevision prefers the VCS stamp embedded by 'go build'; it falls back to
-// asking git in the working directory (e.g. under 'go test').
+// Set by study/build.sh via -ldflags -X after checking that no tracked file is
+// modified. Go's own vcs.modified stamp also counts untracked files.
+var (
+	stampRevision string
+	stampDirty    string
+)
+
+// buildRevision prefers the study build stamp, then the VCS stamp embedded by
+// 'go build'; it falls back to asking git in the working directory (e.g. under
+// 'go test').
 func buildRevision() (rev string, dirty bool, source string) {
+	if stampRevision != "" {
+		return stampRevision, stampDirty != "false", "ldflags"
+	}
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, s := range info.Settings {
 			switch s.Key {

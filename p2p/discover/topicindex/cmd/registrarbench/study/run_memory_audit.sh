@@ -3,10 +3,9 @@
 # Usage (from p2p/discover): run_memory_audit.sh <results-root>
 set -euo pipefail
 root="$1"
-arch=$(uname -m); [ "$arch" = x86_64 ] && arch=amd64
 bin="$root/bin/registrarbench"
-mkdir -p "$root/bin" "$root/memfill" "$root/audit"
-GOARCH=$arch go build -o "$bin" ./topicindex/cmd/registrarbench
+mkdir -p "$root/memfill" "$root/audit"
+"$(dirname "$0")/build.sh" "$bin"
 for C in 1000 5000; do
   for dist in empirical diverse; do
     out="$root/memfill/C$C-$dist.jsonl"
