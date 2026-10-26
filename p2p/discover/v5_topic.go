@@ -336,10 +336,10 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			}
 			// The node responded: reset its global counter
 			sys.transport.trackTopicRequest(resp.att.Node, true)
-			wt := time.Duration(resp.msg.WaitTime) * time.Millisecond
+			wt := waitTimeFromMs(resp.msg.WaitTime)
 			switch {
 			case len(resp.msg.Ticket) > 0:
-				if err := reg.state.HandleTicketResponse(resp.att, resp.msg.Ticket, wt); errors.Is(err, topicindex.ErrWaitBelowFloor) {
+				if reg.state.HandleTicketResponse(resp.att, resp.msg.Ticket, wt) {
 					topicRegTicketBelowFloorCounter.Inc(1)
 				}
 			case wt == 0:

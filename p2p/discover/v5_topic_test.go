@@ -1190,10 +1190,9 @@ func TestHandleRegtopicReplay(t *testing.T) {
 	}
 }
 
-// TestTopicRegZeroWaitTicketDiscarded checks that a ticket quoting less than
-// the wait time floor is discarded: the registrar is not asked again and no
-// liveness failure is counted.
-func TestTopicRegZeroWaitTicketDiscarded(t *testing.T) {
+// TestTopicRegZeroWaitTicketClamped checks that a ticket quoting less than the
+// wait time floor is retried after the floor, and counts no liveness failure.
+func TestTopicRegZeroWaitTicketClamped(t *testing.T) {
 	t.Parallel()
 	test := newUDPV5Test(t)
 	defer test.close()
@@ -1206,16 +1205,61 @@ func TestTopicRegZeroWaitTicketDiscarded(t *testing.T) {
 
 	test.table.addFoundNode(n, true)
 	test.udp.RegisterTopic(testTopic1, 1)
+	var replied time.Time
 	test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+		replied = time.Now()
 		test.packetInFrom(key, a, &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 1, Ticket: []byte("t"), WaitTime: 0})
 	})
-
-	time.Sleep(2*regloopMinTime + 500*time.Millisecond)
-	if q := pipeQueued(test); q != 0 {
-		t.Errorf("%d packets sent to a registrar that quoted a zero wait", q)
-	}
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {
+		if d := time.Since(replied); d < time.Second {
+			t.Errorf("zero-wait ticket retried after %v, want at least 1s", d)
+		}
+		if !bytes.Equal(p.Ticket, []byte("t")) {
+			t.Errorf("retry carries ticket %x, want the quoted one", p.Ticket)
+		}
+	})
 	if fails := test.db.FindFails(n.ID(), n.IPAddr()); fails != 0 {
 		t.Errorf("zero-wait ticket led to %d wire failures, want 0", fails)
+	}
+}
+
+// TestTopicRegHugeWaitTime checks that a wait time too large for a Duration
+// saturates: a ticket is dropped as above budget rather than retried, and an
+// ad lifetime is capped rather than expiring at once.
+func TestTopicRegHugeWaitTime(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		ticket []byte
+		quiet  time.Duration
+	}{
+		// Dropped above budget, the registrar is asked again only on the next
+		// pass, after regloopMinTime. A wrapped wait would be clamped to 1s.
+		{"ticket", []byte("t"), 1500 * time.Millisecond},
+		// Registered for an ad lifetime. A wrapped lifetime would expire at
+		// once and the next pass would register again.
+		{"ad lifetime", nil, 2*regloopMinTime + 500*time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			test := newUDPV5Test(t)
+			defer test.close()
+
+			key := newkey()
+			addr := netip.MustParseAddrPort("10.0.3.48:30303")
+			ln := test.getNode(key, addr)
+			ln.Set(topicindex.TopicDiscoveryVersion)
+
+			test.table.addFoundNode(ln.Node(), true)
+			test.udp.RegisterTopic(testTopic1, 1)
+			test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
+				test.packetInFrom(key, a, &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 1, Ticket: tc.ticket, WaitTime: ^uint(0)})
+			})
+			time.Sleep(tc.quiet)
+			if q := pipeQueued(test); q != 0 {
+				t.Errorf("%d packets sent within %v of a maximal wait time", q, tc.quiet)
+			}
+		})
 	}
 }
 

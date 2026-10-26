@@ -576,19 +576,18 @@ func TestRegistrationUpdateHostileBucket(t *testing.T) {
 		t.Fatalf("first contact in the other bucket returned at step %d, want at most 2", step)
 	}
 	hb := &r.buckets[r.bucketIndex(hostile[0].ID())]
-	if len(hb.att) != 0 {
-		t.Fatalf("%d attempts left in the hostile bucket, want 0", len(hb.att))
+	if len(hb.att) != len(hostile) {
+		t.Fatalf("%d attempts in the hostile bucket, want %d", len(hb.att), len(hostile))
 	}
-	for _, n := range hostile {
-		if !r.failed.Has(n.ID()) {
-			t.Fatalf("hostile registrar %v not held as failed", n.ID())
+	for _, att := range hb.att {
+		if att.State == Waiting && att.NextTime != simclock.Now().Add(topicTableWaitTimeFloor) {
+			t.Fatalf("hostile attempt %v due at %v, want the floor", att.Node.ID(), att.NextTime)
 		}
 	}
-	if n := r.NodeCount(); n != 1 {
-		t.Fatalf("NodeCount = %d, want 1 (the first contact in flight)", n)
-	}
-	if len(r.heap) != 0 {
-		t.Fatalf("%d attempts left in the heap, want 0", len(r.heap))
+	for _, n := range hostile {
+		if r.failed.Has(n.ID()) {
+			t.Fatalf("hostile registrar %v held as failed", n.ID())
+		}
 	}
 }
 
@@ -655,38 +654,56 @@ func TestRegistrationHandleTicketResponseDropAboveBudget(t *testing.T) {
 }
 
 // TestRegistrationHandleTicketResponseBelowFloor checks that a quote below the
-// wait time floor is discarded and its registrar held as failed, while a quote
-// at the floor is kept.
+// wait time floor is raised to the floor and charged to the waiting budget, so
+// zero-wait quotes end the attempt once the budget is spent.
 func TestRegistrationHandleTicketResponseBelowFloor(t *testing.T) {
 	simclock := new(mclock.Simulated)
 	cfg := testConfig(t)
 	cfg.Clock = simclock
+	cfg.RegAttemptTimeout = 5 * topicTableWaitTimeFloor
 	r := NewRegistration(topic1, cfg)
 
-	below := nodesAtDistance(enode.ID(topic1), 30, 1)
-	r.AddNodes(nil, below)
+	node := nodesAtDistance(enode.ID(topic1), 30, 1)
+	r.AddNodes(nil, node)
+	for i := 1; i <= 5; i++ {
+		att := r.Update()
+		if att == nil {
+			t.Fatalf("round %d: no attempt due", i)
+		}
+		r.StartRequest(att)
+		if !r.HandleTicketResponse(att, []byte("t"), topicTableWaitTimeFloor-time.Nanosecond) {
+			t.Fatalf("round %d: quote below the floor not clamped", i)
+		}
+		if att.bucket.att[node[0].ID()] != att {
+			t.Fatalf("round %d: attempt removed", i)
+		}
+		if att.NextTime != simclock.Now().Add(topicTableWaitTimeFloor) {
+			t.Fatalf("round %d: next try at %v, want now+%v", i, att.NextTime, topicTableWaitTimeFloor)
+		}
+		if att.totalWaitTime != time.Duration(i)*topicTableWaitTimeFloor {
+			t.Fatalf("round %d: total wait %v, want %v", i, att.totalWaitTime, time.Duration(i)*topicTableWaitTimeFloor)
+		}
+		if r.Update() != nil {
+			t.Fatalf("round %d: attempt due before the floor", i)
+		}
+		simclock.Run(topicTableWaitTimeFloor)
+	}
 	att := r.Update()
 	r.StartRequest(att)
-	if err := r.HandleTicketResponse(att, []byte("t"), topicTableWaitTimeFloor-time.Nanosecond); err != ErrWaitBelowFloor {
-		t.Fatalf("HandleTicketResponse returned %v, want ErrWaitBelowFloor", err)
+	r.HandleTicketResponse(att, []byte("t"), 0)
+	if att.bucket.att[node[0].ID()] != nil {
+		t.Fatal("attempt kept past the waiting budget")
 	}
-	if att.bucket.att[below[0].ID()] != nil {
-		t.Fatal("attempt not removed")
-	}
-	if !r.failed.Has(below[0].ID()) {
-		t.Fatal("registrar not held as failed")
-	}
-	r.AddNodes(nil, below)
-	if n := r.NodeCount(); n != 0 {
-		t.Fatalf("failed registrar re-admitted: %d nodes", n)
+	if r.failed.Has(node[0].ID()) {
+		t.Fatal("registrar held as failed")
 	}
 
 	at := nodesAtDistance(enode.ID(topic1), 40, 1)
 	r.AddNodes(nil, at)
 	att = r.Update()
 	r.StartRequest(att)
-	if err := r.HandleTicketResponse(att, []byte("t"), topicTableWaitTimeFloor); err != nil {
-		t.Fatalf("HandleTicketResponse returned %v for a quote at the floor", err)
+	if r.HandleTicketResponse(att, []byte("t"), topicTableWaitTimeFloor) {
+		t.Fatal("quote at the floor clamped")
 	}
 	if att.bucket.att[at[0].ID()] != att || att.NextTime != simclock.Now().Add(topicTableWaitTimeFloor) {
 		t.Fatal("quote at the floor not kept")
