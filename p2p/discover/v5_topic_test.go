@@ -1231,14 +1231,26 @@ func TestTopicRegHugeWaitTime(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		ticket []byte
-		quiet  time.Duration
+		check  func(t *testing.T, test *udpV5Test)
 	}{
-		// Dropped above budget, the registrar is asked again only on the next
-		// pass, after regloopMinTime. A wrapped wait would be clamped to 1s.
-		{"ticket", []byte("t"), 1500 * time.Millisecond},
+		// Dropped above budget, the registrar is asked again only as a first
+		// contact. A wrapped wait would be clamped and retried with the ticket.
+		{"ticket", []byte("t"), func(t *testing.T, test *udpV5Test) {
+			test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {
+				if len(p.Ticket) != 0 {
+					t.Errorf("maximal-wait ticket %x retried", p.Ticket)
+				}
+			})
+		}},
 		// Registered for an ad lifetime. A wrapped lifetime would expire at
 		// once and the next pass would register again.
-		{"ad lifetime", nil, 2*regloopMinTime + 500*time.Millisecond},
+		{"ad lifetime", nil, func(t *testing.T, test *udpV5Test) {
+			quiet := 2*regloopMinTime + 500*time.Millisecond
+			time.Sleep(quiet)
+			if q := pipeQueued(test); q != 0 {
+				t.Errorf("%d packets sent within %v of a maximal ad lifetime", q, quiet)
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1255,10 +1267,7 @@ func TestTopicRegHugeWaitTime(t *testing.T) {
 			test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
 				test.packetInFrom(key, a, &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 1, Ticket: tc.ticket, WaitTime: ^uint(0)})
 			})
-			time.Sleep(tc.quiet)
-			if q := pipeQueued(test); q != 0 {
-				t.Errorf("%d packets sent within %v of a maximal wait time", q, tc.quiet)
-			}
+			tc.check(t, test)
 		})
 	}
 }
