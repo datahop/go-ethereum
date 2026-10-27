@@ -451,6 +451,19 @@ func (a *arrivals) at(index uint64) time.Duration {
 	return time.Duration(ns)
 }
 
+// skipTo drops all arrivals before t.
+func (a *arrivals) skipTo(t time.Duration) {
+	if a.rate == 0 || a.next >= t {
+		return
+	}
+	if a.poisson {
+		a.next = t + a.gap()
+		return
+	}
+	a.index = uint64(math.Ceil(t.Seconds() * a.rate))
+	a.next = a.at(a.index)
+}
+
 // consume advances to the next arrival.
 func (a *arrivals) consume() {
 	a.index++

@@ -117,11 +117,17 @@ type engine struct {
 func newEngine(c config, w *workload) *engine {
 	s := newScheduler(c.Mode, c.Pacing)
 	poisson := c.Arrivals == "poisson"
-	return &engine{cfg: c, scheduler: s, workload: w,
+	e := &engine{cfg: c, scheduler: s, workload: w,
 		fresh:  newArrivals(c.FreshRate, poisson, c.Seed+5),
 		query:  newArrivals(c.QueryRate, poisson, c.Seed+6),
 		accept: relayCheck(queryRequester),
 		table:  topicindex.NewTopicTable(topicindex.Config{AdCacheSize: c.CacheSize, AdLifetime: c.Lifetime, Clock: s.clock})}
+	if c.Mode == "hybrid" {
+		// Queries do not change registrar state; simulating them during the
+		// warm-up only costs time (hours at high query rates).
+		e.query.skipTo(c.warmup())
+	}
+	return e
 }
 func (e *engine) eachCount(fn func(*counters)) {
 	fn(&e.total)

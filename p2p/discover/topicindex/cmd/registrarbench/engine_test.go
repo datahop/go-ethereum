@@ -300,6 +300,27 @@ func TestArrivalProcesses(t *testing.T) {
 	}
 }
 
+// Hybrid runs skip the (read-only) queries of the simulated warm-up.
+func TestArrivalsSkipTo(t *testing.T) {
+	d := newArrivals(2, false, 1)
+	d.skipTo(1250 * time.Millisecond)
+	if d.next != 1500*time.Millisecond || d.index != 3 {
+		t.Fatalf("deterministic skip: next %v index %d", d.next, d.index)
+	}
+	p := newArrivals(100, true, 7)
+	p.skipTo(time.Hour)
+	if p.next < time.Hour || p.next > time.Hour+time.Second {
+		t.Fatalf("poisson skip: next %v", p.next)
+	}
+	c := testConfig()
+	c.Mode = "hybrid"
+	c.Warmup = new(time.Duration)
+	*c.Warmup = 10 * time.Second
+	if e := newEngine(c, nil); e.query.next < 10*time.Second || e.fresh.next >= 10*time.Second {
+		t.Fatalf("hybrid engine: first query %v, first fresh arrival %v", e.query.next, e.fresh.next)
+	}
+}
+
 // Scarcity loses the arrival; it is never banked and the run is load-invalid.
 func TestScarcityIsNotBanked(t *testing.T) {
 	c := simConfig()
