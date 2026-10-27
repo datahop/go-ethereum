@@ -177,16 +177,16 @@ func (tab *TopicTable) isRegistered(n *enode.Node, t TopicID) bool {
 // has space available.
 func (tab *TopicTable) Add(n *enode.Node, topic TopicID) bool {
 	if tab.all.Len() < tab.config.AdCacheSize {
-		tab.add(n, topic)
+		tab.add(n, topic, tab.config.Clock.Now())
 		return true
 	}
 	return false
 }
 
-func (tab *TopicTable) add(n *enode.Node, topic TopicID) *topicTableEntry {
+func (tab *TopicTable) add(n *enode.Node, topic TopicID, now mclock.AbsTime) *topicTableEntry {
 	reg := &topicTableEntry{
 		node:  n,
-		exp:   tab.config.Clock.Now().Add(tab.config.AdLifetime),
+		exp:   now.Add(tab.config.AdLifetime),
 		topic: topic,
 	}
 	if tab.reg[topic] == nil {
@@ -336,12 +336,18 @@ func secondsToDuration(s float64) time.Duration {
 // Returns 0 if the node is admitted, otherwise the new wait time the
 // registrant should observe before retrying.
 func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration) time.Duration {
+	return tab.RegisterAt(n, t, waitTime, tab.config.Clock.Now())
+}
+
+// RegisterAt is Register as of now. A caller that credited waitTime at now
+// passes the same instant, so that the credit and the required wait are
+// compared at one time.
+func (tab *TopicTable) RegisterAt(n *enode.Node, t TopicID, waitTime time.Duration, now mclock.AbsTime) time.Duration {
 	// Reject attempt if node is already registered.
 	if tab.isRegistered(n, t) {
 		return 0
 	}
 
-	now := tab.config.Clock.Now()
 	requiredTime, comps := tab.waitTime(n, t, now)
 
 	// Check if the node has waited enough.
@@ -360,7 +366,7 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 		return tab.NextExpiryTime().Sub(now)
 	}
 
-	tab.add(n, t)
+	tab.add(n, t, now)
 	return 0
 }
 
