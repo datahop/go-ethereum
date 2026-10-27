@@ -172,36 +172,90 @@ func TestTopicTableWaitLowerBound(t *testing.T) {
 	}
 }
 
-// TestTopicTableWaitBoundGC checks that a topic's lower bound is recorded when a
-// wait ticket is issued and dropped when the topic's last ad leaves the cache.
+// fillAndQuote fills the cache with topic1 ads and has a fresh node register,
+// so that a wait ticket is issued and topic1's lower bound recorded. It returns
+// the advertisers and the recorded bound.
+func fillAndQuote(t *testing.T, tab *TopicTable, nads int) ([]*enode.Node, lowerBound) {
+	t.Helper()
+	var ads []*enode.Node
+	for i := 0; i < nads; i++ {
+		n := newNode()
+		if !tab.Add(n, topic1) {
+			t.Fatalf("could not add ad %d", i)
+		}
+		ads = append(ads, n)
+	}
+	if wt := tab.Register(newNode(), topic1, 0); wt <= topicTableWaitTimeFloor {
+		t.Fatalf("expected a wait ticket, got %v", wt)
+	}
+	b, ok := tab.wt.topicBounds[topic1]
+	if !ok {
+		t.Fatal("no lower bound recorded for topic1 after issuing a wait ticket")
+	}
+	return ads, b
+}
+
+// TestTopicTableWaitBoundSurvivesEmptyTopic checks that a topic's lower bound
+// still applies to a quote made after the topic's last ad has left the cache.
+func TestTopicTableWaitBoundSurvivesEmptyTopic(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	ads, b := fillAndQuote(t, tab, 4)
+	for _, n := range ads {
+		tab.RemoveNode(n.ID())
+	}
+	if tab.topicSize(topic1) != 0 {
+		t.Fatal("topic1 not emptied")
+	}
+
+	const elapsed = 10 * time.Second
+	simclock.Run(elapsed)
+	want := b.value - elapsed
+	if wt := tab.WaitTime(newNode(), topic1); wt < want {
+		t.Fatalf("wait time %v undercuts the remaining bound %v", wt, want)
+	}
+}
+
+// TestTopicTableWaitBoundGC drives Expire from NextExpiryTime, as the dispatch
+// loop does, with a bound that outlives the topic's ads: once they expire, the
+// bound is pruned when it decays and nothing is left scheduled.
 func TestTopicTableWaitBoundGC(t *testing.T) {
 	simclock := new(mclock.Simulated)
 	cfg := testConfig(t)
 	cfg.Clock = simclock
 	tab := NewTopicTable(cfg)
 
-	// Fill the cache with topic1 ads so the service component is large and
-	// Register issues a wait ticket instead of admitting immediately.
-	for i := 0; i < 16; i++ {
-		if !tab.Add(newNode(), topic1) {
-			t.Fatalf("could not add ad %d", i)
+	_, b := fillAndQuote(t, tab, 16)
+	if b.decayed() <= simclock.Now().Add(tab.AdLifetime()) {
+		t.Fatalf("bound %v does not outlive the ads", b.value)
+	}
+
+	alarm := mclock.NewAlarm(simclock)
+	defer alarm.Stop()
+	for next := tab.NextExpiryTime(); next != Never; next = tab.NextExpiryTime() {
+		if next > b.decayed() {
+			t.Fatalf("expiry scheduled at %v, after the bound decays at %v", next, b.decayed())
 		}
+		alarm.Schedule(next)
+		simclock.Run(next.Sub(simclock.Now()))
+		select {
+		case <-alarm.C():
+		default:
+			t.Fatal("expiry alarm did not fire")
+		}
+		tab.Expire()
 	}
-
-	m := newNode()
-	if wt := tab.Register(m, topic1, 0); wt <= topicTableWaitTimeFloor {
-		t.Fatalf("expected a wait ticket, got %v", wt)
+	if tab.all.Len() != 0 {
+		t.Fatalf("%d ads left", tab.all.Len())
 	}
-	if _, ok := tab.wt.topicBounds[topic1]; !ok {
-		t.Fatal("no lower bound recorded for topic1 after issuing a wait ticket")
-	}
-
-	// When all topic1 ads expire, the bound must be GC'd. Note: testConfig leaves
-	// AdLifetime unset, so read the effective value from the table.
-	simclock.Run(tab.AdLifetime() + time.Second)
-	tab.Expire()
 	if _, ok := tab.wt.topicBounds[topic1]; ok {
-		t.Fatal("lower bound not dropped after topic emptied")
+		t.Fatal("decayed lower bound not pruned")
+	}
+	if simclock.Now() != b.decayed() {
+		t.Fatalf("bound pruned at %v, want %v", simclock.Now(), b.decayed())
 	}
 }
 
