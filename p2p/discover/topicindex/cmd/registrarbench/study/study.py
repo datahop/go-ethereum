@@ -145,8 +145,12 @@ def run_metrics(meta, s, samples):
         "max_bounds_minus_topics": max((x["state"]["topic_bounds"] - x["state"]["occupied_topics"] for x in samples), default=0),
         "max_tree_nodes_per_entry": max((x["state"]["ipv4_tree_nodes"] / max(1, x["state"]["ipv4_entries"]) for x in samples), default=0),
         "max_utilisation": max((x["utilisation"] for x in samples), default=0),
+        "max_topic_ads": max((max(x["ads_per_topic"] or [0]) for x in meas), default=0),
+        "top_topic_cache_share": np.mean([x["ads_per_topic"][0] / x["state"]["occupancy"] for x in meas if x["state"]["occupancy"]]) if meas else float("nan"),
+        "top_topic_population_share": meta["topic_populations"][0] / sum(meta["topic_populations"]),
         "wrapped_waits": s["counts"]["abandoned_wrapped_wait"],
         "single_quote_share": s["counts"]["abandoned_single_quote"] / s["counts"]["abandoned_attempts"] if s["counts"]["abandoned_attempts"] else float("nan"),
+        "abandon_policy": meta["config"]["Abandon"],
         "capacity": C,
         "lifetime_s": E,
     }
@@ -274,7 +278,8 @@ def aggregate(runs, docs, figdir):
                                             "ipv4_tree_nodes", "topic_bounds", "effective_topic_bounds",
                                             "effective_ip_bounds", "occupied_topics", "max_bounds_minus_topics",
                                             "max_tree_nodes_per_entry", "max_utilisation", "occ_drift", "wait_drift",
-                                            "expired_retry_rps"]
+                                            "expired_retry_rps", "max_topic_ads", "top_topic_cache_share",
+                                            "top_topic_population_share", "single_quote_share"]
     summary = {}
     for exp, points in by_exp.items():
         def order(pm):
@@ -539,6 +544,7 @@ def memory(root, docs, figdir):
         # Analytic bound from the brief: C * (max encoded ENR 300 B + per-entry overhead).
         put(f"mem.{tag}.analytic_bound_mib", C * (300 + sh) / 2**20)
         put(f"mem.{tag}.measured_full_mib", C * ind / 2**20)
+        put(f"mem.{tag}.bound_ratio", ind / (300 + sh))
     ax.set_xlabel("occupancy (ads)")
     ax.set_ylabel("post-GC heap above empty table (MB)")
     ax.grid(alpha=.3)
@@ -756,6 +762,15 @@ def equilibrium_model():
     where x = T/(N+1) is the topic share and s the IP score."""
     for xs in (0.1, 0.25, 0.5, 1.0, 2.0):
         put(f"model.ustar.{xs}", 1 - (xs / 15) ** 0.1)
+        # Without the implementation's 0.1 factor (spec: E * occupancy * (...)).
+        put(f"model.ustar_spec.{xs}", 1 - (xs / 1.5) ** 0.1)
+    # The spec's safety constant G = 1e-7 (discv5-theory.md parameter table):
+    # its contribution E*G/(1-u)^10, and the occupancy above which it alone
+    # exceeds the implementation's 1 s admission floor.
+    E, G = 900.0, 1e-7
+    put("model.G_wait_empty_s", E * G)
+    put("model.G_wait_at_30pct_ms", 1e3 * E * G / 0.7 ** 10)
+    put("model.G_exceeds_floor_u", 1 - (E * G) ** 0.1)
 
 
 # ---------------------------------------------------------------- rendering
@@ -855,7 +870,9 @@ def main():
     allm = [m for v in runs.values() for m in v]
     if allm:
         put("sim.max_utilisation", max(m["max_utilisation"] for m in allm))
+        put("sim.max_utilisation_production", max(m["max_utilisation"] for m in allm if m["abandon_policy"] == "production"))
         put("sim.wrapped_waits", sum(m["wrapped_waits"] for m in allm))
+        put("sim.max_immediate_fraction", max(m["immediate_fraction"] for m in allm))
         put("sim.max_bounds_minus_topics", max(m["max_bounds_minus_topics"] for m in allm))
         put("sim.little_min", min(m["little_ratio"] for m in allm))
         put("sim.little_max", max(m["little_ratio"] for m in allm))
