@@ -1204,6 +1204,82 @@ func TestHandleRegtopicReplay(t *testing.T) {
 	}
 }
 
+// stepClock is a simulated clock that, while armed, moves forward by step after
+// every read.
+type stepClock struct {
+	*mclock.Simulated
+	step  time.Duration
+	armed atomic.Bool
+}
+
+func (c *stepClock) Now() mclock.AbsTime {
+	now := c.Simulated.Now()
+	if c.armed.Load() {
+		c.Run(c.step)
+	}
+	return now
+}
+
+// TestHandleRegtopicOneClock checks that handleRegtopic compares a ticket's
+// credit with the wait required at the same instant, however much the clock
+// moves while it handles the request.
+func TestHandleRegtopicOneClock(t *testing.T) {
+	t.Parallel()
+	clock := &stepClock{Simulated: new(mclock.Simulated), step: 10 * time.Second}
+	clock.Run(time.Hour)
+	test := newUDPV5TestClock(t, clock)
+	defer test.close()
+
+	// Quote a wait for the topic, then evict most of its ads: the topic's lower
+	// bound, which decays with time, now sets the required wait.
+	seeds := make([]*enode.Node, 4)
+	for i := range seeds {
+		seeds[i] = enode.NewV4(&newkey().PublicKey, net.IP{10, 0, 9, byte(i + 1)}, 30303, 30303)
+	}
+	seedTopicTable(t, test.udp, testTopic1, seeds...)
+	quoter, qaddr := newkey(), netip.MustParseAddrPort("10.0.3.1:30303")
+	test.packetInFrom(quoter, qaddr, &v5wire.Regtopic{
+		ReqID: []byte{1}, Topic: testTopic1,
+		ENR: signedRecord(t, quoter, qaddr.Addr(), netip.Addr{}, qaddr.Port()),
+	})
+	test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {
+		if len(p.Ticket) == 0 {
+			t.Fatal("quote did not issue a ticket")
+		}
+	})
+	for _, n := range seeds[1:] {
+		test.udp.evictTopicTableNode(n.ID())
+	}
+
+	// Present a ticket on time, crediting 5s less than the wait required now.
+	key, addr := newkey(), netip.MustParseAddrPort("10.0.1.1:30303")
+	rec := signedRecord(t, key, addr.Addr(), netip.Addr{}, addr.Port())
+	adv, err := enode.New(enode.ValidSchemesForTesting, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := clock.Now()
+	required := make(chan time.Duration, 1)
+	test.udp.onDispatchCh <- func() { required <- test.udp.topicTable.WaitTime(adv, testTopic1) }
+	credit := <-required - 5*time.Second
+	ticket := sealTicket(test, &topicindex.Ticket{
+		Topic:          testTopic1,
+		Node:           adv.ID(),
+		LastUsed:       now.Add(-time.Second),
+		WaitTimeIssued: time.Second,
+		FirstIssued:    now.Add(-credit),
+	})
+
+	clock.armed.Store(true)
+	test.packetInFrom(key, addr, &v5wire.Regtopic{ReqID: []byte{2}, Topic: testTopic1, Ticket: ticket, ENR: rec})
+	test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {
+		if len(p.Ticket) == 0 || p.WaitTime != waitTimeToMs(5*time.Second) {
+			t.Errorf("got ticket %d bytes, wait time %dms, want a ticket and 5000ms", len(p.Ticket), p.WaitTime)
+		}
+	})
+	clock.armed.Store(false)
+}
+
 // TestHandleRegtopicForeignTicket checks that a ticket is bound to the node it
 // was issued to: presented by another node it is worth nothing and is not used
 // up, so that its owner can still redeem it in its window.
