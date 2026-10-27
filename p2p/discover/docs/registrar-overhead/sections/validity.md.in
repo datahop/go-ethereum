@@ -1,0 +1,40 @@
+**Internal validity.**
+
+* Simulated results:
+  * every run satisfies Little's law within ±2% (range {{sim.little_min|f:3}}–{{sim.little_max|f:3}});
+  * {{sim.flagged|f:0}} of {{sim.runs|f:0}} runs are flagged, all of them with the `none`
+    abandonment policy (§10.2): population scarcity at 5 and 20 attempts/s, and
+    occupancy drift slightly above 5% in two runs at 1 attempt/s;
+  * no run was inadmissible ({{sim.excluded|f:0}} excluded).
+* Production code is identical across all result revisions (§5.5).
+* `TestHybridTableEquivalence` checks that the hybrid clock keeps expiry and lower
+  bounds consistent across the switch from simulated to real time.
+* `TestAbandonmentMatchesProductionClient` checks that the harness reproduces the
+  production client's abandonment decisions.
+
+**Construct validity.**
+
+* The advertiser model is the production client against **one** registrar. A real
+  advertiser that abandons goes to another registrar; here it returns only as a fresh
+  arrival, so the fresh-attempt rate stands for all advertisers that try this
+  registrar.
+* Advertisers hold one topic and do not renew.
+* Simulated arrivals are deterministic, so the CIs reflect seed variation in the
+  population (topics and addresses), not in arrival times.
+* Simulated runs cannot measure CPU, queueing or wall-clock throughput. Per-call
+  latencies recorded by the harness are quantised by the platform timer and serve only
+  as distributions (§5.1).
+* Registrar-core costs exclude the packet handler (§2). They are lower bounds on
+  per-request cost.
+
+**External validity.**
+
+* Single platform: Apple M5 under macOS. The P/E core of the worker thread cannot be
+  pinned or observed, so realtime results may mix core types.
+* F1 behaves differently on amd64 (§4.1); the simulated dynamics are unaffected
+  because no run approached the overflow threshold.
+* The empirical IP dataset is one snapshot of public addresses; the `diverse` and
+  `concentrated` distributions bracket it.
+* The `none`-policy runs assume that tickets stay valid for days. Production ticket
+  keys expire after 6 h (F3), so these runs overstate what a never-abandoning
+  advertiser could achieve.

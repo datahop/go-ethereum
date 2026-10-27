@@ -1,0 +1,30 @@
+`registrarbench` drives one `TopicTable` directly; the production registrar code is
+used unmodified. The workload:
+
+* **Advertiser population:** a fixed set of identities, generated before timing, each
+  with a signed ENR (IPv4, UDP port) and **one** topic drawn from a Zipf(α)
+  distribution over the topics.
+* **IP addresses** come from one of three distributions:
+  * `empirical`: rows of a public-IP dataset sampled with replacement (SHA-256
+    `{{sim.dataset_sha256|s}}`);
+  * `diverse`: unique random public IPv4 addresses;
+  * `concentrated`: random hosts in eight random /16 prefixes.
+* **Fresh registration attempts** arrive at a fixed rate and take the longest-idle
+  advertiser. Simulated runs use deterministic inter-arrival times; realtime runs use
+  Poisson arrivals. An arrival that finds no idle advertiser is counted as *population
+  scarcity*, not banked as credit, and makes the run *load-invalid*.
+* **Queries** (`RandomNodes(topic, 16, check)` with the production `TOPICQUERY` callback
+  `netutil.CheckRelayAddr`) arrive at a separate fixed rate, with the topic drawn from
+  the same Zipf distribution.
+* **Expiry:** `Expire` runs at `NextExpiryTime()`, like the production dispatch
+  timer. Ads due at the same instant expire in one call.
+
+The parameters of each experiment are listed in §10.1. The baseline is C = 1000 (the
+specification default), E = 15 min, 300 topics, α = 1, 200,000 advertisers, empirical
+IPs, 5 fresh attempts/s and 20 queries/s. Simulated runs last 18 h of logical time, of
+which the first 6 h are warm-up; the abandonment-policy runs last 72 h with 48 h of
+warm-up. State is sampled every 10 s.
+
+In simulated mode, queries do not change registrar state. The query-rate experiment
+(§10.1) gives identical dynamics at 1–1000 queries/s. Query load matters only for CPU
+(§6.4).

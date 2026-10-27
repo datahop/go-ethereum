@@ -1,0 +1,51 @@
+Configuration of each simulated experiment:
+
+{{table:sim_config}}
+
+Columns of the result tables:
+
+* occupancy: time-averaged occupancy;
+* admit/fresh, abandon/fresh: per fresh attempt;
+* wait frac: fraction of `REGTOPIC` answered with a wait;
+* req/admit: `REGTOPIC` per admission;
+* quote mean: mean quoted wait;
+* cum. wait: cumulative wait at admission, over admissions after waiting;
+* Little: time-averaged occupancy / (admission rate · E).
+
+Values are mean ± 95% CI over seeds.
+
+**demand**
+
+{{table:sim_demand}}
+
+**capacity**
+
+{{table:sim_capacity}}
+
+**abandon**
+
+{{table:sim_abandon}}
+
+**skew**
+
+{{table:sim_skew}}
+
+**ipdist**
+
+{{table:sim_ipdist}}
+
+**query**
+
+{{table:sim_query}}
+
+**bounded**
+
+{{table:sim_bounded}}
+
+**Microbenchmarks** (mean ± 95% CI over 10 runs)
+
+{{table:micro}}
+
+**Sleep vs spin pacing check**
+
+{{table:pacing}}

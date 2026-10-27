@@ -1,0 +1,64 @@
+![Occupancy, admission rate and abandonment vs demand](figures/occupancy_vs_demand.png)
+
+Full per-point tables (mean ± 95% CI over 5 seeds) are in §10.1. Every run satisfies
+Little's law: time-averaged occupancy / (admission rate · E) lies between
+{{sim.little_min|f:3}} and {{sim.little_max|f:3}}.
+
+**Two regimes.**
+
+* *Demand-limited:* every attempt is eventually admitted, and occupancy equals
+  λ_fresh · E. At C = 5000 this holds up to 1 fresh attempt/s:
+  {{demand.C5000-fresh1.time_avg_occupancy|ci:0}} ads, admission fraction
+  {{demand.C5000-fresh1.admit_fraction|f:3}}, no abandonment.
+* *Waiting-time-limited:* above that, occupancy saturates and extra demand is turned
+  away. At C = 1000 this regime already holds at 0.5 attempts/s:
+
+| fresh attempts/s | occupancy / C | admissions/s | abandoned / fresh | `REGTOPIC` per admission |
+|---|---|---|---|---|
+| {{demand.C1000-fresh0.5.fresh_attempt_rps|f:2}} | {{demand.C1000-fresh0.5.utilisation|ci:3}} | {{demand.C1000-fresh0.5.admission_rps|ci:3}} | {{demand.C1000-fresh0.5.abandon_fraction|ci:3}} | {{demand.C1000-fresh0.5.requests_per_admission|f:1}} |
+| {{demand.C1000-fresh5.fresh_attempt_rps|f:0}} | {{demand.C1000-fresh5.utilisation|ci:3}} | {{demand.C1000-fresh5.admission_rps|ci:3}} | {{demand.C1000-fresh5.abandon_fraction|ci:3}} | {{demand.C1000-fresh5.requests_per_admission|f:1}} |
+| {{demand.C1000-fresh100.fresh_attempt_rps|f:0}} | {{demand.C1000-fresh100.utilisation|ci:3}} | {{demand.C1000-fresh100.admission_rps|ci:3}} | {{demand.C1000-fresh100.abandon_fraction|ci:3}} | {{demand.C1000-fresh100.requests_per_admission|f:1}} |
+
+**Why the cache saturates near a quarter of C.** The production client gives up once
+its quoted waits exceed 1.5·E. Admission therefore stops growing at the occupancy u
+where a typical first quote reaches 1.5·E. Ignoring lower bounds and the 1 s floor, the
+implemented wait is 0.1·E·(x + s)/(1 − u)^10, with topic share x = T/(N+1) and IP score
+s. This gives
+
+    u* = 1 − ((x + s) / 15)^(1/10)
+
+which is {{model.ustar.0.25|pct:1}}, {{model.ustar.0.5|pct:1}}, {{model.ustar.1.0|pct:1}} and
+{{model.ustar.2.0|pct:1}} for x + s = 0.25, 0.5, 1 and 2. The measured equilibria of
+{{demand.C1000-fresh2.utilisation|pct:1}}–{{demand.C1000-fresh100.utilisation|pct:1}} (C = 1000) and
+{{demand.C5000-fresh2.utilisation|pct:1}}–{{demand.C5000-fresh100.utilisation|pct:1}} (C = 5000) fall in this
+range. Because of the 10th root, the equilibrium hardly depends on demand, on C, or on
+the workload (§6.5).
+
+**Waiting.**
+
+* Admitted advertisers waited a median of {{demand.C1000-fresh5.cumwait_waited_median_s|f:0}} s
+  (p95 {{demand.C1000-fresh5.cumwait_waited_p95_s|f:0}} s) at the baseline. Most
+  admissions happen shortly before the 1350 s attempt timeout.
+* At the baseline, {{demand.C1000-fresh5.single_quote_share|pct:0}} of abandonments come
+  from a single quote above 1.5·E; the rest from the sum of quotes.
+* The p95 quoted wait is {{demand.C1000-fresh5.quoted_wait_p95_s|f:0}} s. Quotes above E
+  are common because the registrar does not cap them (D5).
+* No wrapped waits occurred. No retry missed its ticket window; in simulated mode this
+  holds by construction.
+
+**Topic diversity.** The service term flattens the topic distribution. At the
+baseline, the most popular topic holds {{demand.C1000-fresh5.top_topic_population_share|pct:1}}
+of the advertisers but only {{demand.C1000-fresh5.top_topic_cache_share|ci:3}} of the
+cache. The largest topic list seen during measurement has
+{{demand.C1000-fresh5.max_topic_ads|f:0}} ads at the C = 1000 baseline and
+{{demand.C5000-fresh100.max_topic_ads|f:0}} at C = 5000 with 100 fresh attempts/s
+(mean over seeds). These T values are what the
+per-operation costs of §6.1 should be read at.
+
+![Occupancy vs capacity](figures/occupancy_vs_capacity.png)
+
+**Capacity.** Over C = 500 … 10,000 (§10.1, `capacity`) the occupancy fraction stays
+between {{capacity.C10000-fresh5.utilisation|pct:1}} and {{capacity.C500-fresh20.utilisation|pct:1}}. The
+admission rate scales with C:
+* {{capacity.C500-fresh20.admission_rps|f:2}}/s at C = 500;
+* {{capacity.C10000-fresh20.admission_rps|f:2}}/s at C = 10,000.

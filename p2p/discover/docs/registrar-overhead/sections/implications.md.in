@@ -1,0 +1,49 @@
+**Capacity planning.**
+
+1. *CPU.* The registrar core is cheap per request. Its cost is dominated by the topic
+   size T, not the cache size N, through two linear scans:
+   * the `Register` duplicate check;
+   * the full-topic `RandomNodes` walk.
+
+   With the waiting-time function active, T stays small: at most
+   {{demand.C1000-fresh5.max_topic_ads|f:0}} at the C = 1000 baseline. A query for a
+   large topic still costs O(T): {{micro.RandomNodes/N=5000/T=4096.ns|f:0}} ns at
+   T = 4096. Implementers SHOULD bound the `RandomNodes` work, for example by sampling
+   a fixed number of positions instead of filtering every entry, and SHOULD index the
+   duplicate check (a per-topic map keyed by node ID). All of this runs on the
+   Discovery v5 dispatch goroutine, so registrar throughput comes out of the same core
+   as the rest of the protocol (§6.4).
+2. *Memory.* Budget the decoded record size: up to
+   {{mem.C1000-empirical-maxenr.independent.bytes_per_ad|f:0}} B per ad, i.e.
+   {{mem.C5000-empirical-maxenr.independent.at_capacity_mib|f:1}} MiB for C = 5000.
+   Lower-bound state adds at most one ~{{mem.C1000-empirical.shared.bytes_per_topic_bound|f:0}} B
+   entry per occupied topic. The specification's storage argument holds, but its
+   constant should refer to decoded records.
+3. *Utilisation.* With the implemented waiting time and the production client, a
+   registrar fills to about a quarter of C, independent of demand (§6.2). Extra
+   demand only produces wait responses and abandoned attempts:
+   {{demand.C1000-fresh100.requests_per_admission|f:0}} `REGTOPIC` per admission at
+   {{demand.C1000-fresh100.fresh_attempt_rps|f:0}} attempts/s. Raising C raises the number
+   of cached ads proportionally, not the fraction.
+
+**Decisions for the specification editors** (§4.2):
+
+* The equilibrium occupancy is set by the 0.1 factor (D1), Pocc = 10 and the client's
+  attempt timeout (D10), through u* = 1 − ((x+s)·0.1/k)^(1/Pocc) for a timeout of k·E.
+  If a different target utilisation is intended, these three should be chosen
+  together.
+* Without the 0.1 factor, the same client would fill only
+  {{model.ustar_spec.0.5|pct:0}} of C (model, x + s = 0.5).
+* The specification should state the attempt timeout, or the intended utilisation,
+  because occupancy depends on it more than on any registrar parameter.
+* G (D3) is negligible next to the 1 s floor (D4); either may be dropped from the
+  specification or the implementation, as long as both agree.
+* A registrar-side cap on single quotes (D5) would bound quoted waits to E and remove
+  the overflow path of F1 at the same time.
+
+**Implementation fixes (not applied):**
+
+* F1: clamp the float wait before converting.
+* F2: make the IP-tree depth fixed (candidate on a separate branch).
+* F3: either cap waits below the ticket key lifetime, or keep keys for at least the
+  maximum wait.

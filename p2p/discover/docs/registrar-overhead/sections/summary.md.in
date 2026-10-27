@@ -1,0 +1,39 @@
+* **Per-request cost of the registrar core is small and topic-local.** A fresh
+  `REGTOPIC` that receives a wait ticket costs {{fit.RegisterFresh.T.small.intercept|f:0}} ns
+  plus {{fit.RegisterFresh.T.small.slope|f:2}} ns per cached ad of the requested topic
+  (T ≤ 256). An admitted retry costs about {{fit.RegisterRetryAdmit.N.all.intercept|f:0}} ns.
+  Neither depends on the total occupancy N. A `TOPICQUERY` lookup (`RandomNodes`) visits
+  **every** cached ad of the topic, {{fit.RandomNodes.T.all.slope|f:1}} ns each, regardless of
+  the 16-result limit: {{micro.RandomNodes/N=5000/T=16.ns|f:0}} ns at T = 16 and
+  {{micro.RandomNodes/N=5000/T=4096.ns|f:0}} ns at T = 4096. All registrar work runs on the
+  single Discovery v5 dispatch goroutine, so capacity is per core (§3.3).
+* **With production advertisers, occupancy settles at about a quarter of C, whatever
+  the demand.** The production client abandons an attempt once its quoted waits exceed
+  1.5·E. At C = 1000, as fresh demand grows 400-fold
+  ({{demand.C1000-fresh0.25.fresh_attempt_rps|f:2}} to {{demand.C1000-fresh100.fresh_attempt_rps|f:0}}
+  attempts/s), the time-averaged occupancy rises only from
+  {{demand.C1000-fresh0.25.utilisation|pct:1}} to {{demand.C1000-fresh100.utilisation|pct:1}} of C.
+  Admissions saturate at {{demand.C1000-fresh100.admission_rps|f:2}}/s. Further demand
+  turns into abandoned attempts ({{demand.C1000-fresh100.abandon_fraction|pct:1}} of fresh
+  attempts) and into extra requests: {{demand.C1000-fresh100.requests_per_admission|f:0}}
+  `REGTOPIC` per admission. A one-line model of the waiting-time function predicts
+  {{model.ustar.1.0|pct:0}}–{{model.ustar.0.25|pct:0}} (§6.2). Admitted advertisers waited a median of
+  {{demand.C1000-fresh5.cumwait_waited_median_s|f:0}} s (p95 {{demand.C1000-fresh5.cumwait_waited_p95_s|f:0}} s;
+  E = 900 s).
+* **Memory is dominated by the decoded ENR.** Each cached ad costs
+  {{mem.C1000-empirical.independent.bytes_per_ad|ci:0}} B with typical records and
+  {{mem.C1000-empirical-maxenr.independent.bytes_per_ad|f:0}} B with maximum-size (300-byte)
+  records. A full production-default cache (C = 5000) of maximum-size records holds
+  {{mem.C5000-empirical-maxenr.independent.at_capacity_mib|f:1}} MiB. The analytic bound
+  C·(300 B + overhead) underestimates this by a factor of
+  {{mem.C5000-empirical-maxenr.bound_ratio|f:1}}. The admission state is
+  bounded by the cache contents in every run and test (§6.6).
+* **Two production defects** (§4.1):
+  * the waiting time overflows int64 above about {{findings.arm64.threshold_min|f:0}}/1000
+    occupancy (admission without waiting on amd64, a wrapped wait on arm64); this is
+    unreachable with production advertisers (highest sampled occupancy
+    {{sim.max_utilisation_production|pct:0}});
+  * IP-similarity scores depend on insertion history and deviate from the specification.
+* Ten specification–implementation differences are listed for decision (§4.2). The 0.1
+  scale factor and the client's 1.5·E attempt timeout together set the equilibrium
+  occupancy; the missing G term is negligible.

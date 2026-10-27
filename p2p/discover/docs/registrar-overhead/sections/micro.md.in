@@ -1,0 +1,38 @@
+`testing.B` benchmarks (`topicindex/bench_test.go`) were run natively on arm64, 10 runs
+each; values are mean ± 95% CI. N is the cache occupancy and T the number of cached ads
+for the requested topic. Full table: §10.1.
+
+![Per-operation cost](figures/microbench_complexity.png)
+
+{{table:micro_fits}}
+
+* **`Register`, fresh ad receiving a wait ticket.** {{fit.RegisterFresh.T.small.intercept|f:0}} ns
+  + {{fit.RegisterFresh.T.small.slope|f:2}} ns·T for T ≤ 256, independent of N
+  ({{micro.RegisterFresh/N=100/T=16.ns|f:0}} ns at N = 100, {{micro.RegisterFresh/N=10000/T=16.ns|f:0}} ns at N = 10,000).
+  The T term is the duplicate check, a linear scan of the topic's linked list. Beyond
+  T ≈ 256 the scan leaves the cache and costs {{fit.RegisterFresh.T.all.slope|f:1}} ns per entry
+  ({{micro.RegisterFresh/N=5000/T=4096.ns|f:0}} ns at T = 4096). Each call allocates
+  {{micro.RegisterFresh/N=5000/T=16.bytes|f:0}} B in {{micro.RegisterFresh/N=5000/T=16.allocs|f:0}} objects.
+* **Duplicate `Register`** (the ad is already cached) stops at the duplicate check:
+  {{micro.RegisterDuplicate/N=5000/T=1.ns|f:1}} ns at T = 1, {{fit.RegisterDuplicate.T.small.slope|f:2}} ns per entry, no allocations.
+* **Admitted retry** (insertion into the lists and the IP tree):
+  {{fit.RegisterRetryAdmit.N.all.intercept|f:0}} ns, independent of N.
+* **`RandomNodes(topic, 16, check)`** visits every ad of the topic: reservoir sampling
+  plus one `netutil.CheckRelayAddr` call per entry, at {{fit.RandomNodes.T.all.slope|f:1}} ns per
+  entry. The 16-result limit does not bound the work. An empty topic costs
+  {{micro.RandomNodes/N=5000/T=0.ns|f:1}} ns.
+* **`Expire`**, in steady state: {{micro.Expire/N=5000/k=1000.ns_per_entry|ci:0}} ns per expired
+  entry in batches of 1000, and {{micro.Expire/N=5000/k=1.ns|ci:0}} ns for a single entry. Each
+  entry costs {{micro.Expire/N=5000/k=1.allocs|f:0}} allocations.
+* **IP score** (tree walk): {{micro.IPScore/shape=diverse/N=10.ns|f:0}}–{{micro.IPScore/shape=diverse/N=100000.ns|f:0}} ns
+  for 10–100,000 addresses, logarithmic in N.
+* **`RemoveNode`** scans the whole cache: {{fit.RemoveNode.N.all.slope|f:2}} ns·N.
+
+The allocation audit of the simulated baseline (C = 1000, 5 fresh/s, 20 queries/s,
+independent ENR copies; 3 seeds) gives the per-call averages under the realistic
+operation mix:
+
+{{table:audit}}
+
+Per expired entry this is {{audit.expiry_bytes_per_entry|ci:0}} B in
+{{audit.expiry_allocations_per_entry|f:2}} allocations, matching the microbenchmark.

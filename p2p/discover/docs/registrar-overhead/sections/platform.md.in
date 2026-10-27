@@ -1,0 +1,17 @@
+| item | value |
+|---|---|
+| CPU | {{sim.platform.cpu_model|s}} ({{sim.platform.performance_cores|s}} performance + {{sim.platform.efficiency_cores|s}} efficiency cores) |
+| OS / architecture | {{sim.platform.goos|s}}/{{sim.platform.goarch|s}}, native (Rosetta 2 translated: {{sim.platform.rosetta_translated|s}}) |
+| Go | {{sim.platform.go_version|s}} |
+| timer resolution | {{sim.platform.timer_resolution_ns|s}} ns |
+| core type of the worker | not observable on macOS |
+
+The installed Go toolchain is darwin/amd64. All study binaries were therefore built
+with `GOARCH=arm64`, and each run records `sysctl.proc_translated`. Earlier results
+were produced by amd64 binaries under Rosetta 2; they are not used here.
+
+Results come from these revisions. The production registrar code
+(`topicindex/*.go` except tests and `stats.go`) is identical across all of them
+(checked with `git diff` by `study.py`):
+
+{{table:revisions}}

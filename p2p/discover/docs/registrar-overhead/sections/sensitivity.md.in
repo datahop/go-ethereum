@@ -1,0 +1,53 @@
+All points use C = 1000, 5 fresh attempts/s and 20 queries/s unless stated otherwise;
+per-point tables are in §10.1.
+
+**Advertiser abandonment policy.** These runs last 72 h with 48 h of warm-up and 10⁶
+advertisers.
+
+| fresh attempts/s | policy | occupancy / C | admissions/s | abandoned / fresh | cumulative wait at admission, median / p95 (s) |
+|---|---|---|---|---|---|
+| 1 | production | {{abandon.C1000-fresh1-production.utilisation|ci:3}} | {{abandon.C1000-fresh1-production.admission_rps|f:3}} | {{abandon.C1000-fresh1-production.abandon_fraction|f:3}} | {{abandon.C1000-fresh1-production.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh1-production.cumwait_waited_p95_s|f:0}} |
+| 1 | spec (single quote > E) | {{abandon.C1000-fresh1-spec.utilisation|ci:3}} | {{abandon.C1000-fresh1-spec.admission_rps|f:3}} | {{abandon.C1000-fresh1-spec.abandon_fraction|f:3}} | {{abandon.C1000-fresh1-spec.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh1-spec.cumwait_waited_p95_s|f:0}} |
+| 1 | none | {{abandon.C1000-fresh1-none.utilisation|ci:3}} | {{abandon.C1000-fresh1-none.admission_rps|f:3}} | {{abandon.C1000-fresh1-none.abandon_fraction|f:3}} | {{abandon.C1000-fresh1-none.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh1-none.cumwait_waited_p95_s|f:0}} |
+| 20 | production | {{abandon.C1000-fresh20-production.utilisation|ci:3}} | {{abandon.C1000-fresh20-production.admission_rps|f:3}} | {{abandon.C1000-fresh20-production.abandon_fraction|f:3}} | {{abandon.C1000-fresh20-production.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh20-production.cumwait_waited_p95_s|f:0}} |
+| 20 | spec (single quote > E) | {{abandon.C1000-fresh20-spec.utilisation|ci:3}} | {{abandon.C1000-fresh20-spec.admission_rps|f:3}} | {{abandon.C1000-fresh20-spec.abandon_fraction|f:3}} | {{abandon.C1000-fresh20-spec.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh20-spec.cumwait_waited_p95_s|f:0}} |
+| 20 | none † | {{abandon.C1000-fresh20-none.utilisation|ci:3}} | {{abandon.C1000-fresh20-none.admission_rps|f:3}} | {{abandon.C1000-fresh20-none.abandon_fraction|f:3}} | {{abandon.C1000-fresh20-none.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh20-none.cumwait_waited_p95_s|f:0}} |
+
+† Population-limited: with waits of days, all 10⁶ advertisers are busy, and only
+{{abandon.C1000-fresh20-none.fresh_attempt_rps|f:2}} of the configured 20 attempts/s
+find an idle advertiser. All `none` runs at 5 and 20 attempts/s are flagged (§10.2).
+
+* The `spec` policy drops single quotes above E, which is stricter than production's
+  1.5·E. But it has no cumulative limit: advertisers that keep receiving quotes ≤ E
+  stay. Occupancy is the same at 1 attempt/s and slightly higher at 5 and 20
+  attempts/s;
+  the p95 cumulative wait exceeds 1.5·E.
+* Without abandonment, occupancy roughly doubles. This comes at waits of more than a
+  day: the median cumulative wait at admission is
+  {{abandon.C1000-fresh1-none.cumwait_waited_median_s|f:0}} s at 1 attempt/s. Such waits
+  also outlive the ticket keys (F3), which the harness does not model.
+* The attempt timeout is therefore the parameter that controls registrar utilisation.
+
+**Topic popularity skew** (Zipf α over 300 topics):
+* occupancy: {{skew.C1000-fresh5-alpha0.utilisation|ci:3}} at α = 0,
+  {{skew.C1000-fresh5-alpha1.5.utilisation|ci:3}} at α = 1.5;
+* share of the cache held by the most popular topic: {{skew.C1000-fresh5-alpha1.5.top_topic_cache_share|f:3}},
+  against {{skew.C1000-fresh5-alpha1.5.top_topic_population_share|f:3}} of the advertisers, at α = 1.5.
+
+**IP address distribution:**
+
+| distribution | occupancy / C |
+|---|---|
+| concentrated (8 /16s) | {{ipdist.C1000-fresh5-concentrated.utilisation|ci:3}} |
+| empirical | {{ipdist.C1000-fresh5-empirical.utilisation|ci:3}} |
+| diverse | {{ipdist.C1000-fresh5-diverse.utilisation|ci:3}} |
+
+The IP term shifts the equilibrium as the model predicts (larger s, lower u*).
+
+**Query rate** (1–1000 queries/s): no effect on the dynamics, which are identical to
+all printed digits. Queries affect only CPU.
+
+**Capacity:** see §6.2.
+
+**IP-tree fix (F2), A/B:** *pending.* This will run after the realtime block on
+branch `registrar-overhead-iptree-fix`, at three configurations.

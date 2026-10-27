@@ -1,0 +1,39 @@
+Bytes per cached ad are the slope of the post-GC live heap against occupancy. The
+table is filled with `TopicTable.Add` at 0–100% of C, five repetitions. It is measured
+two ways:
+
+* `independent`: each ad holds its own decoded `enode.Node`, as in production, where
+  `handleRegtopic` decodes the ENR from the packet;
+* `shared`: the ENR is shared, so only the registrar's own structures are charged.
+
+![Heap vs occupancy](figures/memory_fill.png)
+
+{{table:memory}}
+
+Per ad, at C = 1000 with empirical addresses:
+
+* **Registrar structures:** {{mem.C1000-empirical.shared.bytes_per_ad|ci:0}} B (list
+  entries, IP-tree share, map entries).
+* **Decoded ENR:** {{mem.C1000-empirical.enr_copy_bytes|f:0}} B for a
+  {{mem.C1000-empirical.encoded_enr_bytes|f:0}}-byte record, and
+  {{mem.C1000-empirical-maxenr.enr_copy_bytes|f:0}} B for a 300-byte record (padded with an
+  opaque entry). An `enode.Node` keeps the raw RLP, the signature and every key/value pair as separate
+  slices (`enr.Record`), plus the decoded endpoint, so it costs several times the encoded
+  size.
+* **IP tree:** {{mem.C1000-empirical.independent.tree_nodes_per_ad|f:2}} IPv4 vertices per ad
+  with empirical addresses, {{mem.C1000-diverse.independent.tree_nodes_per_ad|f:2}} with
+  diverse ones.
+* **Topic lower bound:** {{mem.C1000-empirical.shared.bytes_per_topic_bound|ci:0}} B per
+  bound.
+
+At full occupancy:
+
+| C | records | measured | brief's bound C·(300 B + registrar overhead) |
+|---|---|---|---|
+| 1000 | typical | {{mem.C1000-empirical.measured_full_mib|f:2}} MiB | {{mem.C1000-empirical.analytic_bound_mib|f:2}} MiB |
+| 1000 | 300-byte | {{mem.C1000-empirical-maxenr.measured_full_mib|f:2}} MiB | {{mem.C1000-empirical-maxenr.analytic_bound_mib|f:2}} MiB |
+| 5000 | 300-byte | {{mem.C5000-empirical-maxenr.measured_full_mib|f:2}} MiB | {{mem.C5000-empirical-maxenr.analytic_bound_mib|f:2}} MiB |
+
+The bound should be stated in terms of the decoded record size, not the encoded one.
+At the measured equilibrium occupancy (§6.2), actual memory is about a quarter of these
+figures.

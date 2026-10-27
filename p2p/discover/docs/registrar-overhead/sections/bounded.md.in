@@ -1,0 +1,25 @@
+Registrar state other than the ad cache must stay bounded by the cache contents in
+normal operation. The specification relies on this (rationale: *Bounded Registrar
+Storage*; lower bounds are kept only for services and prefixes that have cached ads).
+Checks:
+
+* **Tests** (`topicindex/bounded_state_test.go`):
+  * `TestBoundedLowerBoundState`: issuing wait tickets does not add IP-tree vertices;
+    topic lower bounds never outnumber occupied topics; and all admission state is
+    released once every ad has expired.
+  * `TestFullCacheWait`: a full cache answers with the time until the next expiry.
+* **Sweeps:** in every sample of every simulated run ({{sim.runs|f:0}} runs, 10 s samples), the
+  number of topic lower bounds minus the number of occupied topics was at most
+  {{sim.max_bounds_minus_topics|f:0}}.
+* **Stress configuration** (§10.1, `bounded`): 50,000 topics, uniform popularity,
+  unique addresses. Most requests then name a topic that has no cached ad.
+
+| fresh attempts/s | occupied topics | topic lower bounds | IPv4 tree vertices | max IPv4 vertices per cached address |
+|---|---|---|---|---|
+| 5 | {{bounded.C1000-fresh5-topics50000-uniform-diverse.occupied_topics|ci:0}} | {{bounded.C1000-fresh5-topics50000-uniform-diverse.topic_bounds|ci:0}} | {{bounded.C1000-fresh5-topics50000-uniform-diverse.ipv4_tree_nodes|ci:0}} | {{bounded.C1000-fresh5-topics50000-uniform-diverse.max_tree_nodes_per_entry|f:2}} |
+| 50 | {{bounded.C1000-fresh50-topics50000-uniform-diverse.occupied_topics|ci:0}} | {{bounded.C1000-fresh50-topics50000-uniform-diverse.topic_bounds|ci:0}} | {{bounded.C1000-fresh50-topics50000-uniform-diverse.ipv4_tree_nodes|ci:0}} | {{bounded.C1000-fresh50-topics50000-uniform-diverse.max_tree_nodes_per_entry|f:2}} |
+
+Lower-bound state is bounded by the occupied topics and by the IP-tree vertices of
+cached addresses. Pending registrations hold no registrar state: the ticket carries it.
+Ticket MAC keys are the only other state: one key per 100,000 tickets, collected after
+6 h.

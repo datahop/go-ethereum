@@ -1,0 +1,28 @@
+Advertisers behave like the production client, `topicindex.Registration.HandleTicketResponse`
+(`--abandon production`; `TestAbandonmentMatchesProductionClient` checks the harness
+against the production state machine):
+
+1. The first request carries no ticket. A wait response is decoded as on the wire:
+   ceil-milliseconds, then `time.Duration(ms) * time.Millisecond`.
+2. The advertiser **drops the attempt if a single quote exceeds `RegAttemptTimeout`**
+   (1.5·E = 22.5 min). Otherwise it adds the quote to its running sum and **drops the
+   attempt if the sum exceeds `RegAttemptTimeout`**. Both comparisons are strict. Since
+   the registrar credits the time since the first ticket, the sum of quotes is the
+   advertiser's own estimate of its cumulative wait.
+3. A continuing advertiser retries exactly when its wait ends. The ticket window
+   `[due, due + 5 s)` is respected; a retry served late is counted as expired.
+4. **An abandoning advertiser leaves this registrar.** It goes to the back of the idle
+   queue and can come back only through a later fresh arrival, which starts a new
+   attempt with no credit. (In a network, it would try another registrar instead.)
+5. An admitted advertiser stays busy until its ad expires; renewals are not modelled.
+
+Two sensitivity policies (§6.5):
+
+* `spec` drops an attempt when a single quote exceeds E, following "a single waiting
+  interval SHOULD NOT exceed E". It has no cumulative limit.
+* `none` never abandons, as in the original harness.
+
+Every run reports the abandonment rate (per second and as a fraction of fresh
+attempts), with the reason (single quote, cumulative, or wrapped wait). It also reports
+the cumulative wait at admission (median and p95), both over all admissions and over
+admissions after at least one wait.

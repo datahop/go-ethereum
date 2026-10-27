@@ -1,0 +1,10 @@
+* **Wire-level handler benchmark.** `handleRegtopic` and `handleTopicQuery` add costs
+  on top of the registrar core: packet decoding, ENR signature verification, ticket MAC
+  and encoding, and `NODES` responses. This study measures only the core (§2).
+* **Multi-registrar behaviour:** where abandoning advertisers go next, and the
+  network-level effect of the low equilibrium occupancy.
+* **Renewals, multi-topic advertisers, IPv6 addresses** and advertisers that change
+  their ENR during an attempt (D6).
+* **Another platform** (Linux/x86-64 server), where the core type can be pinned and
+  the amd64 overflow behaviour of F1 applies natively.
+* **Adversarial workloads** (out of scope by design).

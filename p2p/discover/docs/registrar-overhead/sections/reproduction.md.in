@@ -1,0 +1,19 @@
+All scripts are in `topicindex/cmd/registrarbench/study/` and run from `p2p/discover`.
+Study binaries are built by `build.sh`. It refuses to build if a tracked file is
+modified, stamps the git revision into the binary, and checks that the binary is native.
+
+| step | script | output (under `results/registrar-overhead/`) |
+|---|---|---|
+| microbenchmarks (§6.1) | `run_microbench.sh results/registrar-overhead/microbench` | `microbench/bench.txt`, `env.json` |
+| memory fill and allocation audit (§6.1, §6.3) | `run_memory_audit.sh results/registrar-overhead` | `memfill/*.jsonl`, `audit/*.jsonl` |
+| simulated sweeps (§6.2, §6.5, §6.6) | `run_sweeps.py results/registrar-overhead --seeds 5 --jobs 6` | `sim/<experiment>/<point>/seed<k>.jsonl` |
+| findings tests (§4.1) | `run_findings.sh results/registrar-overhead` | `findings/{arm64,amd64}{,-strict}.txt` |
+| pacing check (§6.4) | `run_pacing.sh results/registrar-overhead` | `pacing/*.jsonl` |
+| **tables, figures, this document** | `regenerate.sh` | `docs/registrar-overhead/{generated,figures}/`, `registrar-overhead.md` |
+
+`regenerate.sh` reads only result files. It checks every run for admissibility (platform
+record, native, clean known revision, schema ≥ 6) and validity (§5.4). It fails if the
+template references a value that the results do not provide.
+
+The empirical IP dataset is `results/data/dnslist-ipv4.txt`; its SHA-256 is recorded in
+every run (§5.2). Raw JSONL results are not committed (`.gitignore`).
