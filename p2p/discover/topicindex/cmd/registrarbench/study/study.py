@@ -8,6 +8,8 @@ Reads
     <results-root>/sim/<experiment>/<point>/seed<k>.jsonl   simulated runs
     <results-root>/memfill/*.jsonl                          controlled-fill memory runs
     <results-root>/microbench/bench.txt, env.json           testing.B output
+    <results-root>/audit/*.jsonl                            allocation audits
+    <results-root>/pacing/*.jsonl                           sleep vs spin pacing check
     <results-root>/realtime/<experiment>/<point>/*.jsonl    realtime / hybrid runs
 and writes
     <docs-dir>/generated/*.csv, *.md, values.json           tables and scalar values
@@ -143,6 +145,8 @@ def run_metrics(meta, s, samples):
         "max_bounds_minus_topics": max((x["state"]["topic_bounds"] - x["state"]["occupied_topics"] for x in samples), default=0),
         "max_tree_nodes_per_entry": max((x["state"]["ipv4_tree_nodes"] / max(1, x["state"]["ipv4_entries"]) for x in samples), default=0),
         "max_utilisation": max((x["utilisation"] for x in samples), default=0),
+        "wrapped_waits": s["counts"]["abandoned_wrapped_wait"],
+        "single_quote_share": s["counts"]["abandoned_single_quote"] / s["counts"]["abandoned_attempts"] if s["counts"]["abandoned_attempts"] else float("nan"),
         "capacity": C,
         "lifetime_s": E,
     }
@@ -544,6 +548,216 @@ def memory(root, docs, figdir):
     write_md_table(os.path.join(gen, "memory.md"), ["run", "ENR", "C", "bytes per cached ad", "IPv4 tree vertices per ad", "bytes per topic bound", "MiB at occupancy = C"], md)
 
 
+def audit(root, docs):
+    """Allocation audit: bytes and allocations per registrar call, across seeds."""
+    paths = sorted(glob.glob(os.path.join(root, "audit", "*.jsonl")))
+    per = defaultdict(list)
+    for path in paths:
+        meta, s, _, _ = read_run(path)
+        if admissibility(meta) or not s:
+            continue
+        for k, v in s["audit_per_operation"].items():
+            per[k].append(v)
+        c = s["counts"]
+        per["expiry_bytes_per_entry"].append(c["expiry_alloc_bytes"] / c["expired_entries"])
+        per["expiry_allocations_per_entry"].append(c["expiry_allocations"] / c["expired_entries"])
+    rows = []
+    for k, xs in sorted(per.items()):
+        m = ci(xs)
+        put(f"audit.{k}", {"mean": m[0], "ci": m[1], "n": m[2]})
+        rows.append([k.replace("_", " "), fmt_ci(m[0], m[1], 2), m[2]])
+    if rows:
+        write_md_table(os.path.join(docs, "generated", "audit.md"), ["quantity per call", "mean ± 95% CI", "seeds"], rows)
+
+
+def op_latencies(path):
+    """Per-operation latency (ns) and queue delay from the raw operation records."""
+    lat, qd = defaultdict(list), []
+    with open(path) as f:
+        for line in f:
+            if '"type":"operation"' not in line:
+                continue
+            r = json.loads(line)
+            lat[r["operation"]].append(r["latency_ns"])
+            qd.append(r["queue_delay_ns"])
+    return {k: np.array(v) for k, v in lat.items()}, np.array(qd)
+
+
+def pacing(root, docs):
+    """Sleep vs spin pacing check (hybrid runs with raw operation records)."""
+    paths = sorted(glob.glob(os.path.join(root, "pacing", "*.jsonl")))
+    rows = []
+    for path in paths:
+        meta, s, _, _ = read_run(path)
+        if admissibility(meta) or not s:
+            continue
+        tag = os.path.basename(path).replace(".jsonl", "")
+        lat, qd = op_latencies(path)
+        put(f"pacing.{tag}.cpu_percent", s["cpu_percent_one_core"])
+        put(f"pacing.{tag}.cpu_us_per_op", s["cpu_us_per_operation"])
+        put(f"pacing.{tag}.requests_per_s", s["rates"]["registration_rps"] + s["rates"]["query_rps"])
+        put(f"pacing.{tag}.performance_valid", s["performance_valid"])
+        put(f"pacing.{tag}.queue_delay_p50_us", float(np.percentile(qd, 50)) / 1e3)
+        put(f"pacing.{tag}.queue_delay_p99_us", float(np.percentile(qd, 99)) / 1e3)
+        for op in ("registration", "query"):
+            x = lat.get(op)
+            if x is None or not len(x):
+                continue
+            for q in (0, 50, 99):
+                put(f"pacing.{tag}.{op}.p{q}_us", float(np.percentile(x, q)) / 1e3)
+            put(f"pacing.{tag}.{op}.mean_us", float(x.mean()) / 1e3)
+            rows.append([tag, op, len(x), fmt_num(np.min(x) / 1e3, 2), fmt_num(np.median(x) / 1e3, 2), fmt_num(np.percentile(x, 99) / 1e3, 2), fmt_num(x.mean() / 1e3, 2),
+                         fmt_num(np.percentile(qd, 50) / 1e3, 2), fmt_num(s["cpu_percent_one_core"], 1)])
+    if rows:
+        write_md_table(os.path.join(docs, "generated", "pacing.md"),
+                       ["run", "operation", "calls", "min µs", "p50 µs", "p99 µs", "mean µs", "queue delay p50 µs (all ops)", "process CPU % of one core"], rows)
+
+
+CONFIG_COLS = [("CacheSize", "C"), ("Lifetime", "E"), ("FreshRate", "fresh/s"), ("QueryRate", "query/s"), ("Advertisers", "advertisers"),
+               ("Topics", "topics"), ("Alpha", "Zipf α"), ("IPDist", "IP dist."), ("Abandon", "abandon"), ("Arrivals", "arrivals"),
+               ("Duration", "duration"), ("Warmup", "warm-up")]
+
+
+def fmt_cfg(k, v):
+    if k in ("Lifetime", "Duration", "Warmup"):
+        sec = v / 1e9
+        return f"{sec / 3600:g} h" if sec >= 3600 else f"{sec / 60:g} min"
+    return str(v)
+
+
+def cfg_sort_key(x):
+    try:
+        return (0, float(x.split()[0]), x)
+    except ValueError:
+        return (1, 0, x)
+
+
+def sim_config(meta_of, docs):
+    """Per experiment: the parameters that vary across its points, and the fixed ones."""
+    by_exp = defaultdict(list)
+    for (exp, point), meta in sorted(meta_of.items()):
+        by_exp[exp].append(meta["config"])
+    rows = []
+    for exp, cfgs in by_exp.items():
+        varied = [label + " ∈ {" + ", ".join(sorted({fmt_cfg(k, c[k]) for c in cfgs}, key=cfg_sort_key)) + "}" for k, label in CONFIG_COLS if len({str(c[k]) for c in cfgs}) > 1]
+        fixed = [f"{label} = {fmt_cfg(k, cfgs[0][k])}" for k, label in CONFIG_COLS if len({str(c[k]) for c in cfgs}) == 1]
+        rows.append([exp, len(cfgs), "; ".join(varied), "; ".join(fixed)])
+    write_md_table(os.path.join(docs, "generated", "sim_config.md"), ["experiment", "points", "varied", "fixed"], rows)
+
+
+PRODUCTION = ["topicindex", ":(exclude)topicindex/cmd", ":(exclude)topicindex/*_test.go", ":(exclude)topicindex/stats.go"]
+
+
+def revisions(root, docs):
+    """Lists the revisions that produced the results and checks that the
+    production registrar code is identical across them."""
+    import subprocess
+    revs = defaultdict(list)
+    for path in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
+        with open(path) as f:
+            meta = json.loads(f.readline())
+        if meta.get("type") == "metadata" and "platform" in meta:
+            revs[meta["platform"]["revision"]].append(os.path.relpath(path, root).split(os.sep)[0])
+    env = os.path.join(root, "microbench", "env.json")
+    if os.path.exists(env):
+        revs[json.load(open(env))["revision"]].append("microbench")
+    if not revs:
+        return
+    ref = sorted(revs)[0]
+    rows, same = [], True
+    for rev, where in sorted(revs.items()):
+        diff = subprocess.run(["git", "diff", "--quiet", ref, rev, "--"] + PRODUCTION, capture_output=True).returncode
+        same = same and diff == 0
+        rows.append([rev[:12], ", ".join(f"{k} ({where.count(k)})" for k in sorted(set(where))), "identical" if diff == 0 else "DIFFERS"])
+    put("revisions.count", len(revs))
+    put("revisions.production_identical", "yes" if same else "no")
+    write_md_table(os.path.join(docs, "generated", "revisions.md"), ["revision", "results (files)", f"production registrar code vs {ref[:12]}"], rows)
+
+
+OCC_RE = re.compile(r"\s(\d+)% (\S+)\s+WaitTime=(\S+)\s+Register=(\S+)\s+admitted=(\w+)\s+wire=(\d+)ms client=(\S+) ticket=(.*?) topicBounds=(\d+)")
+IP_RE = re.compile(r"(\S+)/(\S+)\s+scores differing from spec:\s+(\d+)/(\d+) \(mean \|diff\| ([\d.]+)\); tree vertices with wrong counter: (\d+)/(\d+)")
+
+
+def short_duration(d):
+    """Abbreviates a Go duration string to its leading unit."""
+    m = re.match(r"(-?)(\d+)h", d)
+    if m:
+        h = int(m.group(2))
+        return f"{m.group(1)}{h / 8766:,.0f} y" if h >= 8766 else f"{m.group(1)}{h:,} h"
+    return d
+
+
+def findings(root, docs):
+    """Parses the conformance and high-occupancy test logs (run_findings.sh)."""
+    gen = os.path.join(docs, "generated")
+    occ = defaultdict(dict)
+    for path in sorted(glob.glob(os.path.join(root, "findings", "*.txt"))):
+        arch = os.path.basename(path).replace(".txt", "")
+        text = open(path).read()
+        head = text.splitlines()[0]
+        put(f"findings.{arch}.header", head)
+        if "dirty=false" not in head:
+            print(f"warning: {path} was produced from a dirty tree", file=sys.stderr)
+        if arch.endswith("-strict"):
+            put(f"findings.{arch}.overflow_violations", len(re.findall(r"v5_topic_overflow_test.go:\d+: \d+%", text)))
+            m = re.search(r"(\d+)/(\d+) scores differ from spec, (\d+)/(\d+) tree counters wrong", text)
+            if m:
+                put(f"findings.{arch}.ip_scores_differ", f"{m.group(1)}/{m.group(2)}")
+                put(f"findings.{arch}.ip_counters_wrong", f"{m.group(3)}/{m.group(4)}")
+            put(f"findings.{arch}.failed_tests", ", ".join(re.findall(r"--- FAIL: (\w+)", text)))
+            continue
+        for m in re.finditer(r"(\S+): GOARCH=\w+ first overflowing occupancy N=(\d+) of C=(\d+)", text):
+            put(f"findings.{arch}.threshold.{m.group(1)}", int(m.group(2)))
+        th = [v for k, v in VALUES.items() if k.startswith(f"findings.{arch}.threshold.")]
+        if th:
+            put(f"findings.{arch}.threshold_min", min(th))
+            put(f"findings.{arch}.threshold_max", max(th))
+        for m in OCC_RE.finditer(text):
+            pct, case, req, reg, adm, wire, client, ticket, _ = m.groups()
+            if adm == "true":
+                cell = "**admitted** without credit"
+            elif client.startswith("-"):
+                cell = f"wait {short_duration(reg)}; advertiser decodes **{short_duration(client)}**, retries at once; ticket rejected"
+            else:
+                cell = f"wait {short_duration(reg)}" + ("" if ticket == "valid" else f"; ticket: {ticket}")
+            occ[(int(pct), case)][arch] = cell
+        if arch == "arm64":
+            rows = []
+            for m in IP_RE.finditer(text):
+                shape, hist, d, n, md, w, v = m.groups()
+                rows.append([shape, hist, f"{d}/{n}", md, f"{w}/{v}"])
+            if rows:
+                write_md_table(os.path.join(gen, "findings_ip.md"), ["address set", "history", "scores ≠ spec", "mean |Δscore|", "tree vertices with wrong counter"], rows)
+            m = re.search(r"implemented/spec wait ratio: min ([\d.]+) median ([\d.]+) max ([\d.]+)", text)
+            if m:
+                put("findings.wait_ratio_median", float(m.group(2)))
+                put("findings.wait_ratio_max", float(m.group(3)))
+            m = re.search(r"of (\d+) quotes: spec > E in (\d+), implemented > E in (\d+), implemented <= 1s floor in (\d+)", text)
+            if m:
+                n = int(m.group(1))
+                put("findings.quotes", n)
+                put("findings.spec_over_E", int(m.group(2)) / n)
+                put("findings.impl_over_E", int(m.group(3)) / n)
+                put("findings.impl_floor", int(m.group(4)) / n)
+            m = re.search(r"single quoted wait at (\d+)% occupancy, single topic: (\S+) \(E", text)
+            if m:
+                put("findings.nocap_occupancy_pct", int(m.group(1)))
+                put("findings.nocap_wait", m.group(2))
+    archs = sorted({a for v in occ.values() for a in v})
+    if occ:
+        write_md_table(os.path.join(gen, "findings_overflow.md"), ["occupancy", "case"] + [f"GOARCH={a}" for a in archs],
+                       [[f"{pct}%", case] + [occ[(pct, case)].get(a, "–") for a in archs] for pct, case in sorted(occ)])
+
+
+def equilibrium_model():
+    """Occupancy u at which a fresh request's quoted wait reaches the attempt
+    timeout 1.5*E, ignoring bounds and the 1 s floor:
+    0.1*E*(x+s)/(1-u)^10 = 1.5*E  =>  u* = 1 - ((x+s)/15)^(1/10),
+    where x = T/(N+1) is the topic share and s the IP score."""
+    for xs in (0.1, 0.25, 0.5, 1.0, 2.0):
+        put(f"model.ustar.{xs}", 1 - (xs / 15) ** 0.1)
+
+
 # ---------------------------------------------------------------- rendering
 
 
@@ -638,17 +852,23 @@ def main():
         meta = next(iter(meta_of.values()))
         put("sim.platform", meta["platform"])
         put("sim.dataset_sha256", meta["dataset"]["sha256"])
+    allm = [m for v in runs.values() for m in v]
+    if allm:
+        put("sim.max_utilisation", max(m["max_utilisation"] for m in allm))
+        put("sim.wrapped_waits", sum(m["wrapped_waits"] for m in allm))
+        put("sim.max_bounds_minus_topics", max(m["max_bounds_minus_topics"] for m in allm))
+        put("sim.little_min", min(m["little_ratio"] for m in allm))
+        put("sim.little_max", max(m["little_ratio"] for m in allm))
     summary = aggregate(runs, docs, figdir)
+    sim_config(meta_of, docs)
     sim_figures(summary, meta_of, figdir)
     microbench(root, docs, figdir)
     memory(root, docs, figdir)
-    for extra in sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "study_*.py"))):
-        # Optional extension modules (e.g. realtime analysis) share VALUES.
-        ns = {"__name__": "study_ext", "VALUES": VALUES, "put": put, "read_run": read_run, "admissibility": admissibility,
-              "ci": ci, "fit": fit, "write_csv": write_csv, "write_md_table": write_md_table, "fmt_ci": fmt_ci,
-              "fmt_num": fmt_num, "savefig": savefig, "plt": plt, "np": np}
-        exec(compile(open(extra).read(), extra, "exec"), ns)
-        ns["run"](root, docs, figdir)
+    audit(root, docs)
+    pacing(root, docs)
+    revisions(root, docs)
+    findings(root, docs)
+    equilibrium_model()
     json.dump(VALUES, open(os.path.join(docs, "generated", "values.json"), "w"), indent=1, sort_keys=True, default=float)
     missing = render(docs)
     if len(runs) and min(len(v) for v in runs.values()) < MIN_SEEDS:
