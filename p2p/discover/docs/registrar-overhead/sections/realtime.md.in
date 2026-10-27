@@ -1,0 +1,54 @@
+#### 6.4.1 Pacing and the cost of idle time
+
+Earlier realtime results reported registration latencies of tens of microseconds,
+against sub-microsecond costs in the microbenchmarks. Before the realtime sweep, a
+pacing check separated the possible causes. It ran two load points, each 15 min of real
+time after a 6 h simulated warm-up (hybrid clock, Poisson arrivals, C = 1000, seed 1),
+with each of two idle strategies between arrivals:
+
+* `sleep`: the worker blocks on a timer;
+* `spin`: the worker busy-waits.
+
+{{table:pacing}}
+
+Median latency by the idle time that preceded the call:
+
+{{table:pacing_idle}}
+
+For reference, simulated runs, which execute operations back to back, give medians of
+{{simlat.C1000-fresh5.registration.p50_us|f:2}} µs (registration) and
+{{simlat.C1000-fresh5.query.p50_us|f:2}} µs (query) at 5 fresh attempts/s, and
+{{simlat.C1000-fresh100.registration.p50_us|f:2}} µs and {{simlat.C1000-fresh100.query.p50_us|f:2}} µs at
+100 fresh attempts/s.
+
+Interpretation:
+
+1. **Sleep pacing distorts both queueing and service time.** With `sleep`, the worker
+   wakes late: the median queue delay is
+   {{pacing.C1000-fresh5-query20-sleep.queue_delay_p50_us|f:0}} µs at low load and
+   {{pacing.C1000-fresh100-query1000-sleep.queue_delay_p50_us|f:0}} µs at high load. With `spin`
+   it is {{pacing.C1000-fresh5-query20-spin.queue_delay_p50_us|f:2}} µs and
+   {{pacing.C1000-fresh100-query1000-spin.queue_delay_p50_us|f:2}} µs. Service times are also
+   inflated after a sleep: at high load the median registration takes
+   {{pacing.C1000-fresh100-query1000-sleep.registration.p50_us|f:2}} µs with `sleep` and
+   {{pacing.C1000-fresh100-query1000-spin.registration.p50_us|f:2}} µs with `spin`. The likely cause
+   is CPU power management: a blocked core lowers its clock or enters an idle state.
+   macOS does not expose the core state, so this cannot be confirmed directly.
+2. **With `spin`, high-load latency matches the simulated and microbenchmark costs.**
+   The remaining dependence on idle time is visible only at low load:
+   registration rises from {{pacing.C1000-fresh5-query20-spin.registration.p50_us|f:2}} µs (median)
+   at {{pacing.C1000-fresh5-query20-spin.requests_per_s|f:0}} requests/s to {{pacing.C1000-fresh100-query1000-spin.registration.p50_us|f:2}} µs at
+   {{pacing.C1000-fresh100-query1000-spin.requests_per_s|f:0}} requests/s. This is consistent
+   with a call after a long gap finding the registrar's data out of the CPU caches.
+   It is a property of a mostly idle registrar, not a capacity limit.
+3. **Consequences for the realtime measurements:**
+   * the realtime sweep uses `spin` pacing;
+   * service-time distributions are reported per load level, not as one number;
+   * throughput limits come from latency and queueing under load. Process CPU time is
+     meaningless under `spin`, where the worker is always busy.
+   * The earlier realtime bundles combined sleep pacing, Rosetta translation and
+     non-stationary measurement windows, so their latencies are not comparable.
+
+#### 6.4.2 Throughput and saturation
+
+*Pending: realtime sweep (awaiting approval).*

@@ -49,5 +49,18 @@ all printed digits. Queries affect only CPU.
 
 **Capacity:** see §6.2.
 
-**IP-tree fix (F2), A/B:** *pending.* This will run after the realtime block on
-branch `registrar-overhead-iptree-fix`, at three configurations.
+**IP-tree fix (F2), A/B.** The candidate fix on branch `registrar-overhead-iptree-fix`
+uses a fixed tree depth, ⌊log₂ C⌋, for both insertion and removal, so vertex counters
+match the cache contents exactly. It was run at the three IP-distribution points
+(5 seeds each, otherwise identical) and compared with the current code by Welch's
+t-test:
+
+{{table:ab_iptree-fix}}
+
+With exact counters, occupancy and admission rate fall slightly:
+* {{ab.iptree-fix.C1000-fresh5-empirical.utilisation.rel|pct:1}} (empirical);
+* {{ab.iptree-fix.C1000-fresh5-diverse.utilisation.rel|pct:1}} (diverse);
+* {{ab.iptree-fix.C1000-fresh5-concentrated.utilisation.rel|pct:1}} (concentrated).
+
+The abandonment fraction and the waits at admission do not change significantly. F2
+is a correctness defect with a small effect on the dynamics.
