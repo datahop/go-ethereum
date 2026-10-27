@@ -3,9 +3,12 @@
 
 Usage (from p2p/discover):
     run_sweeps.py <results-root> [--only EXP ...] [--jobs N] [--seeds K] [--dry-run]
+                  [--src DIR --out NAME]
 
 Each run is one registrarbench invocation, written to
-<results-root>/sim/<experiment>/<point>/seed<k>.jsonl. Completed runs (with a
+<results-root>/sim/<experiment>/<point>/seed<k>.jsonl. For an A/B comparison,
+--src builds the binary from another checkout's p2p/discover directory and --out
+writes to <results-root>/<NAME>/ instead of sim/. Completed runs (with a
 summary record) are skipped, so the script can be re-run after interruption.
 """
 import argparse
@@ -84,16 +87,19 @@ def main():
     p.add_argument("--jobs", type=int, default=6)
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--src", default=".", help="p2p/discover directory to build from")
+    p.add_argument("--out", default="sim", help="output directory under the results root")
     a = p.parse_args()
-    binary = os.path.join(a.root, "bin", "registrarbench")
-    here = os.path.dirname(os.path.abspath(__file__))
-    subprocess.check_call([os.path.join(here, "build.sh"), binary])
+    a.root = os.path.abspath(a.root)
+    binary = os.path.join(a.root, "bin", "registrarbench" if a.out == "sim" else f"registrarbench-{a.out}")
+    src = os.path.abspath(a.src)
+    subprocess.check_call([os.path.join(src, "topicindex/cmd/registrarbench/study/build.sh"), binary], cwd=src)
     jobs = []
     for exp, point, over in experiments():
         if a.only and exp not in a.only:
             continue
         for seed in range(1, a.seeds + 1):
-            path = os.path.join(a.root, "sim", exp, point, f"seed{seed}.jsonl")
+            path = os.path.join(a.root, a.out, exp, point, f"seed{seed}.jsonl")
             if done(path):
                 continue
             os.makedirs(os.path.dirname(path), exist_ok=True)

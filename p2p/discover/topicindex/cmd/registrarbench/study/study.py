@@ -654,6 +654,43 @@ def sim_config(meta_of, docs):
 PRODUCTION = ["topicindex", ":(exclude)topicindex/cmd", ":(exclude)topicindex/*_test.go", ":(exclude)topicindex/stats.go"]
 
 
+AB_PREFIX = "ab-"
+
+
+def ab(root, docs):
+    """A/B: each <root>/ab-<name>/<exp>/<point> against <root>/sim/<exp>/<point>
+    (Welch's t-test on the per-seed values)."""
+    rows = defaultdict(list)
+    keys = [("utilisation", "occupancy / C", 3), ("admission_rps", "admissions/s", 3), ("abandon_fraction", "abandoned / fresh", 3),
+            ("requests_per_admission", "REGTOPIC per admission", 1), ("cumwait_waited_median_s", "cum. wait p50 s", 0)]
+    for d in sorted(glob.glob(os.path.join(root, AB_PREFIX + "*", "*", "*"))):
+        name = d.split(os.sep)[-3][len(AB_PREFIX):]
+        exp, point = d.split(os.sep)[-2:]
+        a, b = [], []
+        for path in sorted(glob.glob(os.path.join(root, "sim", exp, point, "seed*.jsonl"))):
+            meta, s, samples, _ = read_run(path)
+            if s and not admissibility(meta):
+                a.append(run_metrics(meta, s, samples))
+        for path in sorted(glob.glob(os.path.join(d, "seed*.jsonl"))):
+            meta, s, samples, _ = read_run(path)
+            if s and not admissibility(meta):
+                b.append(run_metrics(meta, s, samples))
+        if not a or not b:
+            continue
+        for k, label, nd in keys:
+            xa, xb = [m[k] for m in a], [m[k] for m in b]
+            ma, mb = ci(xa), ci(xb)
+            p = stats.ttest_ind(xa, xb, equal_var=False).pvalue if len(xa) > 1 and len(xb) > 1 else float("nan")
+            rel = (mb[0] - ma[0]) / ma[0] if ma[0] else float("nan")
+            put(f"ab.{name}.{point}.{k}.base", {"mean": ma[0], "ci": ma[1], "n": ma[2]})
+            put(f"ab.{name}.{point}.{k}.fix", {"mean": mb[0], "ci": mb[1], "n": mb[2]})
+            put(f"ab.{name}.{point}.{k}.rel", rel)
+            put(f"ab.{name}.{point}.{k}.p", p)
+            rows[name].append([point, label, fmt_ci(ma[0], ma[1], nd), fmt_ci(mb[0], mb[1], nd), f"{100 * rel:+.1f}%", fmt_num(p, 3)])
+    for name, r in rows.items():
+        write_md_table(os.path.join(docs, "generated", f"ab_{name}.md"), ["point", "metric", "current code", "candidate fix", "change", "Welch p"], r)
+
+
 def revisions(root, docs):
     """Lists the revisions that produced the results and checks that the
     production registrar code is identical across them."""
@@ -669,12 +706,17 @@ def revisions(root, docs):
         revs[json.load(open(env))["revision"]].append("microbench")
     if not revs:
         return
-    ref = sorted(revs)[0]
+    ab = {rev for rev, where in revs.items() if all(w.startswith(AB_PREFIX) for w in where)}
+    ref = sorted(set(revs) - ab)[0]
     rows, same = [], True
     for rev, where in sorted(revs.items()):
         diff = subprocess.run(["git", "diff", "--quiet", ref, rev, "--"] + PRODUCTION, capture_output=True).returncode
-        same = same and diff == 0
-        rows.append([rev[:12], ", ".join(f"{k} ({where.count(k)})" for k in sorted(set(where))), "identical" if diff == 0 else "DIFFERS"])
+        if rev in ab:
+            status = "candidate fix (A/B only)" if diff else "identical"
+        else:
+            same = same and diff == 0
+            status = "identical" if diff == 0 else "DIFFERS"
+        rows.append([rev[:12], ", ".join(f"{k} ({where.count(k)})" for k in sorted(set(where))), status])
     put("revisions.count", len(revs))
     put("revisions.production_identical", "yes" if same else "no")
     write_md_table(os.path.join(docs, "generated", "revisions.md"), ["revision", "results (files)", f"production registrar code vs {ref[:12]}"], rows)
@@ -884,6 +926,7 @@ def main():
     audit(root, docs)
     pacing(root, docs)
     revisions(root, docs)
+    ab(root, docs)
     findings(root, docs)
     equilibrium_model()
     json.dump(VALUES, open(os.path.join(docs, "generated", "values.json"), "w"), indent=1, sort_keys=True, default=float)
