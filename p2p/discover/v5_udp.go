@@ -313,14 +313,31 @@ func (t *UDPv5) StopRegisterTopic(topic topicindex.TopicID) {
 	t.topicSys.stopRegister(topic)
 }
 
-// LocalTopicNodes returns all locally-registered nodes for a topic.
+// localTopicTimeout bounds how long a local topic-table accessor waits for the
+// dispatch goroutine, which can be arbitrarily busy under load or during shutdown.
+const localTopicTimeout = 250 * time.Millisecond
+
+// LocalTopicNodes returns all locally-registered nodes for a topic. It returns
+// nil if the dispatch goroutine does not serve the request within
+// localTopicTimeout.
 func (t *UDPv5) LocalTopicNodes(topic topicindex.TopicID) []*enode.Node {
 	done := make(chan []*enode.Node, 1)
 	fn := func() { done <- t.topicTable.Nodes(topic) }
+	timeout := time.NewTimer(localTopicTimeout)
+	defer timeout.Stop()
 	select {
 	case t.onDispatchCh <- fn:
-		return <-done
 	case <-t.closeCtx.Done():
+		return nil
+	case <-timeout.C:
+		return nil
+	}
+	select {
+	case nodes := <-done:
+		return nodes
+	case <-t.closeCtx.Done():
+		return nil
+	case <-timeout.C:
 		return nil
 	}
 }
