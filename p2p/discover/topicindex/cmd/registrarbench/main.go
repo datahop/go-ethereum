@@ -339,7 +339,7 @@ func run(c config, out io.Writer) error {
 			if err := sample(); err != nil {
 				return err
 			}
-			nextSample = (now/c.SampleInterval + 1) * c.SampleInterval
+			nextSample = now - now%c.SampleInterval + c.SampleInterval
 			continue
 		}
 		event := e.nextWork()
