@@ -14,6 +14,13 @@ for C in 1000 5000; do
       --memfill-reps 5 --output "$out"
   done
 done
+# Records padded to near the 300-byte ENR size limit, for the upper bound.
+for C in 1000 5000; do
+  out="$root/memfill/C$C-empirical-maxenr.jsonl"
+  [ -s "$out" ] && grep -q memfill_bounds "$out" && continue
+  "$bin" --mode memfill --cache-size "$C" --ad-lifetime 15m --ip-dist empirical --enr-pad 160 \
+    --memfill-reps 5 --output "$out"
+done
 # Allocation audit at the realistic configuration (independent ENR copies, as
 # production; decoding happens outside the instrumented bracket).
 for seed in 1 2 3; do
