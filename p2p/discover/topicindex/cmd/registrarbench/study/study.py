@@ -576,9 +576,14 @@ def audit(root, docs):
         write_md_table(os.path.join(docs, "generated", "audit.md"), ["quantity per call", "mean ± 95% CI", "seeds"], rows)
 
 
+IDLE_BUCKETS = [(0, 1e6, "< 1 ms"), (1e6, 1e7, "1–10 ms"), (1e7, 1e8, "10–100 ms"), (1e8, float("inf"), "≥ 100 ms")]
+
+
 def op_latencies(path):
-    """Per-operation latency (ns) and queue delay from the raw operation records."""
-    lat, qd = defaultdict(list), []
+    """Per-operation latency (ns), queue delay, and the idle time before each
+    operation (end of the previous operation to the start of this one)."""
+    lat, qd, idle = defaultdict(list), [], defaultdict(list)
+    prev_end = None
     with open(path) as f:
         for line in f:
             if '"type":"operation"' not in line:
@@ -586,19 +591,31 @@ def op_latencies(path):
             r = json.loads(line)
             lat[r["operation"]].append(r["latency_ns"])
             qd.append(r["queue_delay_ns"])
-    return {k: np.array(v) for k, v in lat.items()}, np.array(qd)
+            if prev_end is not None:
+                idle[r["operation"]].append((r["started_ns"] - prev_end, r["latency_ns"]))
+            prev_end = r["started_ns"] + r["latency_ns"]
+    return {k: np.array(v) for k, v in lat.items()}, np.array(qd), {k: np.array(v) for k, v in idle.items()}
 
 
 def pacing(root, docs):
     """Sleep vs spin pacing check (hybrid runs with raw operation records)."""
     paths = sorted(glob.glob(os.path.join(root, "pacing", "*.jsonl")))
-    rows = []
+    rows, idle_rows = [], []
     for path in paths:
         meta, s, _, _ = read_run(path)
         if admissibility(meta) or not s:
             continue
         tag = os.path.basename(path).replace(".jsonl", "")
-        lat, qd = op_latencies(path)
+        lat, qd, idle = op_latencies(path)
+        for op in ("registration", "query"):
+            g = idle.get(op)
+            if g is None or not len(g):
+                continue
+            cells = []
+            for lo, hi, label in IDLE_BUCKETS:
+                m = (g[:, 0] >= lo) & (g[:, 0] < hi)
+                cells.append(f"{np.median(g[m, 1]) / 1e3:.2f} ({m.sum()})" if m.sum() >= 20 else "–")
+            idle_rows.append([tag, op] + cells)
         put(f"pacing.{tag}.cpu_percent", s["cpu_percent_one_core"])
         put(f"pacing.{tag}.cpu_us_per_op", s["cpu_us_per_operation"])
         put(f"pacing.{tag}.requests_per_s", s["rates"]["registration_rps"] + s["rates"]["query_rps"])
@@ -617,6 +634,19 @@ def pacing(root, docs):
     if rows:
         write_md_table(os.path.join(docs, "generated", "pacing.md"),
                        ["run", "operation", "calls", "min µs", "p50 µs", "p99 µs", "mean µs", "queue delay p50 µs (all ops)", "process CPU % of one core"], rows)
+        write_md_table(os.path.join(docs, "generated", "pacing_idle.md"),
+                       ["run", "operation"] + [f"p50 µs after idle {label} (calls)" for _, _, label in IDLE_BUCKETS], idle_rows)
+    # Reference: the same calls in simulated mode, where operations run back to back.
+    for point in ("C1000-fresh5", "C1000-fresh100"):
+        for op in ("registration", "query"):
+            xs = []
+            for path in glob.glob(os.path.join(root, "sim", "demand", point, "seed*.jsonl")):
+                meta, s, _, _ = read_run(path)
+                if s and not admissibility(meta):
+                    xs.append(s[f"{op}_latency"]["median_ns_upper"] / 1e3)
+            if xs:
+                m = ci(xs)
+                put(f"simlat.{point}.{op}.p50_us", {"mean": m[0], "ci": m[1], "n": m[2]})
 
 
 CONFIG_COLS = [("CacheSize", "C"), ("Lifetime", "E"), ("FreshRate", "fresh/s"), ("QueryRate", "query/s"), ("Advertisers", "advertisers"),
