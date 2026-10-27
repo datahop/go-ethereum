@@ -9,7 +9,7 @@
   single Discovery v5 dispatch goroutine, so capacity is per core (§3.3).
 * **With production advertisers, occupancy settles at about a quarter of C, whatever
   the demand.** The production client abandons an attempt once its quoted waits exceed
-  1.5·E. At C = 1000, as fresh demand grows 400-fold
+  1.5·E. At C = 1000, as fresh demand grows
   ({{demand.C1000-fresh0.25.fresh_attempt_rps|f:2}} to {{demand.C1000-fresh100.fresh_attempt_rps|f:0}}
   attempts/s), the time-averaged occupancy rises only from
   {{demand.C1000-fresh0.25.utilisation|pct:1}} to {{demand.C1000-fresh100.utilisation|pct:1}} of C.
@@ -28,12 +28,22 @@
   C·(300 B + overhead) underestimates this by a factor of
   {{mem.C5000-empirical-maxenr.bound_ratio|f:1}}. The admission state is
   bounded by the cache contents in every run and test (§6.6).
-* **Two production defects** (§4.1):
-  * the waiting time overflows int64 above about {{findings.arm64.threshold_min|f:0}}/1000
+* **Production findings** (§4.1, each with a test and a suggested fix; none applied):
+  * F1: the waiting time overflows int64 above about {{findings.arm64.threshold_min|f:0}}/1000
     occupancy (admission without waiting on amd64, a wrapped wait on arm64); this is
     unreachable with production advertisers (highest sampled occupancy
     {{sim.max_utilisation_production|pct:0}});
-  * IP-similarity scores depend on insertion history and deviate from the specification.
-* Ten specification–implementation differences are listed for decision (§4.2). The 0.1
+  * F2: IP-similarity scores depend on insertion history and deviate from the
+    specification; the candidate fix lowers occupancy by a few percent (§6.5);
+  * F3: ticket keys can expire before a long wait ends;
+  * F4: tickets are not bound to the advertiser, so one advertiser's ticket admits
+    another;
+  * F5: the waiting-time function deviates from the specification (D1–D5).
+* **Throughput is provisional.** Measured per-call costs imply that one core could
+  serve roughly {{cap.implied_min|sig:2}}–{{cap.implied_max|sig:2}} registrar-core requests/s,
+  depending on load and request mix; at every load measured so far the registrar core
+  used at most {{cap.busy_max|pct:2}} of a core. These are not measured saturation
+  points; the realtime validation is pending (§6.4).
+* The specification–implementation differences D1–D10 are listed for decision (§4.2). The 0.1
   scale factor and the client's 1.5·E attempt timeout together set the equilibrium
   occupancy; the missing G term is negligible.

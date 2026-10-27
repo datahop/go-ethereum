@@ -30,7 +30,7 @@ Measured:
 * the admission dynamics a registrar experiences under a population of advertisers
   that behave like the production client (§5.3): occupancy, waiting times, retry and
   abandonment rates;
-* the throughput of the registrar core on one CPU core.
+* the throughput of the registrar core on one CPU core (provisional, §6.4.2).
 
 Not measured: UDP I/O, Discovery v5 packet encoding, session cryptography and
 handshakes, ticket MAC computation and encoding, ENR signature verification of incoming
@@ -88,10 +88,12 @@ otherwise    return required − credited, and record the component bounds
 if full:     return the time until the next expiry
 ```
 
-## 4. Specification–implementation differences
+## 4. Production findings and specification differences
 
-Measured effects refer to the experiments of §6. Recommendations are for the
-specification editors and implementers; none of these were changed for this study.
+§4.1 lists defects and deviations found in the production code, with the tests that
+show them and suggested fixes. §4.2 lists the differences that are decisions for the
+specification editors. Measured effects refer to the experiments of §6. Nothing in
+`topicindex` was changed for this study.
 
 {{section:spec_differences}}
 

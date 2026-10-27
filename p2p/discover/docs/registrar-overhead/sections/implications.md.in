@@ -47,3 +47,5 @@
 * F2: make the IP-tree depth fixed (candidate on a separate branch).
 * F3: either cap waits below the ticket key lifetime, or keep keys for at least the
   maximum wait.
+* F4: seal the requester's node ID (or the spec's adDigest) into the ticket and check it
+  before crediting the wait.

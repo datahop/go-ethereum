@@ -1,3 +1,5 @@
+* **Realtime throughput and saturation** (§6.4.2): the planned realtime block, which
+  replaces the provisional capacity estimates.
 * **Wire-level handler benchmark.** `handleRegtopic` and `handleTopicQuery` add costs
   on top of the registrar core: packet decoding, ENR signature verification, ticket MAC
   and encoding, and `NODES` responses. This study measures only the core (§2).

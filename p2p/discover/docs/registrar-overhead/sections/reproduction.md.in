@@ -15,5 +15,22 @@ modified, stamps the git revision into the binary, and checks that the binary is
 record, native, clean known revision, schema ≥ 6) and validity (§5.4). It fails if the
 template references a value that the results do not provide.
 
-The empirical IP dataset is `results/data/dnslist-ipv4.txt`; its SHA-256 is recorded in
-every run (§5.2). Raw JSONL results are not committed (`.gitignore`).
+**IP dataset (not in the repository).** The empirical address distribution is read from
+`results/data/dnslist-ipv4.txt`, one IPv4 address per line. It is not committed. It was
+extracted from `all.json` of {{dataset.source_repository|s}} at commit
+`{{dataset.source_commit|s}}` ({{dataset.source_commit_date|s}}; `all.json` SHA-256
+`{{dataset.all_json_sha256|s}}`): every record was parsed with `enode.Parse`, and the
+explicit `ip` field of each valid record kept, without deduplication, in sorted node-key
+order. Of {{dataset.total_enrs_examined|f:0}} records, {{dataset.usable_ipv4_rows|f:0}} gave a
+usable IPv4 address ({{dataset.distinct_ipv4_addresses|f:0}} distinct;
+{{dataset.missing_or_unusable_ipv4|f:0}} without one). The file's SHA-256 is
+`{{dataset.ipv4_sha256|s}}`.
+
+Every run records the SHA-256 and row count of the file it read; all empirical-distribution
+runs used the file above (hash match: {{dataset.sha_consistent|s}}; rows:
+{{dataset.run_rows|s}}). A rebuilt file must have the same hash to reproduce the runs
+exactly. The synthetic `diverse` and `concentrated` distributions (§6.5) are generated
+from the seed and need no file.
+
+Raw JSONL results are not committed (`.gitignore`); only the generated tables, figures
+and this document are.
