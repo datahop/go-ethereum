@@ -1,6 +1,5 @@
 # registrar-overhead study outputs (raw runs and generated plots)
 results/*
-!results/data/
 plots/
 *.zip
 *.jsonl

@@ -649,6 +649,76 @@ def pacing(root, docs):
                 put(f"simlat.{point}.{op}.p50_us", {"mean": m[0], "ci": m[1], "n": m[2]})
 
 
+def dataset(root, meta_of):
+    """Provenance of the empirical IP dataset, from its metadata file (written
+    when the dataset was extracted) and the dataset record of the runs."""
+    path = os.path.join(os.path.dirname(os.path.normpath(root)), "data", "dnslist-ipv4.metadata.json")
+    if not os.path.exists(path):
+        path = os.path.join(root, "data", "dnslist-ipv4.metadata.json")
+    if os.path.exists(path):
+        md = json.load(open(path))
+        for k in ("source_repository", "source_commit", "source_commit_date", "total_enrs_examined", "usable_ipv4_rows",
+                  "distinct_ipv4_addresses", "missing_or_unusable_ipv4", "ipv4_sha256", "all_json_sha256"):
+            if k in md:
+                put(f"dataset.{k}", md[k])
+    emp = [m for m in meta_of.values() if m["config"].get("IPDist") in ("", "empirical") and m.get("dataset", {}).get("sha256")]
+    shas = {m["dataset"]["sha256"] for m in emp}
+    rows = {m["dataset"]["rows"] for m in emp}
+    put("dataset.run_sha256", ", ".join(sorted(shas)))
+    put("dataset.run_rows", ", ".join(str(r) for r in sorted(rows)))
+    put("dataset.sha_consistent", "yes" if len(shas) == 1 and VALUES.get("dataset.ipv4_sha256") in shas else "no")
+
+
+def capacity_provisional(root, docs):
+    """Single-core capacity of the registrar core implied by measured per-call
+    cost: microbenchmarks, simulated runs (calls back to back) and the spin-paced
+    realtime pacing runs. The implied rate excludes the harness and everything
+    outside TopicTable; it is not a measured saturation point."""
+    rows = []
+
+    def row(source, point, reg_ns, q_ns, reg_rps, q_rps):
+        busy = (reg_rps * reg_ns + q_rps * q_ns) / 1e9
+        implied = (reg_rps + q_rps) / busy if busy else float("nan")
+        key = f"cap.{source}.{point}"
+        put(f"{key}.busy", busy)
+        put(f"{key}.implied_rps", implied)
+        put(f"{key}.offered_rps", reg_rps + q_rps)
+        rows.append([source, point, fmt_num(reg_rps, 1), fmt_num(q_rps, 1), fmt_num(reg_ns, 0), fmt_num(q_ns, 0),
+                     f"{busy * 100:.3g}%", fmt_num(implied, 0)])
+
+    for name in ("RegisterFresh/N=1000/T=16", "RandomNodes/N=1000/T=16", "RandomNodes/N=5000/T=64"):
+        v = VALUES.get(f"micro.{name}.ns")
+        if v:
+            put(f"cap.micro.{name}.ops_per_s", 1e9 / v["mean"])
+    for exp, point in (("demand", "C1000-fresh100"), ("query", "C1000-fresh5-query1000")):
+        regs, qs, rr, qr = [], [], [], []
+        for path in glob.glob(os.path.join(root, "sim", exp, point, "seed*.jsonl")):
+            meta, s, _, _ = read_run(path)
+            if not s or admissibility(meta):
+                continue
+            regs.append(s["registration_latency"]["mean_ns"])
+            qs.append(s["query_latency"]["mean_ns"])
+            rr.append(s["rates"]["registration_rps"])
+            qr.append(s["rates"]["query_rps"])
+        if regs:
+            row("simulated", point, np.mean(regs), np.mean(qs), np.mean(rr), np.mean(qr))
+    for path in sorted(glob.glob(os.path.join(root, "pacing", "*-spin.jsonl"))):
+        meta, s, _, _ = read_run(path)
+        if not s or admissibility(meta):
+            continue
+        tag = os.path.basename(path).replace(".jsonl", "")
+        lat, _, _ = op_latencies(path)
+        row("realtime-spin", tag, float(lat["registration"].mean()), float(lat["query"].mean()),
+            s["rates"]["registration_rps"], s["rates"]["query_rps"])
+    if rows:
+        put("cap.implied_min", min(VALUES[k] for k in VALUES if k.startswith("cap.") and k.endswith(".implied_rps")))
+        put("cap.implied_max", max(VALUES[k] for k in VALUES if k.startswith("cap.") and k.endswith(".implied_rps")))
+        put("cap.busy_max", max(VALUES[k] for k in VALUES if k.startswith("cap.") and k.endswith(".busy")))
+        write_md_table(os.path.join(docs, "generated", "capacity_provisional.md"),
+                       ["source", "point", "registrations/s", "queries/s", "mean ns/registration", "mean ns/query",
+                        "registrar busy (one core)", "implied requests/s at 100% busy (same mix)"], rows)
+
+
 CONFIG_COLS = [("CacheSize", "C"), ("Lifetime", "E"), ("FreshRate", "fresh/s"), ("QueryRate", "query/s"), ("Advertisers", "advertisers"),
                ("Topics", "topics"), ("Alpha", "Zipf α"), ("IPDist", "IP dist."), ("Abandon", "abandon"), ("Arrivals", "arrivals"),
                ("Duration", "duration"), ("Warmup", "warm-up")]
@@ -885,6 +955,8 @@ def fmt_value(key, spec):
         return f"{100 * m:.{nd}f} ± {100 * h:.{nd}f}%" if not math.isnan(h) else f"{100 * m:.{nd}f}%"
     if kind == "s":
         return str(m)
+    if kind == "sig":  # rounded to nd significant digits
+        return f"{float(f'{m:.{nd}g}'):,.0f}"
     return fmt_num(m, nd)
 
 
@@ -959,6 +1031,8 @@ def main():
     memory(root, docs, figdir)
     audit(root, docs)
     pacing(root, docs)
+    capacity_provisional(root, docs)
+    dataset(root, meta_of)
     revisions(root, docs)
     ab(root, docs)
     findings(root, docs)
