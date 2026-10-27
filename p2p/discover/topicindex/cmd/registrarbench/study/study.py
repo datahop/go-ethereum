@@ -817,6 +817,10 @@ def findings(root, docs):
                 put("findings.spec_over_E", int(m.group(2)) / n)
                 put("findings.impl_over_E", int(m.group(3)) / n)
                 put("findings.impl_floor", int(m.group(4)) / n)
+            m = re.search(r"ticket issued to A \(wait (\S+)\), presented by B after the wait: confirmed=(\w+), B in cache=(\w+)", text)
+            if m:
+                put("findings.ticket_transfer_wait", m.group(1))
+                put("findings.ticket_transfer_admitted", m.group(3))
             m = re.search(r"single quoted wait at (\d+)% occupancy, single topic: (\S+) \(E", text)
             if m:
                 put("findings.nocap_occupancy_pct", int(m.group(1)))

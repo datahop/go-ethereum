@@ -15,12 +15,12 @@ for arch in $archs; do
     GOARCH=$arch go test ./topicindex -count=1 -v \
       -run 'TestSpecIPScoreDeviation|TestSpecWaitTimeDeviations|TestSpecNoWaitCap|TestFullCacheWait|TestBoundedLowerBoundState' 2>&1
     GOARCH=$arch go test . -count=1 -v \
-      -run 'TestRegisterHighOccupancy$|TestRegisterOverflowThreshold|TestRegisterFullCacheNaN|TestTicketOutlivesKey' 2>&1
+      -run 'TestRegisterHighOccupancy$|TestRegisterOverflowThreshold|TestRegisterFullCacheNaN|TestTicketOutlivesKey|TestTicketNotBoundToAdvertiser' 2>&1
   } > "$out/$arch.txt" || true
   # Strict variants are expected to fail with the current code.
   {
     echo "$header"
     TOPDISC_SPEC_STRICT=1 GOARCH=$arch go test ./topicindex -count=1 -v -run 'TestIPTreeCountersMatchContents' 2>&1
-    TOPDISC_SPEC_STRICT=1 GOARCH=$arch go test . -count=1 -v -run 'TestRegisterHighOccupancyInvariants' 2>&1
+    TOPDISC_SPEC_STRICT=1 GOARCH=$arch go test . -count=1 -v -run 'TestRegisterHighOccupancyInvariants|TestTicketNotBoundToAdvertiser' 2>&1
   } > "$out/$arch-strict.txt" || true
 done
