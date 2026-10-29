@@ -34,8 +34,9 @@ const (
 	// (closest) bucket.
 	searchTableDepth = 18
 
-	// IP subnet limit.
-	searchBucketSubnet, searchBucketIPLimit = 24, 1
+	// IP subnet limits: per bucket and pass, and distinct IDs per search.
+	searchBucketSubnet, searchBucketIPLimit = 24, 2
+	searchSubnet, searchSubnetLimit         = 24, 10
 
 	// Adaptive distance.
 	searchYieldFloor  = 8
@@ -61,6 +62,7 @@ type Search struct {
 	start     int                      // the bucket this pass started at
 	asked     *AskedSet                // nodes queried within the last ad lifetime
 	failed    *AskedSet                // nodes whose query failed within the last ad lifetime
+	admitted  *AdmittedSet             // nodes admitted to the table within the last ad lifetime, by subnet; nil for no limit
 	spare     map[enode.ID]*enode.Node // asked nodes; the longest unasked is re-asked once if nothing else is left
 	spareUsed bool                     // the pass re-asked its one spare
 	placed    bool                     // a density sample placed the active bucket in this pass
@@ -145,6 +147,12 @@ func (s *Search) SetFailed(f *AskedSet) {
 	s.failed = f
 }
 
+// SetAdmitted shares the record of admitted nodes between search passes,
+// limiting the distinct nodes a subnet gets into the table.
+func (s *Search) SetAdmitted(a *AdmittedSet) {
+	s.admitted = a
+}
+
 // IsDone reports when the pass is over. When it returns true, this search
 // state should be abandoned and a new search started using a fresh Search
 // instance, at NextPassBucket.
@@ -216,6 +224,10 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		if s.failed.Has(id) {
 			continue
 		}
+		if s.admitted != nil && !s.admitted.Allows(n) {
+			s.cfg.Log.Debug("Ignoring search node", "id", id, "reason", "subnetlimit")
+			continue
+		}
 
 		bi := s.bucketIndex(n.ID())
 		b := &s.buckets[bi]
@@ -225,6 +237,9 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 		if s.asked.Has(n.ID()) {
 			s.spare[id] = n
+			if s.admitted != nil {
+				s.admitted.Add(n)
+			}
 			continue
 		}
 		if b.contains(id) || b.count() >= s.cfg.SearchBucketSize {
@@ -247,6 +262,9 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 
 		// All checks passed, add the node.
 		b.new[id] = n
+		if s.admitted != nil {
+			s.admitted.Add(n)
+		}
 	}
 }
 
