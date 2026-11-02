@@ -334,6 +334,12 @@ func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
 	return total
 }
 
+// WaitTimeAt is WaitTime as of now.
+func (tab *TopicTable) WaitTimeAt(n *enode.Node, t TopicID, now mclock.AbsTime) time.Duration {
+	total, _ := tab.waitTime(n, t, now)
+	return total
+}
+
 // computes the required waiting time for (n, t) as of 'now'
 func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (time.Duration, waitTimeComponents) {
 	regCount := tab.all.Len()
