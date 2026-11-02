@@ -421,6 +421,7 @@ type topicSearch struct {
 	queries      atomic.Uint64 // TOPICQUERY requests sent, read by tests
 	asked        *topicindex.AskedSet
 	failed       *topicindex.AskedSet
+	admitted     *topicindex.AdmittedSet
 
 	newNodesCh  chan *enode.Node
 	newNodesSub event.Subscription
@@ -471,6 +472,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 		asked:        topicindex.NewAskedSet(sys.config),
 		started:      sys.config.Clock.Now(),
 		failed:       topicindex.NewAskedSet(sys.config),
+		admitted:     topicindex.NewAdmittedSet(sys.config),
 
 		queryCh:     make(chan topicQueryJob),
 		queryRespCh: make(chan topicQueryResult),
@@ -514,6 +516,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 		state.SetActiveBucket(s.activeBucket)
 		state.SetAsked(s.asked)
 		state.SetFailed(s.failed)
+		state.SetAdmitted(s.admitted)
 		nodes := filterTopicDiscovery(sys.transport.tab.allNodes())
 		if len(nodes) == 0 {
 			continue
@@ -629,6 +632,9 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				queryCh = s.queryCh
 				nextQuery = topicQueryJob{dst: target}
 				nextQuery.buckets = state.BucketsWithFreeSpace(nextQuery.buckets[:0])
+			} else if unread() == 0 && state.IsDone() {
+				// QueryTarget dropped the last candidates over the subnet limit.
+				continue
 			}
 		}
 		if n := state.PeekResult(); n != nil {
