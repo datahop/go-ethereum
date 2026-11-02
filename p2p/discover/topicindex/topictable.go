@@ -35,6 +35,9 @@ const (
 
 	// scales the occupancy-based part of the waiting time
 	waitTimeBaseModifier = 0.1
+
+	// G in the DISC-NG waiting time: keeps it rising with occupancy for any registrant
+	waitTimeSafety = 1e-7
 )
 
 // If a node has less than this time to wait, they will be accepted anyway.
@@ -352,8 +355,8 @@ func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (t
 
 	comps := waitTimeComponents{
 		topic:       t,
-		serviceSecs: baseTime * topicMod,
-		ipSecs:      baseTime * ipMod,
+		serviceSecs: scaleBase(baseTime, topicMod),
+		ipSecs:      scaleBase(baseTime, ipMod),
 		ipNodes:     ipNodes,
 	}
 
@@ -371,19 +374,15 @@ func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (t
 		chargedIP = rem
 	}
 
-	// The occupancy-scaled safety floor (baseTime * a tiny constant) was dropped:
-	// as a baseTime multiplier it did nothing at light load — sub-second, below
-	// the topicTableWaitTimeFloor admission slack — yet exploded at high
-	// occupancy, quoting an empty-topic / diverse-IP registrant an absurd wait
-	// even with free space. The wait is just the (lower-bounded) service and IP
-	// components.
-	neededTime := chargedService + chargedIP
+	// The G term is a floor on the whole wait and is not lower-bounded.
+	neededTime := chargedService + chargedIP + baseTime*waitTimeSafety
 	return secondsToDuration(neededTime), comps
 }
 
 // recordWaitTime updates the per-component lower bounds after a wait ticket has
 // been issued, so a subsequent request for the same topic / IP prefix cannot
-// obtain a smaller waiting time by more than the elapsed time.
+// obtain a smaller service or IP component by more than the elapsed time.
+// The G term is not recorded and drops when occupancy falls.
 func (tab *TopicTable) recordWaitTime(c waitTimeComponents, now mclock.AbsTime) {
 	// Service component. serviceSecs > 0 implies the topic has at least one ad in
 	// the cache, so only topics that held an ad get an entry. Once the topic
@@ -405,9 +404,18 @@ func (tab *TopicTable) recordWaitTime(c waitTimeComponents, now mclock.AbsTime) 
 	}
 }
 
+// scaleBase returns base*factor, or 0 when factor is 0, so a full table
+// (base +Inf) does not yield NaN.
+func scaleBase(base, factor float64) float64 {
+	if factor > 0 {
+		return base * factor
+	}
+	return 0
+}
+
 // secondsToDuration converts a wait-time value in (fractional) seconds to a
 // Duration, rounding up so a stored floor is never below the value it represents.
-// The result is capped at maxWaitTime. NaN (0*Inf on a full table) maps to 0.
+// The result is capped at maxWaitTime. NaN and non-positive values map to 0.
 func secondsToDuration(s float64) time.Duration {
 	if !(s > 0) {
 		return 0
@@ -441,8 +449,8 @@ func (tab *TopicTable) RegisterAt(n *enode.Node, t TopicID, waitTime time.Durati
 	if waitTime < requiredTime {
 		remaining := requiredTime - waitTime
 		if remaining > topicTableWaitTimeFloor {
-			// A wait ticket is being issued: record the per-component lower bounds
-			// so the node can't obtain a cheaper quote by re-requesting.
+			// A wait ticket is being issued: record the service and IP lower
+			// bounds so re-requesting can't lower those components.
 			tab.recordWaitTime(comps, now)
 			return remaining
 		}

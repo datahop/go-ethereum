@@ -532,6 +532,104 @@ func TestTopicTableWaitTimeCap(t *testing.T) {
 	}
 }
 
+// fillOther adds n topic2 ads from nodes without an IP.
+func fillOther(t *testing.T, tab *TopicTable, n int) []*enode.Node {
+	t.Helper()
+	ads := make([]*enode.Node, n)
+	for i := range ads {
+		ads[i] = newNode()
+		if !tab.Add(ads[i], topic2) {
+			t.Fatalf("could not add ad %d", i)
+		}
+	}
+	return ads
+}
+
+// TestTopicTableWaitSafetyLowOccupancy checks that the G term stays below
+// topicTableWaitTimeFloor at low occupancy, so a fresh topic is admitted.
+func TestTopicTableWaitSafetyLowOccupancy(t *testing.T) {
+	for _, fill := range []int{10, 50} {
+		cfg := testConfig(t)
+		cfg.Clock = new(mclock.Simulated)
+		cfg.AdCacheSize = 100
+		tab := NewTopicTable(cfg)
+		fillOther(t, tab, fill)
+
+		n := newNode()
+		if wt := tab.Register(n, topic1, 0); wt != 0 {
+			t.Errorf("%d%% fill: Register returned %v, want 0", fill, wt)
+		}
+		if !tab.isRegistered(n, topic1) {
+			t.Errorf("%d%% fill: fresh topic not admitted", fill)
+		}
+	}
+}
+
+// TestTopicTableWaitSafetyHighOccupancy checks that the G term alone quotes a
+// fresh topic from a score-0 address above the attempt budget at high occupancy.
+func TestTopicTableWaitSafetyHighOccupancy(t *testing.T) {
+	for _, fill := range []int{86, 93} {
+		cfg := testConfig(t)
+		cfg.Clock = new(mclock.Simulated)
+		cfg.AdCacheSize = 100
+		tab := NewTopicTable(cfg)
+		fillOther(t, tab, fill)
+
+		n := newNode()
+		budget := 3 * tab.AdLifetime() / 2
+		if wt := tab.Register(n, topic1, 0); wt <= budget || wt > maxWaitTime {
+			t.Errorf("%d%% fill: Register returned %v, want in (%v, %v]", fill, wt, budget, maxWaitTime)
+		}
+		if tab.isRegistered(n, topic1) {
+			t.Errorf("%d%% fill: fresh topic admitted", fill)
+		}
+	}
+}
+
+// TestTopicTableWaitSafetyFull checks that a full table quotes maxWaitTime both
+// to a fresh topic from a score-0 address and to an existing topic from a
+// similar IP, rather than the 0 that 0*Inf would give.
+func TestTopicTableWaitSafetyFull(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Clock = new(mclock.Simulated)
+	tab := NewTopicTable(cfg)
+	for i := 0; i < cfg.AdCacheSize; i++ {
+		tab.Add(nodeWithIP(net.IP{11, 2, 3, byte(i + 1)}), topic1)
+	}
+
+	if wt := tab.Register(newNode(), topic2, 0); wt != maxWaitTime {
+		t.Errorf("fresh topic: Register returned %v, want %v", wt, maxWaitTime)
+	}
+	if wt := tab.Register(nodeWithIP(net.IP{11, 2, 3, 200}), topic1, 0); wt != maxWaitTime {
+		t.Errorf("existing topic, similar IP: Register returned %v, want %v", wt, maxWaitTime)
+	}
+}
+
+// TestTopicTableWaitSafetyNotBounded checks that the G term is not recorded as
+// a lower bound: once the cache drains, the quote drops with occupancy.
+func TestTopicTableWaitSafetyNotBounded(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Clock = new(mclock.Simulated)
+	cfg.AdCacheSize = 100
+	tab := NewTopicTable(cfg)
+	ads := fillOther(t, tab, 93)
+
+	n := newNode()
+	if wt := tab.Register(n, topic1, 0); wt <= tab.AdLifetime() {
+		t.Fatalf("93%% fill: Register returned %v, want above %v", wt, tab.AdLifetime())
+	}
+	if _, ok := tab.wt.topicBounds[topic1]; ok {
+		t.Fatal("G term recorded as a topic lower bound")
+	}
+
+	for _, ad := range ads[50:] {
+		tab.RemoveNode(ad.ID())
+	}
+	if wt := tab.Register(n, topic1, 0); wt != 0 {
+		t.Fatalf("after draining to 50%%: Register returned %v, want 0", wt)
+	}
+}
+
 func testConfig(t *testing.T) Config {
 	return Config{
 		AdCacheSize:      20,

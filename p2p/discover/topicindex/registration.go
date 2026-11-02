@@ -53,6 +53,8 @@ type Registration struct {
 	heap    regHeap
 
 	failed *AskedSet // nodes whose registration failed within the last ad lifetime
+	// registrars that quoted more than the attempt budget within the last ad lifetime
+	overloaded *AskedSet
 
 	// rrBucket is the bucket of the last started attempt. Update scans from the
 	// next one.
@@ -187,6 +189,7 @@ func NewRegistration(topic TopicID, cfg Config) *Registration {
 		log:            cfg.Log.New("topic", topic),
 		buckets:        make([]regBucket, cfg.RegTableDepth),
 		failed:         NewAskedSet(cfg),
+		overloaded:     NewAskedSet(cfg),
 
 		rrBucket: cfg.RegTableDepth - 1,
 	}
@@ -244,7 +247,7 @@ func (r *Registration) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		if id == r.cfg.Self {
 			continue
 		}
-		if r.failed.Has(id) {
+		if r.failed.Has(id) || r.overloaded.Has(id) {
 			continue
 		}
 
@@ -438,7 +441,9 @@ func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, wait
 
 	// Drop the attempt when a single quote already exceeds the registrant's total allowed waiting time for the registration.
 	if waitTime > r.cfg.RegAttemptTimeout {
+		r.overloaded.Add(att.Node.ID())
 		r.removeAttempt(att, "wtime-above-budget")
+		r.refillAttempts(att.bucket)
 		return clamped
 	}
 
@@ -446,7 +451,9 @@ func (r *Registration) HandleTicketResponse(att *RegAttempt, ticket []byte, wait
 
 	// Drop the attempt when cumulative waiting exceeds RegAttemptTimeout.
 	if att.totalWaitTime > r.cfg.RegAttemptTimeout {
+		r.overloaded.Add(att.Node.ID())
 		r.removeAttempt(att, "wtime-too-high")
+		r.refillAttempts(att.bucket)
 		return clamped
 	}
 
