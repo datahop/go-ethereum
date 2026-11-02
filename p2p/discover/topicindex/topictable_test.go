@@ -436,6 +436,73 @@ func TestTopicTableEviction(t *testing.T) {
 	}
 }
 
+// TestTopicTableFullWaitIgnoresBoundPrune checks that a full table quotes the
+// next ad expiry, not the earlier prune of a bound left by an emptied topic, and
+// does not admit a registrant at the prune deadline.
+func TestTopicTableFullWaitIgnoresBoundPrune(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+	t0 := simclock.Now()
+
+	ad := newNode()
+	tab.Add(ad, topic2)
+	tab.wt.topicBounds[topic2] = lowerBound{value: 5 * time.Minute, since: t0}
+	tab.RemoveNode(ad.ID())
+	for i := 0; i < cfg.AdCacheSize; i++ {
+		tab.Add(newNode(), topic1)
+	}
+	adExp := t0.Add(tab.AdLifetime())
+	if got, want := tab.NextExpiryTime(), t0.Add(5*time.Minute); got != want {
+		t.Fatalf("NextExpiryTime = %v, want the bound prune at %v", got, want)
+	}
+
+	n := newNode()
+	if wt, want := tab.Register(n, topic1, maxWaitTime), adExp.Sub(simclock.Now()); wt != want {
+		t.Fatalf("full table quoted %v, want the next ad expiry in %v", wt, want)
+	}
+
+	simclock.Run(5 * time.Minute)
+	if wt, want := tab.Register(n, topic1, maxWaitTime), adExp.Sub(simclock.Now()); wt != want {
+		t.Fatalf("at the prune deadline: quoted %v, want %v", wt, want)
+	}
+	if tab.isRegistered(n, topic1) || tab.all.Len() != cfg.AdCacheSize {
+		t.Fatal("registrant admitted to a full table")
+	}
+}
+
+// TestTopicTableFullRegisterExpires checks that Register on a full table expires
+// an ad that is past its expiry and admits the registrant in its slot.
+func TestTopicTableFullRegisterExpires(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	old := newNode()
+	tab.Add(old, topic1)
+	simclock.Run(time.Minute)
+	for i := 1; i < cfg.AdCacheSize; i++ {
+		tab.Add(newNode(), topic1)
+	}
+
+	simclock.Run(tab.AdLifetime() - time.Minute)
+	n := newNode()
+	if wt := tab.Register(n, topic1, maxWaitTime); wt != 0 {
+		t.Fatalf("Register returned %v, want 0", wt)
+	}
+	if !tab.isRegistered(n, topic1) {
+		t.Fatal("registrant not in the table")
+	}
+	if tab.isRegistered(old, topic1) {
+		t.Fatal("expired ad still in the table")
+	}
+	if tab.all.Len() != cfg.AdCacheSize {
+		t.Fatalf("table has %d ads, want %d", tab.all.Len(), cfg.AdCacheSize)
+	}
+}
+
 // TestTopicTableWaitTimeCap checks that the wait time stays positive and capped
 // at high occupancy, where the uncapped value overflows a Duration.
 func TestTopicTableWaitTimeCap(t *testing.T) {

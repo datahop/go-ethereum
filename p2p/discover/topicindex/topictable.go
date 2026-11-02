@@ -138,12 +138,18 @@ func (tab *TopicTable) RandomNodes(topic TopicID, n int, check func(*enode.Node)
 // registration expires, or when the bound of a topic without ads decays.
 func (tab *TopicTable) NextExpiryTime() mclock.AbsTime {
 	next := tab.wt.pruneAt
-	if e := tab.all.Front(); e != nil {
-		if exp := e.Value.(*topicTableEntry).exp; next == Never || exp < next {
-			next = exp
-		}
+	if exp := tab.nextAdExpiry(); exp != Never && (next == Never || exp < next) {
+		next = exp
 	}
 	return next
+}
+
+// nextAdExpiry returns when the next registration expires.
+func (tab *TopicTable) nextAdExpiry() mclock.AbsTime {
+	if e := tab.all.Front(); e != nil {
+		return e.Value.(*topicTableEntry).exp
+	}
+	return Never
 }
 
 // Expire removes inactive registrations.
@@ -367,7 +373,14 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 
 	// Check if there is space. If not, the node needs to come back when a slot opens.
 	if tab.all.Len() >= tab.config.AdCacheSize {
-		return tab.NextExpiryTime().Sub(now)
+		if wait := tab.nextAdExpiry().Sub(now); wait > 0 {
+			return wait
+		}
+		// An ad is past its expiry but Expire has not run yet.
+		tab.Expire()
+		if tab.all.Len() >= tab.config.AdCacheSize {
+			return tab.nextAdExpiry().Sub(now)
+		}
 	}
 
 	tab.add(n, t)
@@ -439,6 +452,9 @@ func newWaitTimeState() waitTimeState {
 
 // pruneTopicBounds drops the decayed bounds of topics that have no ad in the
 // cache, and sets pruneAt to when the next of the remaining ones decays.
+// A bound needs an ad of its topic and lasts up to maxWaitTime (a full table
+// quotes that), so about AdCacheSize*maxWaitTime/AdLifetime entries can be kept
+// (480k at defaults).
 func (wt *waitTimeState) pruneTopicBounds(reg map[TopicID]*list.List, now mclock.AbsTime) {
 	wt.pruneAt = Never
 	for t, b := range wt.topicBounds {
