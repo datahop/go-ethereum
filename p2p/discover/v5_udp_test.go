@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/internal/testlog"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/discover/v4wire"
@@ -920,6 +921,11 @@ func (c *testCodec) decodeFrame(input []byte) (frame testCodecFrame, p v5wire.Pa
 }
 
 func newUDPV5Test(t *testing.T) *udpV5Test {
+	return newUDPV5TestClock(t, nil)
+}
+
+// newUDPV5TestClock is newUDPV5Test with the given clock (nil for the system clock).
+func newUDPV5TestClock(t *testing.T, clock mclock.Clock) *udpV5Test {
 	test := &udpV5Test{
 		t:          t,
 		pipe:       newpipe(),
@@ -938,6 +944,7 @@ func newUDPV5Test(t *testing.T) *udpV5Test {
 		Log:          testlog.Logger(t, log.LvlTrace),
 		ValidSchemes: enode.ValidSchemesForTesting,
 		PingInterval: 1000 * time.Hour,
+		Clock:        clock,
 	})
 	test.udp.codec = &testCodec{test: test, id: ln.ID()}
 	test.table = test.udp.tab

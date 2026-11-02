@@ -1294,6 +1294,9 @@ func addrIsRoutable(addr netip.Addr) bool {
 // invalid or expired ticket or one issued to another node, it starts a new
 // attempt.
 func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wire.Regtopic) {
+	// One instant for the whole request: the ticket credit, the required wait
+	// and the admission must not see the handler's processing time.
+	now := t.clock.Now()
 	reject := func() {
 		t.sendResponse(fromID, fromAddr, &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 1})
 	}
@@ -1319,7 +1322,6 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 
 	// Compute total wait time. A ticket that fails to unpack or was issued to
 	// another node is ignored, and the request is treated as a new attempt.
-	now := t.clock.Now()
 	waitTime, firstIssued := time.Duration(0), now
 	if len(p.Ticket) > 0 {
 		ticket, err := t.ticketSealer.Unpack(p.Topic, p.Ticket)
@@ -1360,7 +1362,7 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 	responseCount := uint8(1 + len(nodesResponses))
 
 	// Attempt to register.
-	newTime := t.topicTable.Register(n, p.Topic, waitTime)
+	newTime := t.topicTable.RegisterAt(n, p.Topic, waitTime, now)
 
 	// Build confirmation.
 	confirmation := &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: responseCount}
