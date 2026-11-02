@@ -332,10 +332,9 @@ func (t *UDPv5) TopicCacheOccupancy() (held, capacity int, byTopic map[topicinde
 		byTopic = t.topicTable.TopicOccupancy()
 		close(done)
 	}
-	// The dispatch goroutine can be arbitrarily busy under load, and a caller
-	// sampling thousands of nodes must not be held up by one of them. Give up
-	// rather than block; a missed sample beats a stalled teardown.
-	timeout := time.NewTimer(250 * time.Millisecond)
+	// A caller sampling thousands of nodes must not be held up by one of them;
+	// a missed sample beats a stalled teardown.
+	timeout := time.NewTimer(localTopicTimeout)
 	defer timeout.Stop()
 	select {
 	case t.onDispatchCh <- fn:
@@ -361,7 +360,8 @@ type TopicAd struct {
 }
 
 // LocalTopicAds returns the advertisements held for a topic with their
-// remaining lifetime, or nil when the dispatch loop does not answer.
+// remaining lifetime, or nil when the dispatch loop does not answer within
+// localTopicTimeout.
 func (t *UDPv5) LocalTopicAds(topic topicindex.TopicID) []TopicAd {
 	done := make(chan []TopicAd, 1)
 	fn := func() {
@@ -373,10 +373,21 @@ func (t *UDPv5) LocalTopicAds(topic topicindex.TopicID) []TopicAd {
 		}
 		done <- out
 	}
+	timeout := time.NewTimer(localTopicTimeout)
+	defer timeout.Stop()
 	select {
 	case t.onDispatchCh <- fn:
-		return <-done
 	case <-t.closeCtx.Done():
+		return nil
+	case <-timeout.C:
+		return nil
+	}
+	select {
+	case ads := <-done:
+		return ads
+	case <-t.closeCtx.Done():
+		return nil
+	case <-timeout.C:
 		return nil
 	}
 }
