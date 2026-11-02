@@ -264,6 +264,7 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 		if s.admitted != nil && !s.admitted.Allows(n) {
 			s.cfg.Log.Debug("Ignoring search node", "id", id, "reason", "subnetlimit")
+			provRejectSubnet.Add(1)
 			continue
 		}
 
@@ -633,6 +634,7 @@ var (
 	provRejectFull         atomic.Int64
 	provRejectOnePerBucket atomic.Int64
 	provRejectIP           atomic.Int64
+	provRejectSubnet       atomic.Int64
 	provBucketOcc          [maxTableDepth]atomic.Int64
 	provBucketCount        atomic.Int64
 	provBucketSamples      atomic.Int64
@@ -660,7 +662,7 @@ func SearchBucketStats() ([]float64, map[string]int64) {
 	}
 	return occ, map[string]int64{
 		"full": provRejectFull.Load(), "onePerBucket": provRejectOnePerBucket.Load(),
-		"ip": provRejectIP.Load(), "samples": n,
+		"ip": provRejectIP.Load(), "subnet": provRejectSubnet.Load(), "samples": n,
 	}
 }
 
