@@ -523,6 +523,57 @@ func TestTopicDHTEvictionEvictsAd(t *testing.T) {
 	})
 }
 
+// TestTopicStopPendingEviction checks that shutdown returns while the eviction
+// path is blocked on a registration that does not read its evictCh.
+func TestTopicStopPendingEviction(t *testing.T) {
+	test := newUDPV5Test(t)
+
+	sys := test.udp.topicSys
+	sys.mu.Lock()
+	sys.reg[testTopic1] = &topicReg{quit: make(chan struct{}), evictCh: make(chan enode.ID)}
+	sys.mu.Unlock()
+
+	// Wait for the ad to leave the cache: the eviction path has then passed the
+	// topic table and is blocked on the registration.
+	topic := topicindex.TopicID{1, 2, 3}
+	n := nodeAtDistance(test.table.self().ID(), 128, net.IP{203, 0, 113, 9})
+	added := make(chan struct{})
+	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, topic); close(added) }
+	<-added
+	test.table.removedFeed.Send(n.ID())
+	waitForCond(t, "ad removed from cache", func() bool {
+		return len(test.udp.LocalTopicNodes(topic)) == 0
+	})
+
+	closed := make(chan struct{})
+	go func() { test.udp.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked on a pending eviction")
+	}
+	test.close()
+}
+
+// TestTopicLocalTopicNodesTimeout checks that LocalTopicNodes gives up when the
+// dispatch goroutine does not serve it.
+func TestTopicLocalTopicNodesTimeout(t *testing.T) {
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	release := make(chan struct{})
+	test.udp.onDispatchCh <- func() { <-release }
+	defer close(release)
+
+	start := time.Now()
+	if got := test.udp.LocalTopicNodes(testTopic1); got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("LocalTopicNodes took %v", d)
+	}
+}
+
 // TestTopicRegTimeoutTracksNotEvicts checks the local-vs-global split after
 // topic RPC failures were wired into the DHT wire-failure counter: a single
 // REGTOPIC timeout is counted toward the node's consecutive-failure tally (via

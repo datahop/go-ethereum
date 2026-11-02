@@ -83,7 +83,7 @@ func (sys *topicSystem) evictNode(id enode.ID) {
 	}
 	sys.mu.Unlock()
 	for _, r := range regs {
-		r.evict(id)
+		r.evict(id, sys.quit)
 	}
 }
 
@@ -159,11 +159,13 @@ type topicReg struct {
 
 // evict requests removal of a node from the registration table. It is called
 // from the topic system's eviction path (evictNode), fed by DHT removals and
-// search query timeouts.
-func (reg *topicReg) evict(id enode.ID) {
+// search query timeouts. It also returns once sysQuit closes: the topic system
+// waits for the eviction path to exit before it stops the registrations.
+func (reg *topicReg) evict(id enode.ID, sysQuit <-chan struct{}) {
 	select {
 	case reg.evictCh <- id:
 	case <-reg.quit:
+	case <-sysQuit:
 	}
 }
 
