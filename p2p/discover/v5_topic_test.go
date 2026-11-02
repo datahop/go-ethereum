@@ -1966,3 +1966,77 @@ func TestTopicSearchRunUnsupportedAds(t *testing.T) {
 		})
 	}
 }
+
+// TestTopicSearchRunSubnetLimitEndsPass checks that the run loop ends the pass
+// when QueryTarget drops the last candidates over the subnet limit while no
+// query is in flight.
+func TestTopicSearchRunSubnetLimitEndsPass(t *testing.T) {
+	node := startLocalhostV5(t, Config{})
+	defer node.Close()
+	sys := node.topicSys
+	s := &topicSearch{
+		topic:        testTopic1,
+		config:       sys.config,
+		quit:         make(chan struct{}),
+		resultCh:     make(chan *enode.Node, 200),
+		resultFilter: topicindex.NewSearchFilter(sys.config),
+		asked:        topicindex.NewAskedSet(sys.config),
+		queryCh:      make(chan topicQueryJob),
+		queryRespCh:  make(chan topicQueryResult),
+		readCh:       make(chan struct{}, 1),
+		newNodesCh:   make(chan *enode.Node, 100),
+	}
+	record := func(host byte) *enode.Node {
+		db, err := enode.OpenDB("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(db.Close)
+		ln := enode.NewLocalNode(db, newkey())
+		ln.Set(topicindex.TopicDiscoveryVersion)
+		ln.SetStaticIP(net.IP{203, 0, 113, host})
+		ln.SetFallbackUDP(30303)
+		return ln.Node()
+	}
+	// Nine of the subnet's ten slots are taken.
+	admitted := topicindex.NewAdmittedSet(sys.config)
+	for host := range byte(9) {
+		admitted.Add(record(host + 1))
+	}
+	state := topicindex.NewSearch(testTopic1, sys.config)
+	state.SetAdmitted(admitted)
+	active := state.ActiveBucket()
+	// Two registrars of the same /24 in the active bucket: the first takes the
+	// subnet's last slot, the second is dropped once the first fails.
+	var regs []*enode.Node
+	for host := byte(100); len(regs) < 2; host++ {
+		if n := record(host); enode.LogDist(enode.ID(testTopic1), n.ID()) == 256-active {
+			regs = append(regs, n)
+		}
+	}
+	state.AddNodes(nil, regs)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.run(sys, state)
+	}()
+	var job topicQueryJob
+	select {
+	case job = <-s.queryCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no query sent")
+	}
+	s.queryRespCh <- topicQueryResult{src: job.dst, err: errTimeout}
+	select {
+	case <-done:
+	case job = <-s.queryCh:
+		close(s.quit)
+		<-done
+		t.Fatalf("query to %v over the subnet limit", job.dst.ID())
+	case <-time.After(5 * time.Second):
+		close(s.quit)
+		<-done
+		t.Fatal("the pass did not end after its last candidate was dropped")
+	}
+}
