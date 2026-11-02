@@ -652,6 +652,102 @@ func TestRegistrationHandleTicketResponseDropAboveBudget(t *testing.T) {
 	}
 }
 
+// TestRegistrationOverBudgetPromotesStandby checks that dropping an attempt for
+// an over-budget quote promotes a standby registrar and does not mark the
+// dropped registrar as failed.
+func TestRegistrationOverBudgetPromotesStandby(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		quote time.Duration
+		spent time.Duration
+	}{
+		{"single-quote", 23 * time.Minute, 0},
+		{"cumulative", 10 * time.Minute, 20 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.Clock = new(mclock.Simulated)
+			cfg.AdLifetime = 15 * time.Minute
+			cfg.RegAttemptTimeout = 22*time.Minute + 30*time.Second
+			cfg.RegBucketSize = 1
+			r := NewRegistration(topic1, cfg)
+
+			nodes := nodesAtDistance(enode.ID(topic1), 30, 2)
+			r.AddNodes(nil, nodes)
+			att := r.Update()
+			if att == nil {
+				t.Fatal("no request scheduled")
+			}
+			b := att.bucket
+			if b.count[Waiting] != 1 || b.count[Standby] != 1 {
+				t.Fatalf("bucket has %d waiting, %d standby, want 1, 1", b.count[Waiting], b.count[Standby])
+			}
+			r.StartRequest(att)
+			att.totalWaitTime = tc.spent
+			r.HandleTicketResponse(att, []byte("t"), tc.quote)
+
+			if b.att[att.Node.ID()] != nil {
+				t.Fatal("over-budget attempt not removed")
+			}
+			if b.count[Waiting] != 1 || b.count[Standby] != 0 {
+				t.Fatalf("bucket has %d waiting, %d standby, want 1, 0", b.count[Waiting], b.count[Standby])
+			}
+			if r.NextUpdateTime() == Never {
+				t.Fatal("no update scheduled after the drop")
+			}
+			if next := r.Update(); next == nil || next.Node.ID() == att.Node.ID() {
+				t.Fatal("standby registrar not scheduled")
+			}
+			if r.failed.Has(att.Node.ID()) {
+				t.Fatal("over-budget registrar held as failed")
+			}
+		})
+	}
+}
+
+// TestRegistrationOverloadedRing checks that two registrars quoting over budget
+// and returning each other are asked at most once per ad lifetime.
+func TestRegistrationOverloadedRing(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdLifetime = 15 * time.Minute
+	cfg.RegAttemptTimeout = 22*time.Minute + 30*time.Second
+	r := NewRegistration(topic1, cfg)
+
+	a := nodeAtDistance(enode.ID(topic1), 30, intIP(1))
+	b := nodeAtDistance(enode.ID(topic1), 40, intIP(2))
+	other := map[enode.ID]*enode.Node{a.ID(): b, b.ID(): a}
+	asked := make(map[enode.ID]int)
+
+	r.AddNodes(nil, []*enode.Node{a})
+	for i := 0; i < 1000; i++ {
+		att := r.Update()
+		if att == nil {
+			break
+		}
+		r.StartRequest(att)
+		asked[att.Node.ID()]++
+		r.AddNodes(att.Node, []*enode.Node{other[att.Node.ID()]})
+		r.HandleTicketResponse(att, []byte("t"), maxWaitTime)
+	}
+	if asked[a.ID()] != 1 || asked[b.ID()] != 1 {
+		t.Fatalf("asked a %d, b %d times within an ad lifetime, want 1 each", asked[a.ID()], asked[b.ID()])
+	}
+	if next := r.NextUpdateTime(); next == simclock.Now() {
+		t.Fatal("update due now with both registrars overloaded")
+	}
+	if r.failed.Has(a.ID()) || r.failed.Has(b.ID()) {
+		t.Fatal("overloaded registrar held as failed")
+	}
+
+	simclock.Run(cfg.AdLifetime)
+	r.AddNodes(nil, []*enode.Node{a})
+	if att := r.Update(); att == nil || att.Node.ID() != a.ID() {
+		t.Fatal("overloaded registrar not re-added after an ad lifetime")
+	}
+}
+
 // TestRegistrationHandleTicketResponseBelowFloor checks that a quote below the
 // wait time floor is raised to the floor and charged to the waiting budget, so
 // zero-wait quotes end the attempt once the budget is spent.
