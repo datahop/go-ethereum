@@ -1432,32 +1432,20 @@ func TestTopicRegZeroWaitTicketClamped(t *testing.T) {
 
 // TestTopicRegHugeWaitTime checks that a wait time too large for a Duration
 // saturates: a ticket is dropped as above budget rather than retried, and an
-// ad lifetime is capped rather than expiring at once.
+// ad lifetime is capped rather than expiring at once. Either way the registrar
+// is not asked again within the test.
 func TestTopicRegHugeWaitTime(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		ticket []byte
-		check  func(t *testing.T, test *udpV5Test)
 	}{
-		// Dropped above budget, the registrar is asked again only as a first
-		// contact. A wrapped wait would be clamped and retried with the ticket.
-		{"ticket", []byte("t"), func(t *testing.T, test *udpV5Test) {
-			test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {
-				if len(p.Ticket) != 0 {
-					t.Errorf("maximal-wait ticket %x retried", p.Ticket)
-				}
-			})
-		}},
+		// Dropped above budget and held out as overloaded. A wrapped wait would
+		// be clamped and retried with the ticket.
+		{"ticket", []byte("t")},
 		// Registered for an ad lifetime. A wrapped lifetime would expire at
 		// once and the next pass would register again.
-		{"ad lifetime", nil, func(t *testing.T, test *udpV5Test) {
-			quiet := 2*regloopMinTime + 500*time.Millisecond
-			time.Sleep(quiet)
-			if q := pipeQueued(test); q != 0 {
-				t.Errorf("%d packets sent within %v of a maximal ad lifetime", q, quiet)
-			}
-		}},
+		{"ad lifetime", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1474,7 +1462,11 @@ func TestTopicRegHugeWaitTime(t *testing.T) {
 			test.waitPacketOut(func(p *v5wire.Regtopic, a netip.AddrPort, _ v5wire.Nonce) {
 				test.packetInFrom(key, a, &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 1, Ticket: tc.ticket, WaitTime: ^uint(0)})
 			})
-			tc.check(t, test)
+			quiet := 2*regloopMinTime + 500*time.Millisecond
+			time.Sleep(quiet)
+			if q := pipeQueued(test); q != 0 {
+				t.Errorf("%d packets sent within %v of a maximal wait", q, quiet)
+			}
 		})
 	}
 }
