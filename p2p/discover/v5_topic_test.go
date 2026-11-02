@@ -1205,7 +1205,7 @@ func TestHandleRegtopicReplay(t *testing.T) {
 }
 
 // stepClock is a simulated clock that, while armed, moves forward by step after
-// every read.
+// every read. Arm it only while no timers are pending: Now fires due timers inline.
 type stepClock struct {
 	*mclock.Simulated
 	step  time.Duration
@@ -1227,7 +1227,7 @@ func TestHandleRegtopicOneClock(t *testing.T) {
 	t.Parallel()
 	clock := &stepClock{Simulated: new(mclock.Simulated), step: 10 * time.Second}
 	clock.Run(time.Hour)
-	test := newUDPV5TestClock(t, clock)
+	test := newUDPV5TestClock(t, clock.Simulated)
 	defer test.close()
 
 	// Quote a wait for the topic, then evict most of its ads: the topic's lower
@@ -1258,26 +1258,31 @@ func TestHandleRegtopicOneClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := clock.Now()
-	required := make(chan time.Duration, 1)
-	test.udp.onDispatchCh <- func() { required <- test.udp.topicTable.WaitTime(adv, testTopic1) }
-	credit := <-required - 5*time.Second
-	ticket := sealTicket(test, &topicindex.Ticket{
-		Topic:          testTopic1,
-		Node:           adv.ID(),
-		LastUsed:       now.Add(-time.Second),
-		WaitTimeIssued: time.Second,
-		FirstIssued:    now.Add(-credit),
-	})
-
-	clock.armed.Store(true)
-	test.packetInFrom(key, addr, &v5wire.Regtopic{ReqID: []byte{2}, Topic: testTopic1, Ticket: ticket, ENR: rec})
+	test.getNode(key, addr)
+	done := make(chan struct{})
+	test.udp.onDispatchCh <- func() {
+		defer close(done)
+		now := clock.Now()
+		credit := test.udp.topicTable.WaitTime(adv, testTopic1) - 5*time.Second
+		ticket := test.udp.ticketSealer.Pack(&topicindex.Ticket{
+			Topic:          testTopic1,
+			Node:           adv.ID(),
+			LastUsed:       now.Add(-time.Second),
+			WaitTimeIssued: time.Second,
+			FirstIssued:    now.Add(-credit),
+		})
+		test.udp.clock = clock
+		clock.armed.Store(true)
+		test.udp.handleRegtopic(adv.ID(), addr, &v5wire.Regtopic{ReqID: []byte{2}, Topic: testTopic1, Ticket: ticket, ENR: rec})
+		clock.armed.Store(false)
+		test.udp.clock = clock.Simulated
+	}
 	test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {
 		if len(p.Ticket) == 0 || p.WaitTime != waitTimeToMs(5*time.Second) {
 			t.Errorf("got ticket %d bytes, wait time %dms, want a ticket and 5000ms", len(p.Ticket), p.WaitTime)
 		}
 	})
-	clock.armed.Store(false)
+	<-done
 }
 
 // TestHandleRegtopicForeignTicket checks that a ticket is bound to the node it
