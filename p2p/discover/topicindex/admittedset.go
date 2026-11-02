@@ -25,14 +25,14 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 )
 
-// AdmittedSet remembers the nodes a topic search admitted to its table, by
-// /24, for an ad lifetime from the first admission: a subnet with
-// searchSubnetLimit distinct IDs counted can only re-admit those. LAN and
-// address-less nodes are not counted.
+// AdmittedSet remembers the nodes a topic search queried, by /24, for an ad
+// lifetime from the first query: a subnet with searchSubnetLimit distinct IDs
+// counted can only have those queried again. A node whose query failed keeps
+// its slot until it expires. LAN and address-less nodes are not counted.
 type AdmittedSet struct {
 	clock   mclock.Clock
 	ttl     time.Duration
-	subnets map[netip.Prefix]map[enode.ID]mclock.AbsTime // first admission
+	subnets map[netip.Prefix]map[enode.ID]mclock.AbsTime // first query
 	expired mclock.AbsTime                               // when expire last ran
 }
 
@@ -42,7 +42,7 @@ func NewAdmittedSet(cfg Config) *AdmittedSet {
 	return &AdmittedSet{clock: cfg.Clock, ttl: cfg.AdLifetime, subnets: make(map[netip.Prefix]map[enode.ID]mclock.AbsTime)}
 }
 
-// Allows reports whether n may be admitted. It does not count n.
+// Allows reports whether n may be queried. It does not count n.
 func (a *AdmittedSet) Allows(n *enode.Node) bool {
 	key, ok := a.key(n)
 	if !ok {
@@ -56,7 +56,7 @@ func (a *AdmittedSet) Allows(n *enode.Node) bool {
 	return len(ids) < searchSubnetLimit
 }
 
-// Add counts n against its subnet. Re-admitting a counted node keeps its
+// Add counts n against its subnet. Re-adding a counted node keeps its
 // expiry.
 func (a *AdmittedSet) Add(n *enode.Node) {
 	key, ok := a.key(n)

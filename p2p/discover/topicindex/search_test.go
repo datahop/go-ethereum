@@ -1082,6 +1082,119 @@ func subnetNodesAt(start int, dists ...int) []*enode.Node {
 	return nodes
 }
 
+func subnetTestConfig(t *testing.T) (Config, *mclock.Simulated) {
+	clock := new(mclock.Simulated)
+	config := testConfig(t)
+	config.Clock = clock
+	config.AdLifetime = time.Minute
+	return config, clock
+}
+
+// Table nodes of a /24 that sit in far buckets and are never queried do not
+// take the subnet's slots from a near node of the same /24.
+func TestSearchSubnetLimitUnqueriedSeeds(t *testing.T) {
+	config, clock := subnetTestConfig(t)
+	asked, failed, admitted := NewAskedSet(config), NewAskedSet(config), NewAdmittedSet(config)
+	seeds := subnetNodesAt(1, 256, 256, 255, 255, 254, 254, 253, 253, 252, 252)
+	helper := nodeAtDistance(enode.ID(topic1), 243, intIP(9))
+	const active = 14
+	for pass := 0; clock.Now() <= mclock.AbsTime(2*config.AdLifetime); pass++ {
+		s := NewSearch(topic1, config)
+		s.SetActiveBucket(active)
+		s.SetAsked(asked)
+		s.SetFailed(failed)
+		s.SetAdmitted(admitted)
+		s.AddNodes(nil, seeds)
+		near := subnetNodesAt(100+pass, 256-active)[0]
+		s.AddNodes(helper, []*enode.Node{near})
+		if n := s.QueryTarget(); n == nil || n.ID() != near.ID() {
+			t.Fatalf("pass %d: near node of a seeded /24 not queried first, got %v", pass, n)
+		}
+		s.AddQueryResults(near, nil)
+		clock.Run(config.AdLifetime / 3)
+	}
+}
+
+// A node whose /24 reaches the limit while it waits in the table is dropped
+// instead of queried, and frees its bucket slot and IP-limit entry.
+func TestSearchSubnetLimitDropsHeldNode(t *testing.T) {
+	config, _ := subnetTestConfig(t)
+	config.SearchBucketSize = 1
+	admitted := NewAdmittedSet(config)
+	s := NewSearch(topic1, config)
+	s.SetAdmitted(admitted)
+	held := subnetNodesAt(1, 253)[0]
+	s.AddNodes(nil, []*enode.Node{held})
+	b := s.bucket(held.ID())
+	other := nodeAtDistance(enode.ID(topic1), 253, intIP(9))
+	s.AddNodes(nil, []*enode.Node{other})
+	if b.contains(other.ID()) {
+		t.Fatal("full bucket took another node")
+	}
+
+	for _, n := range subnetNodesAt(10, slices.Repeat([]int{200}, searchSubnetLimit)...) {
+		admitted.Add(n)
+	}
+	s.SetActiveBucket(s.bucketIndex(held.ID()))
+	if n := s.QueryTarget(); n != nil {
+		t.Fatalf("QueryTarget returned %v, want nil", n.ID())
+	}
+	if b.count() != 0 || b.ips.Contains(held.IP()) {
+		t.Fatalf("held node kept: %d nodes, ips %v", b.count(), b.ips)
+	}
+	s.AddNodes(nil, []*enode.Node{other})
+	if !b.contains(other.ID()) {
+		t.Fatal("freed slot refused a node from another subnet")
+	}
+}
+
+// QueryTarget returns at most searchSubnetLimit distinct nodes of a /24 across
+// the passes of a search, until the first of them expire.
+func TestSearchSubnetLimitAcrossPasses(t *testing.T) {
+	config, clock := subnetTestConfig(t)
+	asked, admitted := NewAskedSet(config), NewAdmittedSet(config)
+	pass := func(nodes []*enode.Node) (s *Search, got []*enode.Node) {
+		s = NewSearch(topic1, config)
+		s.SetAsked(asked)
+		s.SetAdmitted(admitted)
+		s.AddNodes(nil, nodes)
+		for n := s.QueryTarget(); n != nil; n = s.QueryTarget() {
+			got = append(got, n)
+			s.AddReply(n, nil, 0, searchYieldFloor)
+		}
+		return s, got
+	}
+
+	queried := make(map[enode.ID]bool)
+	nodes := subnetNodesAt(1, slices.Repeat([]int{256}, searchSubnetLimit+2)...)
+	for i := 0; i < len(nodes); i += 2 {
+		s, got := pass(nodes[i : i+2])
+		for _, n := range got {
+			queried[n.ID()] = true
+		}
+		if i >= searchSubnetLimit {
+			if s.bucket(nodes[i].ID()).count() != 0 || len(s.spare) != 0 {
+				t.Fatal("nodes over the subnet limit held")
+			}
+		}
+		clock.Run(time.Second)
+	}
+	if len(queried) != searchSubnetLimit {
+		t.Fatalf("%d nodes of one /24 queried, want %d", len(queried), searchSubnetLimit)
+	}
+
+	clock.Run(config.AdLifetime - time.Duration(clock.Now()))
+	if _, got := pass(nodes[searchSubnetLimit:]); len(got) != 2 {
+		t.Fatalf("%d nodes queried after the first slots expired, want 2", len(got))
+	}
+
+	s := NewSearch(topic1, config)
+	s.AddNodes(nil, subnetNodesAt(50, 256, 256, 255, 255, 254, 254))
+	if got := s.admittedCount(); got != 6 {
+		t.Fatalf("search without a ledger holds %d nodes, want 6", got)
+	}
+}
+
 func (s *Search) admittedCount() (n int) {
 	for _, b := range s.buckets {
 		n += b.count()
@@ -1089,84 +1202,83 @@ func (s *Search) admittedCount() (n int) {
 	return n
 }
 
-// A /24 gets at most searchSubnetLimit distinct nodes into the table across
-// the passes of a search, until the first of them expire.
-func TestSearchSubnetLimitAcrossPasses(t *testing.T) {
-	clock := new(mclock.Simulated)
-	config := testConfig(t)
-	config.Clock = clock
-	config.AdLifetime = time.Minute
-	admitted := NewAdmittedSet(config)
-	pass := func() *Search {
+// A spare is counted against its subnet when it is re-asked, and dropped if
+// its subnet reached the limit meanwhile.
+func TestSearchSubnetLimitSpares(t *testing.T) {
+	config, clock := subnetTestConfig(t)
+	asked := NewAskedSet(config)
+	spares := subnetNodesAt(1, 256, 255)
+	for _, n := range spares {
+		asked.Add(n.ID())
+		clock.Run(time.Second)
+	}
+	others := subnetNodesAt(10, slices.Repeat([]int{200}, searchSubnetLimit)...)
+	search := func() (*Search, *AdmittedSet) {
+		admitted := NewAdmittedSet(config)
+		for _, n := range others[:searchSubnetLimit-1] {
+			admitted.Add(n)
+		}
 		s := NewSearch(topic1, config)
+		s.SetAsked(asked)
 		s.SetAdmitted(admitted)
-		return s
+		s.AddNodes(nil, spares)
+		if len(s.spare) != len(spares) {
+			t.Fatalf("%d spares, want %d", len(s.spare), len(spares))
+		}
+		return s, admitted
 	}
 
-	old := subnetNodesAt(1, 256, 256, 255, 255, 254, 254)
-	s := pass()
-	s.AddNodes(nil, old)
-	if got := s.admittedCount(); got != len(old) {
-		t.Fatalf("pass 1 admitted %d nodes, want %d", got, len(old))
+	s, admitted := search()
+	if n := s.QueryTarget(); n == nil || n.ID() != spares[0].ID() {
+		t.Fatalf("QueryTarget returned %v, want the longest unasked spare", n)
+	}
+	if admitted.Allows(others[searchSubnetLimit-1]) {
+		t.Fatal("re-asked spare not counted")
 	}
 
-	fresh := subnetNodesAt(len(old)+1, 253, 253, 252, 252, 251)
-	last := fresh[len(fresh)-1]
-	s = pass()
-	s.AddNodes(nil, append(slices.Clone(old), fresh...))
-	if got := s.admittedCount(); got != searchSubnetLimit {
-		t.Fatalf("pass 2 admitted %d nodes, want %d", got, searchSubnetLimit)
+	s, admitted = search()
+	admitted.Add(others[searchSubnetLimit-1])
+	if n := s.QueryTarget(); n != nil {
+		t.Fatalf("QueryTarget returned spare %v over the subnet limit", n.ID())
 	}
-	if s.bucket(last.ID()).contains(last.ID()) {
-		t.Fatal("node over the subnet limit admitted")
-	}
-	if _, ok := s.spare[last.ID()]; ok {
-		t.Fatal("node over the subnet limit kept as a spare")
-	}
-	other := nodeAtDistance(enode.ID(topic1), 251, intIP(9))
-	s.AddNodes(nil, []*enode.Node{other})
-	if !s.bucket(other.ID()).contains(other.ID()) {
-		t.Fatal("a node from another subnet was refused")
-	}
-
-	clock.Run(config.AdLifetime)
-	s = pass()
-	s.AddNodes(nil, []*enode.Node{last})
-	if !s.bucket(last.ID()).contains(last.ID()) {
-		t.Fatal("node refused after the subnet's slots expired")
-	}
-
-	s = NewSearch(topic1, config)
-	s.AddNodes(nil, append(slices.Clone(old), fresh...))
-	if got := s.admittedCount(); got != len(old)+len(fresh) {
-		t.Fatalf("search without a ledger admitted %d nodes, want %d", got, len(old)+len(fresh))
+	if len(s.spare) != 0 {
+		t.Fatal("spares over the subnet limit kept")
 	}
 }
 
-// Nodes kept as spares count against their subnet's limit.
-func TestSearchSubnetLimitCountsSpares(t *testing.T) {
-	config := testConfig(t)
-	config.Clock = new(mclock.Simulated)
-	nodes := subnetNodesAt(1, 256, 256, 255, 255, 254, 254, 253, 253, 252, 252)
+// Dropping the last candidate of an active bucket that already has its
+// density samples ends the pass instead of querying a helper.
+func TestSearchSubnetLimitDropEndsPass(t *testing.T) {
+	config, _ := subnetTestConfig(t)
+	admitted := NewAdmittedSet(config)
 	s := NewSearch(topic1, config)
-	s.AddNodes(nil, nodes)
-	for _, n := range nodes {
-		s.AddReply(n, nil, 0, 0)
+	s.SetAdmitted(admitted)
+	s.SetActiveBucket(3)
+	regs := nodesAtDistanceFrom(enode.ID(topic1), 253, 2, 1)
+	helper := nodeAtDistance(enode.ID(topic1), 252, intIP(9))
+	s.AddNodes(nil, append(slices.Clone(regs), helper))
+	for range regs {
+		reply := s.QueryTarget()
+		if s.bucketIndex(reply.ID()) != 3 {
+			t.Fatalf("query to bucket[%d], want bucket[3]", s.bucketIndex(reply.ID()))
+		}
+		s.AddReply(reply, nil, 0, searchYieldFloor)
 	}
 
-	next := NewSearch(topic1, config)
-	next.SetAsked(s.asked)
-	next.SetAdmitted(NewAdmittedSet(config))
-	next.AddNodes(nil, nodes)
-	if len(next.spare) != len(nodes) {
-		t.Fatalf("%d spares, want %d", len(next.spare), len(nodes))
+	counted := subnetNodesAt(10, slices.Repeat([]int{200}, searchSubnetLimit)...)
+	for _, n := range counted[:searchSubnetLimit-1] {
+		admitted.Add(n)
 	}
-	extra := subnetNodesAt(len(nodes)+1, 251)[0]
-	next.AddNodes(nil, []*enode.Node{extra})
-	if next.bucket(extra.ID()).contains(extra.ID()) {
-		t.Fatal("node over the subnet limit admitted")
+	held := subnetNodesAt(1, 253)[0]
+	s.AddNodes(regs[0], []*enode.Node{held})
+	if !s.buckets[3].contains(held.ID()) {
+		t.Fatal("held node not added")
 	}
-	if _, ok := next.spare[extra.ID()]; ok {
-		t.Fatal("node over the subnet limit kept as a spare")
+	admitted.Add(counted[searchSubnetLimit-1])
+	if n := s.QueryTarget(); n != nil {
+		t.Fatalf("QueryTarget returned %v after the active bucket was done", n.ID())
+	}
+	if !s.IsDone() {
+		t.Fatal("pass not done")
 	}
 }

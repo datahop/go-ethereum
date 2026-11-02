@@ -569,6 +569,9 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 				queryCh = s.queryCh
 				nextQuery = topicQueryJob{dst: target}
 				nextQuery.buckets = state.BucketsWithFreeSpace(nextQuery.buckets[:0])
+			} else if unread() == 0 && state.IsDone() {
+				// QueryTarget dropped the last candidates over the subnet limit.
+				continue
 			}
 		}
 		if n := state.PeekResult(); n != nil {

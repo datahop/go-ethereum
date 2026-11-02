@@ -34,9 +34,9 @@ const (
 	// (closest) bucket.
 	searchTableDepth = 18
 
-	// IP subnet limits: per bucket and pass, and distinct IDs per search.
-	searchBucketSubnet, searchBucketIPLimit = 24, 2
-	searchSubnet, searchSubnetLimit         = 24, 10
+	// IP subnet limits: per bucket and pass, and distinct IDs queried per search.
+	searchSubnet                           = 24
+	searchBucketIPLimit, searchSubnetLimit = 2, 10
 
 	// Adaptive distance.
 	searchYieldFloor  = 8
@@ -62,7 +62,7 @@ type Search struct {
 	start     int                      // the bucket this pass started at
 	asked     *AskedSet                // nodes queried within the last ad lifetime
 	failed    *AskedSet                // nodes whose query failed within the last ad lifetime
-	admitted  *AdmittedSet             // nodes admitted to the table within the last ad lifetime, by subnet; nil for no limit
+	admitted  *AdmittedSet             // nodes queried within the last ad lifetime, by subnet; nil for no limit
 	spare     map[enode.ID]*enode.Node // asked nodes; the longest unasked is re-asked once if nothing else is left
 	spareUsed bool                     // the pass re-asked its one spare
 	placed    bool                     // a density sample placed the active bucket in this pass
@@ -105,7 +105,7 @@ func NewSearch(topic TopicID, cfg Config) *Search {
 			dist: dist,
 			new:  make(map[enode.ID]*enode.Node, cfg.SearchBucketSize),
 			ips: netutil.DistinctNetSet{
-				Subnet: searchBucketSubnet,
+				Subnet: searchSubnet,
 				Limit:  searchBucketIPLimit,
 			},
 		}
@@ -147,8 +147,8 @@ func (s *Search) SetFailed(f *AskedSet) {
 	s.failed = f
 }
 
-// SetAdmitted shares the record of admitted nodes between search passes,
-// limiting the distinct nodes a subnet gets into the table.
+// SetAdmitted shares the record of queried nodes between search passes,
+// limiting the distinct nodes of a subnet the search queries.
 func (s *Search) SetAdmitted(a *AdmittedSet) {
 	s.admitted = a
 }
@@ -237,9 +237,6 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 		if s.asked.Has(n.ID()) {
 			s.spare[id] = n
-			if s.admitted != nil {
-				s.admitted.Add(n)
-			}
 			continue
 		}
 		if b.contains(id) || b.count() >= s.cfg.SearchBucketSize {
@@ -262,9 +259,6 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 
 		// All checks passed, add the node.
 		b.new[id] = n
-		if s.admitted != nil {
-			s.admitted.Add(n)
-		}
 	}
 }
 
@@ -295,7 +289,9 @@ func (s *Search) removeNode(id enode.ID, keepIP bool) {
 }
 
 // QueryTarget picks an unasked node in the active bucket, or in the nearest
-// bucket that has one. It returns nil once the pass is over.
+// bucket that has one, and counts it against its subnet's limit. Nodes whose
+// subnet reached the limit since they were added are dropped. It returns nil
+// once the pass is over.
 func (s *Search) QueryTarget() *enode.Node {
 	if s.activeDone() {
 		return nil
@@ -305,7 +301,17 @@ func (s *Search) QueryTarget() *enode.Node {
 			if i < 0 || i >= len(s.buckets) {
 				continue
 			}
-			for _, n := range s.buckets[i].new {
+			for id, n := range s.buckets[i].new {
+				if s.admitted != nil {
+					if !s.admitted.Allows(n) {
+						s.removeNode(id, false)
+						if s.activeDone() {
+							return nil
+						}
+						continue
+					}
+					s.admitted.Add(n)
+				}
 				return n
 			}
 		}
@@ -316,6 +322,10 @@ func (s *Search) QueryTarget() *enode.Node {
 		var pick *enode.Node
 		var at mclock.AbsTime
 		for id, n := range s.spare {
+			if s.admitted != nil && !s.admitted.Allows(n) {
+				delete(s.spare, id)
+				continue
+			}
 			if t := s.asked.LastAsked(id); pick == nil || t < at {
 				pick, at = n, t
 			}
@@ -323,6 +333,9 @@ func (s *Search) QueryTarget() *enode.Node {
 		if pick != nil {
 			s.spareUsed = true
 			delete(s.spare, pick.ID())
+			if s.admitted != nil {
+				s.admitted.Add(pick)
+			}
 			return pick
 		}
 	}
