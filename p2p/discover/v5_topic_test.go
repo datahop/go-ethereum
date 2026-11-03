@@ -1336,6 +1336,36 @@ func TestHandleRegtopicOneClock(t *testing.T) {
 	<-done
 }
 
+// TestHandleTopicQueryExpiredAd checks that TOPICQUERY does not return an ad
+// past its expiry when the expiry alarm has not run yet.
+func TestHandleTopicQueryExpiredAd(t *testing.T) {
+	t.Parallel()
+	clock := new(mclock.Simulated)
+	test := newUDPV5TestClock(t, clock)
+	defer test.close()
+
+	ad := enode.NewV4(&newkey().PublicKey, net.IP{10, 0, 9, 1}, 30303, 30303)
+	seedTopicTable(t, test.udp, testTopic1, ad)
+	key, addr := newkey(), netip.MustParseAddrPort("10.0.1.1:30303")
+	id := test.getNode(key, addr).ID()
+
+	query := func(reqID byte, advance time.Duration) int {
+		test.udp.onDispatchCh <- func() {
+			clock.Run(advance)
+			test.udp.handleTopicQuery(id, addr, &v5wire.TopicQuery{ReqID: []byte{reqID}, Topic: testTopic1})
+		}
+		var n int
+		test.waitPacketOut(func(p *v5wire.TopicNodes, _ netip.AddrPort, _ v5wire.Nonce) { n = len(p.Nodes) })
+		return n
+	}
+	if n := query(1, 0); n != 1 {
+		t.Fatalf("live ad: got %d nodes, want 1", n)
+	}
+	if n := query(2, test.udp.topicTable.AdLifetime()); n != 0 {
+		t.Fatalf("expired ad: got %d nodes, want 0", n)
+	}
+}
+
 // TestHandleRegtopicForeignTicket checks that a ticket is bound to the node it
 // was issued to: presented by another node it is worth nothing and is not used
 // up, so that its owner can still redeem it in its window.

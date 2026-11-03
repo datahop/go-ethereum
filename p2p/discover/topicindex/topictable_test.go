@@ -102,6 +102,124 @@ func TestTopicTableRandomNodes(t *testing.T) {
 	t.Run(fmt.Sprint(N+1), func(t *testing.T) { check(t, N+1, N) })
 }
 
+// TestTopicTableRandomNodesExpired checks that RandomNodes does not return
+// ads past their expiry before Expire runs.
+func TestTopicTableRandomNodesExpired(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+	all := func(*enode.Node) bool { return true }
+
+	tab.Add(newNode(), topic1)
+	simclock.Run(tab.AdLifetime() + time.Second)
+	if got := tab.RandomNodes(topic1, 10, all); len(got) != 0 {
+		t.Fatalf("RandomNodes returned %d expired ads", len(got))
+	}
+
+	var old []*enode.Node
+	for i := 0; i < 5; i++ {
+		n := newNode()
+		tab.Add(n, topic1)
+		old = append(old, n)
+	}
+	simclock.Run(time.Minute)
+	live := make(map[enode.ID]bool)
+	for i := 0; i < 5; i++ {
+		n := newNode()
+		tab.Add(n, topic1)
+		live[n.ID()] = true
+	}
+	simclock.Run(tab.AdLifetime() - time.Second)
+	for _, n := range []int{3, 5, 10} {
+		got := uniqueNodeIDs(tab.RandomNodes(topic1, n, all))
+		want := min(n, len(live))
+		if len(got) != want {
+			t.Fatalf("RandomNodes(%d) returned %d nodes, want %d", n, len(got), want)
+		}
+		for _, id := range got {
+			if !live[id] {
+				t.Fatalf("RandomNodes(%d) returned expired ad %v", n, id)
+			}
+		}
+	}
+	for _, n := range old {
+		if tab.isRegistered(n, topic1) {
+			t.Fatal("expired ad still in the table")
+		}
+	}
+}
+
+// TestTopicTableReregisterExpired checks that a node whose ad has expired, but
+// not yet been removed, gets a new ad instead of being reported registered.
+func TestTopicTableReregisterExpired(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	n := newNode()
+	tab.Add(n, topic1)
+	simclock.Run(tab.AdLifetime() + time.Second)
+	if wt := tab.Register(n, topic1, maxWaitTime); wt != 0 {
+		t.Fatalf("Register returned %v, want 0", wt)
+	}
+	if tab.all.Len() != 1 || !tab.isRegistered(n, topic1) {
+		t.Fatalf("table has %d ads, want the new one only", tab.all.Len())
+	}
+	if got, want := tab.NextExpiryTime(), simclock.Now().Add(tab.AdLifetime()); got != want {
+		t.Fatalf("ad expires at %v, want a fresh expiry %v", got, want)
+	}
+}
+
+// TestTopicTableWaitTimeExpired checks that expired ads do not count toward
+// the waiting time before Expire runs.
+func TestTopicTableWaitTimeExpired(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	cfg.AdCacheSize = 100
+	newExpired := func() *TopicTable {
+		tab := NewTopicTable(cfg)
+		fillOther(t, tab, 92)
+		tab.Add(nodeWithIP(net.IP{11, 2, 3, 4}), topic1)
+		simclock.Run(tab.AdLifetime() + time.Second)
+		return tab
+	}
+	n := nodeWithIP(net.IP{11, 2, 3, 5})
+
+	empty := NewTopicTable(cfg).WaitTime(n, topic1)
+	if wt := newExpired().WaitTime(n, topic1); wt != empty {
+		t.Fatalf("WaitTime = %v, want the empty-table quote %v", wt, empty)
+	}
+	tab := newExpired()
+	if wt := tab.Register(n, topic1, 0); wt != 0 {
+		t.Fatalf("Register returned %v, want 0", wt)
+	}
+	if tab.all.Len() != 1 {
+		t.Fatalf("table has %d ads, want 1", tab.all.Len())
+	}
+}
+
+// TestTopicTableRegisterAtExpiredBound checks that expiring a topic's last ads
+// in RegisterAt keeps the topic's bound as of the given instant, even when the
+// bound decays on the clock before the call.
+func TestTopicTableRegisterAtExpiredBound(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+	_, bound := fillAndQuote(t, tab, 16)
+	now := bound.decayed().Add(-5 * time.Second)
+	if now < tab.nextAdExpiry() {
+		t.Fatal("ads must have expired at now")
+	}
+	simclock.Run(now.Sub(simclock.Now()) + 10*time.Second)
+	if wt := tab.RegisterAt(newNode(), topic1, 0, now); wt < 5*time.Second {
+		t.Fatalf("RegisterAt returned %v, want at least the 5s bound left at now", wt)
+	}
+}
+
 // TestLowerBoundDecay checks the decay and max-aggregation semantics of the
 // per-component lower bound (§6, "Lower Bound").
 func TestLowerBoundDecay(t *testing.T) {
