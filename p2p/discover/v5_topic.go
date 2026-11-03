@@ -91,6 +91,11 @@ func (sys *topicSystem) register(topic topicindex.TopicID, opid uint64) {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
+	select {
+	case <-sys.quit:
+		return
+	default:
+	}
 	if _, ok := sys.reg[topic]; ok {
 		return
 	}
@@ -124,6 +129,11 @@ func (sys *topicSystem) newSearchIterator(topic topicindex.TopicID, opid uint64)
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
+	select {
+	case <-sys.quit:
+		return enode.IterNodes(nil)
+	default:
+	}
 	resultCh := make(chan *enode.Node, 200)
 	s := newTopicSearch(sys, topic, resultCh, opid)
 	return newTopicSearchIterator(sys, s, resultCh)
@@ -453,7 +463,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 	gap := regloopMinTime
 	for {
 		if time >= 0 {
-			if exit := s.pause(time, gap); exit {
+			if exit := s.pause(sys, time, gap); exit {
 				return
 			}
 		}
@@ -515,7 +525,7 @@ func (s *topicSearch) passGap(nresults int, moved bool) time.Duration {
 
 // pause ensures that top-level search loop iterations take at least gap.
 // This prevents the loop from running too hot when the local node table is very empty.
-func (s *topicSearch) pause(lastTime mclock.AbsTime, gap time.Duration) bool {
+func (s *topicSearch) pause(sys *topicSystem, lastTime mclock.AbsTime, gap time.Duration) bool {
 	d := s.config.Clock.Now().Sub(lastTime)
 	if d < gap {
 		sleep := s.config.Clock.NewTimer(gap - d)
@@ -527,6 +537,8 @@ func (s *topicSearch) pause(lastTime mclock.AbsTime, gap time.Duration) bool {
 			case <-s.newNodesCh:
 				// Drain the channel to avoid blocking the Table's feed sender.
 			case <-s.quit:
+				return true
+			case <-sys.quit:
 				return true
 			}
 		}
@@ -581,6 +593,8 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 
 		select {
 		case <-s.quit:
+			return true, nresults
+		case <-sys.quit:
 			return true, nresults
 
 		case <-s.newNodesCh:
@@ -660,6 +674,8 @@ func (s *topicSearch) runRequests(sys *topicSystem) {
 		select {
 		case s.queryRespCh <- result:
 		case <-s.quit:
+			return
+		case <-sys.quit:
 			return
 		}
 	}
