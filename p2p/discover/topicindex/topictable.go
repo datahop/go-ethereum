@@ -102,6 +102,8 @@ func (tab *TopicTable) Nodes(topic TopicID) []*enode.Node {
 // RandomNodes returns n random nodes registered for a topic.
 // It only collects nodes for which the 'check' function returns true.
 func (tab *TopicTable) RandomNodes(topic TopicID, n int, check func(*enode.Node) bool) []*enode.Node {
+	now := tab.config.Clock.Now()
+	tab.expireAt(now)
 	reglist := tab.reg[topic]
 	if reglist == nil || n == 0 {
 		return []*enode.Node{}
@@ -116,7 +118,7 @@ func (tab *TopicTable) RandomNodes(topic TopicID, n int, check func(*enode.Node)
 	e := reglist.Front()
 	for ; e != nil && len(nodes) < n; e = e.Next() {
 		reg := e.Value.(*topicTableEntry)
-		if check(reg.node) {
+		if reg.exp > now && check(reg.node) {
 			nodes = append(nodes, reg.node)
 		}
 	}
@@ -125,7 +127,7 @@ func (tab *TopicTable) RandomNodes(topic TopicID, n int, check func(*enode.Node)
 	seen := len(nodes)
 	for ; e != nil; e = e.Next() {
 		reg := e.Value.(*topicTableEntry)
-		if !check(reg.node) {
+		if reg.exp <= now || !check(reg.node) {
 			continue
 		}
 		seen++
@@ -157,7 +159,10 @@ func (tab *TopicTable) nextAdExpiry() mclock.AbsTime {
 
 // Expire removes inactive registrations.
 func (tab *TopicTable) Expire() {
-	now := tab.config.Clock.Now()
+	tab.expireAt(tab.config.Clock.Now())
+}
+
+func (tab *TopicTable) expireAt(now mclock.AbsTime) {
 	// Capture Next() before remove; list.Remove nils the element's next/prev
 	// pointers, so e.Next() after remove would return nil.
 	for e := tab.all.Front(); e != nil; {
@@ -166,7 +171,7 @@ func (tab *TopicTable) Expire() {
 		if reg.exp > now {
 			break
 		}
-		tab.remove(reg)
+		tab.remove(reg, now)
 		tab.wt.removeReg(reg)
 		e = next
 	}
@@ -191,8 +196,10 @@ func (tab *TopicTable) isRegistered(n *enode.Node, t TopicID) bool {
 // Add adds a registration of node n for a topic. This only works when the table
 // has space available.
 func (tab *TopicTable) Add(n *enode.Node, topic TopicID) bool {
+	now := tab.config.Clock.Now()
+	tab.expireAt(now)
 	if tab.all.Len() < tab.config.AdCacheSize {
-		tab.add(n, topic, tab.config.Clock.Now())
+		tab.add(n, topic, now)
 		return true
 	}
 	return false
@@ -221,14 +228,14 @@ func (tab *TopicTable) RemoveNode(id enode.ID) {
 		next := e.Next()
 		reg := e.Value.(*topicTableEntry)
 		if reg.node.ID() == id {
-			tab.remove(reg)
+			tab.remove(reg, tab.config.Clock.Now())
 			tab.wt.removeReg(reg)
 		}
 		e = next
 	}
 }
 
-func (tab *TopicTable) remove(reg *topicTableEntry) {
+func (tab *TopicTable) remove(reg *topicTableEntry, now mclock.AbsTime) {
 	tab.all.Remove(reg.allElem)
 	topicList := tab.reg[reg.topic]
 	if topicList.Len() == 1 {
@@ -236,7 +243,7 @@ func (tab *TopicTable) remove(reg *topicTableEntry) {
 		// The topic's bound must outlive its last ad, or the next quote for it
 		// could undercut the previous one. A still-active bound is pruned in
 		// Expire once it decays.
-		if b := tab.wt.topicBounds[reg.topic]; b.remaining(tab.config.Clock.Now()) == 0 {
+		if b := tab.wt.topicBounds[reg.topic]; b.remaining(now) == 0 {
 			delete(tab.wt.topicBounds, reg.topic)
 		} else {
 			tab.wt.schedulePrune(b.decayed())
@@ -259,7 +266,9 @@ func (tab *TopicTable) topicSize(t TopicID) int {
 
 // WaitTime returns the amount of time that node n must have waited to register for topic t.
 func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
-	total, _ := tab.waitTime(n, t, tab.config.Clock.Now())
+	now := tab.config.Clock.Now()
+	tab.expireAt(now)
+	total, _ := tab.waitTime(n, t, now)
 	return total
 }
 
@@ -367,6 +376,9 @@ func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration
 // passes the same instant, so that the credit and the required wait are
 // compared at one time.
 func (tab *TopicTable) RegisterAt(n *enode.Node, t TopicID, waitTime time.Duration, now mclock.AbsTime) time.Duration {
+	// Expired ads must not count as registered or toward the waiting time.
+	tab.expireAt(now)
+
 	// Reject attempt if node is already registered.
 	if tab.isRegistered(n, t) {
 		return 0
@@ -387,14 +399,7 @@ func (tab *TopicTable) RegisterAt(n *enode.Node, t TopicID, waitTime time.Durati
 
 	// Check if there is space. If not, the node needs to come back when a slot opens.
 	if tab.all.Len() >= tab.config.AdCacheSize {
-		if wait := tab.nextAdExpiry().Sub(now); wait > 0 {
-			return wait
-		}
-		// An ad is past its expiry but Expire has not run yet.
-		tab.Expire()
-		if tab.all.Len() >= tab.config.AdCacheSize {
-			return tab.nextAdExpiry().Sub(now)
-		}
+		return tab.nextAdExpiry().Sub(now)
 	}
 
 	tab.add(n, t, now)
