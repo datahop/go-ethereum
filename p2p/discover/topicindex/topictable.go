@@ -187,14 +187,9 @@ func (tab *TopicTable) RandomNodes(topic TopicID, n int, check func(*enode.Node)
 	return nodes
 }
 
-// NextExpiryTime returns the time when Expire is next due: when the next
-// registration expires, or when the bound of a topic without ads decays.
+// NextExpiryTime returns the time when the next registration expires.
 func (tab *TopicTable) NextExpiryTime() mclock.AbsTime {
-	next := tab.wt.pruneAt
-	if exp := tab.nextAdExpiry(); exp != Never && (next == Never || exp < next) {
-		next = exp
-	}
-	return next
+	return tab.nextAdExpiry()
 }
 
 // nextAdExpiry returns when the next registration expires.
@@ -219,12 +214,9 @@ func (tab *TopicTable) expireAt(now mclock.AbsTime) {
 		if reg.exp > now {
 			break
 		}
-		tab.remove(reg, now)
+		tab.remove(reg)
 		tab.wt.removeReg(reg)
 		e = next
-	}
-	if tab.wt.pruneAt != Never && now >= tab.wt.pruneAt {
-		tab.wt.pruneTopicBounds(tab.reg, now)
 	}
 }
 
@@ -282,26 +274,22 @@ func (tab *TopicTable) RemoveNode(id enode.ID) {
 		next := e.Next()
 		reg := e.Value.(*topicTableEntry)
 		if reg.node.ID() == id {
-			tab.remove(reg, tab.config.Clock.Now())
+			tab.remove(reg)
 			tab.wt.removeReg(reg)
 		}
 		e = next
 	}
 }
 
-func (tab *TopicTable) remove(reg *topicTableEntry, now mclock.AbsTime) {
+func (tab *TopicTable) remove(reg *topicTableEntry) {
 	tab.all.Remove(reg.allElem)
 	topicList := tab.reg[reg.topic]
 	if topicList.Len() == 1 {
 		delete(tab.reg, reg.topic)
-		// The topic's bound must outlive its last ad, or the next quote for it
-		// could undercut the previous one. A still-active bound is pruned in
-		// Expire once it decays.
-		if b := tab.wt.topicBounds[reg.topic]; b.remaining(now) == 0 {
-			delete(tab.wt.topicBounds, reg.topic)
-		} else {
-			tab.wt.schedulePrune(b.decayed())
-		}
+		// The topic's last ad is leaving the cache, so its service component
+		// returns to zero and its lower-bound entry can be dropped. This keeps
+		// topicBounds bounded by the number of distinct topics in the cache.
+		delete(tab.wt.topicBounds, reg.topic)
 	} else {
 		topicList.Remove(reg.topicElem)
 	}
@@ -400,8 +388,8 @@ func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (t
 // The G term is not recorded and drops when occupancy falls.
 func (tab *TopicTable) recordWaitTime(c waitTimeComponents, now mclock.AbsTime) {
 	// Service component. serviceSecs > 0 implies the topic has at least one ad in
-	// the cache, so only topics that held an ad get an entry. Once the topic
-	// leaves the cache, the entry is dropped when its bound has decayed.
+	// the cache, so the entry count is bounded by the cache capacity; the entry is
+	// dropped in remove() when the topic's last ad leaves.
 	if c.serviceSecs > 0 {
 		b := tab.wt.topicBounds[c.topic]
 		b.bump(secondsToDuration(c.serviceSecs), now)
@@ -504,11 +492,6 @@ func (lb lowerBound) remaining(now mclock.AbsTime) time.Duration {
 	return d
 }
 
-// decayed returns the time at which the floor reaches zero.
-func (lb lowerBound) decayed() mclock.AbsTime {
-	return lb.since.Add(lb.value)
-}
-
 // bump raises the floor to v (recorded at 'now') when v exceeds the currently
 // remaining floor, and returns the value that should actually be charged.
 func (lb *lowerBound) bump(v time.Duration, now mclock.AbsTime) time.Duration {
@@ -534,7 +517,6 @@ type waitTimeState struct {
 	ipv4        *ipTree
 	ipv6        *ipTree
 	topicBounds map[TopicID]lowerBound
-	pruneAt     mclock.AbsTime // when the next bound of a topic without ads decays
 }
 
 func newWaitTimeState() waitTimeState {
@@ -542,33 +524,6 @@ func newWaitTimeState() waitTimeState {
 		ipv4:        newIPTree(32),
 		ipv6:        newIPTree(128),
 		topicBounds: make(map[TopicID]lowerBound),
-		pruneAt:     Never,
-	}
-}
-
-// pruneTopicBounds drops the decayed bounds of topics that have no ad in the
-// cache, and sets pruneAt to when the next of the remaining ones decays.
-// A bound needs an ad of its topic and lasts up to maxWaitTime (a full table
-// quotes that), so about AdCacheSize*maxWaitTime/AdLifetime entries can be kept
-// (480k at defaults).
-func (wt *waitTimeState) pruneTopicBounds(reg map[TopicID]*list.List, now mclock.AbsTime) {
-	wt.pruneAt = Never
-	for t, b := range wt.topicBounds {
-		if reg[t] != nil {
-			continue
-		}
-		if b.remaining(now) == 0 {
-			delete(wt.topicBounds, t)
-		} else {
-			wt.schedulePrune(b.decayed())
-		}
-	}
-}
-
-// schedulePrune sets pruneAt to at if that is sooner.
-func (wt *waitTimeState) schedulePrune(at mclock.AbsTime) {
-	if wt.pruneAt == Never || at < wt.pruneAt {
-		wt.pruneAt = at
 	}
 }
 
