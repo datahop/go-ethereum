@@ -36,10 +36,8 @@ type topicSystem struct {
 	transport *UDPv5
 	config    topicindex.Config
 
-	mu       sync.Mutex
-	reg      map[topicindex.TopicID]*topicReg
-	searches map[*topicSearch]struct{}
-	stopped  bool
+	mu  sync.Mutex
+	reg map[topicindex.TopicID]*topicReg
 
 	wg   sync.WaitGroup
 	quit chan struct{}
@@ -50,7 +48,6 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 		transport: transport,
 		config:    config,
 		reg:       make(map[topicindex.TopicID]*topicReg),
-		searches:  make(map[*topicSearch]struct{}),
 		quit:      make(chan struct{}),
 	}
 	sys.wg.Add(1)
@@ -94,7 +91,12 @@ func (sys *topicSystem) register(topic topicindex.TopicID, opid uint64) {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
-	if _, ok := sys.reg[topic]; ok || sys.stopped {
+	select {
+	case <-sys.quit:
+		return
+	default:
+	}
+	if _, ok := sys.reg[topic]; ok {
 		return
 	}
 	sys.reg[topic] = newTopicReg(sys, topic, opid)
@@ -115,42 +117,25 @@ func (sys *topicSystem) stop() {
 	sys.wg.Wait()
 
 	sys.mu.Lock()
-	sys.stopped = true
-	searches := sys.searches
-	sys.searches = nil
-	sys.mu.Unlock()
-
-	for s := range searches {
-		s.stop()
-	}
-
-	sys.mu.Lock()
 	defer sys.mu.Unlock()
+
 	for topic, reg := range sys.reg {
 		reg.stop()
 		delete(sys.reg, topic)
 	}
 }
 
-// stopSearch is called by the iterator's Close. The search stays registered
-// until it has stopped, so that a concurrent stop waits for it too.
-func (sys *topicSystem) stopSearch(s *topicSearch) {
-	s.stop()
-	sys.mu.Lock()
-	delete(sys.searches, s)
-	sys.mu.Unlock()
-}
-
 func (sys *topicSystem) newSearchIterator(topic topicindex.TopicID, opid uint64) enode.Iterator {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
-	if sys.stopped {
+	select {
+	case <-sys.quit:
 		return enode.IterNodes(nil)
+	default:
 	}
 	resultCh := make(chan *enode.Node, 200)
 	s := newTopicSearch(sys, topic, resultCh, opid)
-	sys.searches[s] = struct{}{}
 	return newTopicSearchIterator(sys, s, resultCh)
 }
 
@@ -418,9 +403,8 @@ type topicSearch struct {
 	opid   uint64
 	config topicindex.Config
 
-	wg       sync.WaitGroup
-	quit     chan struct{}
-	quitOnce sync.Once // both the iterator's Close and the topic system's stop stop the search
+	wg   sync.WaitGroup
+	quit chan struct{}
 
 	queryCh      chan topicQueryJob
 	queryRespCh  chan topicQueryResult
@@ -466,7 +450,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 }
 
 func (s *topicSearch) stop() {
-	s.quitOnce.Do(func() { close(s.quit) })
+	close(s.quit)
 	s.wg.Wait()
 }
 
@@ -479,7 +463,7 @@ func (s *topicSearch) runLoop(sys *topicSystem) {
 	gap := regloopMinTime
 	for {
 		if time >= 0 {
-			if exit := s.pause(time, gap); exit {
+			if exit := s.pause(sys, time, gap); exit {
 				return
 			}
 		}
@@ -541,7 +525,7 @@ func (s *topicSearch) passGap(nresults int, moved bool) time.Duration {
 
 // pause ensures that top-level search loop iterations take at least gap.
 // This prevents the loop from running too hot when the local node table is very empty.
-func (s *topicSearch) pause(lastTime mclock.AbsTime, gap time.Duration) bool {
+func (s *topicSearch) pause(sys *topicSystem, lastTime mclock.AbsTime, gap time.Duration) bool {
 	d := s.config.Clock.Now().Sub(lastTime)
 	if d < gap {
 		sleep := s.config.Clock.NewTimer(gap - d)
@@ -553,6 +537,8 @@ func (s *topicSearch) pause(lastTime mclock.AbsTime, gap time.Duration) bool {
 			case <-s.newNodesCh:
 				// Drain the channel to avoid blocking the Table's feed sender.
 			case <-s.quit:
+				return true
+			case <-sys.quit:
 				return true
 			}
 		}
@@ -607,6 +593,8 @@ func (s *topicSearch) run(sys *topicSystem, state *topicindex.Search) (exit bool
 
 		select {
 		case <-s.quit:
+			return true, nresults
+		case <-sys.quit:
 			return true, nresults
 
 		case <-s.newNodesCh:
@@ -687,6 +675,8 @@ func (s *topicSearch) runRequests(sys *topicSystem) {
 		case s.queryRespCh <- result:
 		case <-s.quit:
 			return
+		case <-sys.quit:
+			return
 		}
 	}
 }
@@ -719,7 +709,7 @@ func (tsi *topicSearchIterator) Node() *enode.Node {
 }
 
 func (tsi *topicSearchIterator) Close() {
-	tsi.closing.Do(func() { tsi.sys.stopSearch(tsi.search) })
+	tsi.closing.Do(tsi.search.stop)
 }
 
 // filterTopicDiscovery returns only the nodes that advertise a supported

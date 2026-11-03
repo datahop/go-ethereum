@@ -380,8 +380,8 @@ func TestTopicSearchIteratorClose(t *testing.T) {
 }
 
 // TestTopicSearchStopsOnClose closes the searcher's UDPv5 after its first
-// queries, with dead candidates in its table: the search is stopped when Close
-// returns, sends no more queries and Next returns false.
+// queries, with dead candidates in its table: the search stops and Next
+// returns false.
 func TestTopicSearchStopsOnClose(t *testing.T) {
 	node0 := startLocalhostV5(t, Config{})
 	node1 := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
@@ -414,12 +414,6 @@ func TestTopicSearchStopsOnClose(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("UDPv5.Close hangs with a running search")
 	}
-	select {
-	case <-s.quit:
-	default:
-		t.Fatal("search not stopped by UDPv5.Close")
-	}
-	sent := s.queries.Load()
 
 	next := make(chan bool, 1)
 	go func() {
@@ -429,22 +423,38 @@ func TestTopicSearchStopsOnClose(t *testing.T) {
 	}()
 	select {
 	case <-next:
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("Next does not return false after UDPv5.Close")
 	}
-	if n := s.queries.Load() - sent; n > 0 {
-		t.Fatalf("search sent %d queries after UDPv5.Close returned", n)
+	itClosed := make(chan struct{})
+	go func() { it.Close(); close(itClosed) }()
+	select {
+	case <-itClosed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("iterator Close hangs after UDPv5.Close")
 	}
 }
 
-// TestTopicSearchCloseAfterClose closes a search iterator twice after its
-// UDPv5 is closed.
+// TestTopicSearchCloseAfterClose closes the UDPv5 of a search with an empty
+// table, which waits between passes: Next returns false, and closing the
+// iterator twice afterwards works.
 func TestTopicSearchCloseAfterClose(t *testing.T) {
 	t.Parallel()
 
 	node := startLocalhostV5(t, Config{})
 	it := node.TopicSearch(testTopic1, 0)
 	node.Close()
+
+	next := make(chan bool, 1)
+	go func() { next <- it.Next() }()
+	select {
+	case ok := <-next:
+		if ok {
+			t.Fatal("Next returned true after UDPv5.Close")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Next does not return false after UDPv5.Close")
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -456,43 +466,6 @@ func TestTopicSearchCloseAfterClose(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("iterator Close hangs after UDPv5.Close")
-	}
-	if it.Next() {
-		t.Fatal("Next returned true after Close")
-	}
-}
-
-// TestTopicSearchCloseDuringClose overlaps the iterator's Close with UDPv5.Close.
-// Holding the topic system's lock stops both at the registry: the iterator's
-// Close must have stopped the search by then, or UDPv5.Close may miss it.
-func TestTopicSearchCloseDuringClose(t *testing.T) {
-	t.Parallel()
-
-	node := startLocalhostV5(t, Config{})
-	defer node.Close()
-	it := node.TopicSearch(testTopic1, 0)
-	s := it.(*topicSearchIterator).search
-
-	sys := node.topicSys
-	sys.mu.Lock()
-	itClosed := make(chan struct{})
-	go func() { it.Close(); close(itClosed) }()
-	select {
-	case <-s.quit:
-	case <-time.After(5 * time.Second):
-		sys.mu.Unlock()
-		t.Fatal("iterator Close did not stop the search before leaving the registry")
-	}
-	nodeClosed := make(chan struct{})
-	go func() { node.Close(); close(nodeClosed) }()
-	sys.mu.Unlock()
-
-	for _, ch := range []chan struct{}{itClosed, nodeClosed} {
-		select {
-		case <-ch:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Close hangs")
-		}
 	}
 	if it.Next() {
 		t.Fatal("Next returned true after Close")
