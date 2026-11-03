@@ -36,8 +36,10 @@ type topicSystem struct {
 	transport *UDPv5
 	config    topicindex.Config
 
-	mu  sync.Mutex
-	reg map[topicindex.TopicID]*topicReg
+	mu       sync.Mutex
+	reg      map[topicindex.TopicID]*topicReg
+	searches map[*topicSearch]struct{}
+	stopped  bool
 
 	wg   sync.WaitGroup
 	quit chan struct{}
@@ -48,6 +50,7 @@ func newTopicSystem(transport *UDPv5, config topicindex.Config) *topicSystem {
 		transport: transport,
 		config:    config,
 		reg:       make(map[topicindex.TopicID]*topicReg),
+		searches:  make(map[*topicSearch]struct{}),
 		quit:      make(chan struct{}),
 	}
 	sys.wg.Add(1)
@@ -91,7 +94,7 @@ func (sys *topicSystem) register(topic topicindex.TopicID, opid uint64) {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
-	if _, ok := sys.reg[topic]; ok {
+	if _, ok := sys.reg[topic]; ok || sys.stopped {
 		return
 	}
 	sys.reg[topic] = newTopicReg(sys, topic, opid)
@@ -112,20 +115,42 @@ func (sys *topicSystem) stop() {
 	sys.wg.Wait()
 
 	sys.mu.Lock()
-	defer sys.mu.Unlock()
+	sys.stopped = true
+	searches := sys.searches
+	sys.searches = nil
+	sys.mu.Unlock()
 
+	for s := range searches {
+		s.stop()
+	}
+
+	sys.mu.Lock()
+	defer sys.mu.Unlock()
 	for topic, reg := range sys.reg {
 		reg.stop()
 		delete(sys.reg, topic)
 	}
 }
 
+// stopSearch is called by the iterator's Close. The search stays registered
+// until it has stopped, so that a concurrent stop waits for it too.
+func (sys *topicSystem) stopSearch(s *topicSearch) {
+	s.stop()
+	sys.mu.Lock()
+	delete(sys.searches, s)
+	sys.mu.Unlock()
+}
+
 func (sys *topicSystem) newSearchIterator(topic topicindex.TopicID, opid uint64) enode.Iterator {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
+	if sys.stopped {
+		return enode.IterNodes(nil)
+	}
 	resultCh := make(chan *enode.Node, 200)
 	s := newTopicSearch(sys, topic, resultCh, opid)
+	sys.searches[s] = struct{}{}
 	return newTopicSearchIterator(sys, s, resultCh)
 }
 
@@ -393,8 +418,9 @@ type topicSearch struct {
 	opid   uint64
 	config topicindex.Config
 
-	wg   sync.WaitGroup
-	quit chan struct{}
+	wg       sync.WaitGroup
+	quit     chan struct{}
+	quitOnce sync.Once // both the iterator's Close and the topic system's stop stop the search
 
 	queryCh      chan topicQueryJob
 	queryRespCh  chan topicQueryResult
@@ -440,7 +466,7 @@ func newTopicSearch(sys *topicSystem, topic topicindex.TopicID, out chan *enode.
 }
 
 func (s *topicSearch) stop() {
-	close(s.quit)
+	s.quitOnce.Do(func() { close(s.quit) })
 	s.wg.Wait()
 }
 
@@ -693,7 +719,7 @@ func (tsi *topicSearchIterator) Node() *enode.Node {
 }
 
 func (tsi *topicSearchIterator) Close() {
-	tsi.closing.Do(tsi.search.stop)
+	tsi.closing.Do(func() { tsi.sys.stopSearch(tsi.search) })
 }
 
 // filterTopicDiscovery returns only the nodes that advertise a supported
