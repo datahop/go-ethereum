@@ -58,6 +58,9 @@ const (
 
 	// Maximum amount of time allowed for writing a complete message.
 	frameWriteTimeout = 20 * time.Second
+
+	// Receive buffer requested for the discovery UDP socket.
+	discoveryReadBuffer = 8 << 20
 )
 
 var (
@@ -581,6 +584,7 @@ func (srv *Server) setupUDPListening() (*net.UDPConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	setUDPReadBuffer(conn, discoveryReadBuffer, srv.log)
 	laddr := conn.LocalAddr().(*net.UDPAddr)
 	srv.localnode.SetFallbackUDP(laddr.Port)
 	srv.log.Debug("UDP listener up", "addr", laddr)
@@ -593,6 +597,33 @@ func (srv *Server) setupUDPListening() (*net.UDPConn, error) {
 	}
 
 	return conn, nil
+}
+
+// setUDPReadBuffer requests a receive buffer of size bytes on conn and warns if the
+// kernel grants less. A larger existing buffer is kept. Errors are logged and
+// otherwise ignored.
+func setUDPReadBuffer(conn *net.UDPConn, size int, logger log.Logger) {
+	if current, err := udpReadBufferSize(conn); err == nil && current >= size {
+		logger.Debug("UDP receive buffer already large enough", "size", current, "requested", size)
+		return
+	}
+	if err := conn.SetReadBuffer(size); err != nil {
+		logger.Warn("Failed to set UDP receive buffer", "size", size, "err", err)
+		return
+	}
+	effective, err := udpReadBufferSize(conn)
+	if errors.Is(err, errors.ErrUnsupported) {
+		return
+	}
+	if err != nil {
+		logger.Warn("Failed to read UDP receive buffer size", "err", err)
+		return
+	}
+	if effective < size {
+		logger.Warn("UDP receive buffer smaller than requested, raise net.core.rmem_max", "requested", size, "effective", effective)
+	} else {
+		logger.Debug("UDP receive buffer set", "size", effective)
+	}
 }
 
 // doPeerOp runs fn on the main loop.
