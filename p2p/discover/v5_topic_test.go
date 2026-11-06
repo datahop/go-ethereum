@@ -140,10 +140,13 @@ func waitForTable(t *testing.T, node *UDPv5, nodes []*enode.Node) {
 	}
 }
 
-// TestTopicSearchMixesRegistrars runs a search over five registrars that each
-// hold two ads of their own: the first five results come from five different
-// registrars, and every ad is returned.
+// TestTopicSearchMixesRegistrars runs a search over eleven registrars that each
+// hold two ads of their own. The tenth reply releases the results: the first
+// ten come from ten different registrars, the next from one of those again
+// rather than from the eleventh, as it would if they waited for the end of the
+// pass. Every ad is returned.
 func TestTopicSearchMixesRegistrars(t *testing.T) {
+	const mixRegistrars = 10 // topicindex.searchMixRegistrars
 	node0 := startLocalhostV5(t, Config{})
 	var all []*UDPv5
 	defer func() {
@@ -155,7 +158,7 @@ func TestTopicSearchMixesRegistrars(t *testing.T) {
 	regOf := make(map[enode.ID]int)
 	var regs []*enode.Node
 	var ads []*enode.Node
-	for i := 0; i < 5; i++ {
+	for i := 0; i < mixRegistrars+1; i++ {
 		reg := startLocalhostV5(t, Config{Bootnodes: []*enode.Node{node0.Self()}})
 		all = append(all, reg)
 		regs = append(regs, reg.Self())
@@ -168,7 +171,11 @@ func TestTopicSearchMixesRegistrars(t *testing.T) {
 		seedTopicTable(t, reg, testTopic1, own...)
 		ads = append(ads, own...)
 	}
-	searcher := startLocalhostV5(t, Config{Bootnodes: append([]*enode.Node{node0.Self()}, regs...)})
+	searcher := startLocalhostV5(t, Config{
+		Bootnodes: append([]*enode.Node{node0.Self()}, regs...),
+		// Random IDs can crowd one search bucket: the pass must keep them all.
+		Topic: topicindex.Config{SearchBucketSize: len(regs) + 1},
+	})
 	all = append(all, searcher)
 	waitForTable(t, searcher, regs)
 
@@ -185,11 +192,14 @@ func TestTopicSearchMixesRegistrars(t *testing.T) {
 		t.Fatalf("got %d results, want %d", len(found), len(ads))
 	}
 	seen := make(map[int]bool)
-	for _, n := range found[:5] {
+	for _, n := range found[:mixRegistrars] {
 		seen[regOf[n.ID()]] = true
 	}
-	if len(seen) != 5 {
-		t.Fatalf("first five results came from %d registrars, want 5", len(seen))
+	if len(seen) != mixRegistrars {
+		t.Fatalf("first %d results came from %d registrars, want %d", mixRegistrars, len(seen), mixRegistrars)
+	}
+	if !seen[regOf[found[mixRegistrars].ID()]] {
+		t.Fatalf("result %d came from the registrar that replied last: results were held past the threshold", mixRegistrars)
 	}
 	sortByID(found)
 	sortByID(ads)
