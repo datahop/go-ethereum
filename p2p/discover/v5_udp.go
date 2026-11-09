@@ -701,14 +701,22 @@ func (t *UDPv5) regtopic(quit <-chan struct{}, n *enode.Node, topic topicindex.T
 		confirmed bool
 		result    topicRegResult
 		received  int
+		packets   int // all packets delivered, of any type
 		total     = -1
 	)
 	for result.err == nil && (!confirmed || (total >= 0 && received < total)) {
+		if packets >= regtopicNodesLimit {
+			if !confirmed {
+				result.err = errTooManyResponses
+			}
+			break
+		}
 		select {
 		case <-quit:
 			result.err = errClosed
 			return result
 		case responseMsg := <-c.ch:
+			packets++
 			switch resp := responseMsg.(type) {
 			case *v5wire.Regconfirmation:
 				if total == -1 {
@@ -735,6 +743,11 @@ func (t *UDPv5) regtopic(quit <-chan struct{}, n *enode.Node, topic topicindex.T
 				}
 			}
 		case err := <-c.err:
+			if err == errTimeout && confirmed {
+				// Only NODES packets are missing, the confirmation still holds.
+				result.nodes = nodes
+				return result
+			}
 			result.err = err
 		}
 	}
@@ -756,14 +769,20 @@ func (t *UDPv5) topicQuery(quit <-chan struct{}, n *enode.Node, topic topicindex
 		topicSeen  = make(map[enode.ID]struct{})
 		result     topicQueryResult
 		received   int
+		packets    int // all packets delivered, of any type
 		total      = -1
 	)
 	for result.err == nil && (total < 0 || received < total) {
+		if packets >= topicNodesResultLimit {
+			result.err = errTooManyResponses
+			break
+		}
 		select {
 		case <-quit:
 			result.err = errClosed
 			return result
 		case responseMsg := <-c.ch:
+			packets++
 			switch resp := responseMsg.(type) {
 			case *v5wire.Nodes:
 				if total == -1 {
@@ -1227,8 +1246,9 @@ func (t *UDPv5) handleUnknown(p *v5wire.Unknown, fromID enode.ID, fromAddr netip
 }
 
 var (
-	errChallengeNoCall = errors.New("no matching call")
-	errChallengeTwice  = errors.New("second handshake")
+	errChallengeNoCall  = errors.New("no matching call")
+	errChallengeTwice   = errors.New("second handshake")
+	errTooManyResponses = errors.New("too many responses")
 )
 
 // handleWhoareyou resends the active call as a handshake packet.
