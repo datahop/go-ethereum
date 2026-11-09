@@ -16,7 +16,9 @@
 
 package discover
 
-// These tests follow a waiting time from TopicTable.Register through the
+// Regression tests for the waiting-time overflow (finding F1 of the registrar
+// overhead study), fixed by #155 (cap at maxWaitTime) and #157 (saturating wire
+// decode, sub-floor clamp). They follow a waiting time from TopicTable.Register through the
 // REGCONFIRMATION encoding (waitTimeToMs), the advertiser's decoding
 // (v5_topic.go: time.Duration(ms) * time.Millisecond) and ticket validation
 // (TicketSealer.Unpack) at high cache occupancy, where the occupancy factor
@@ -30,7 +32,6 @@ import (
 	"math"
 	mrand "math/rand"
 	"net"
-	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -120,7 +121,7 @@ func overflowProbe(n int, c overflowCase) overflowResult {
 	enc := sealer.Pack(ticket)
 	res.wireMs = waitTimeToMs(res.wait)
 	// v5_topic.go: advertiser decoding of the wire value.
-	res.clientWait = time.Duration(res.wireMs) * time.Millisecond
+	res.clientWait = waitTimeFromMs(res.wireMs)
 	switch {
 	case res.clientWait <= 0:
 		// The advertiser schedules its retry at now+clientWait, i.e. immediately.
@@ -157,8 +158,9 @@ func TestRegisterHighOccupancy(t *testing.T) {
 	}
 }
 
-// TestRegisterOverflowThreshold finds the smallest occupancy at which the
-// float waiting time no longer fits a time.Duration.
+// TestRegisterOverflowThreshold checks that no occupancy makes the float
+// waiting time overflow a time.Duration (F1, fixed by #155). It logs the first
+// overflowing occupancy, -1 if none.
 func TestRegisterOverflowThreshold(t *testing.T) {
 	for _, c := range overflowCases {
 		first := -1
@@ -170,18 +172,18 @@ func TestRegisterOverflowThreshold(t *testing.T) {
 			}
 		}
 		t.Logf("%s: GOARCH=%s first overflowing occupancy N=%d of C=%d", c.name, runtime.GOARCH, first, overflowCapacity)
+		if first >= 0 {
+			t.Errorf("%s: waiting time overflows at N=%d", c.name, first)
+		}
 	}
 }
 
-// TestRegisterHighOccupancyInvariants fails with the current code. At any
-// occupancy >= 80% with a non-empty topic, the required wait exceeds the 1s
-// admission floor by many orders of magnitude, so a fresh ad without credit
-// must not be admitted, and an advertiser that waits as told must be able to
-// retry. Skipped unless TOPDISC_SPEC_STRICT=1.
+// TestRegisterHighOccupancyInvariants: at any occupancy >= 80% the required
+// wait exceeds the 1s admission floor by orders of magnitude, so a fresh ad
+// without credit must not be admitted, the quote must decode to a positive wait
+// no longer than the cap, and an advertiser that waits as told must be able to
+// retry. Failed before #155/#157 (F1).
 func TestRegisterHighOccupancyInvariants(t *testing.T) {
-	if os.Getenv("TOPDISC_SPEC_STRICT") == "" {
-		t.Skip("known production issue, see TestRegisterHighOccupancy; set TOPDISC_SPEC_STRICT=1 to run")
-	}
 	for _, pct := range []int{80, 85, 90, 95, 99, 100} {
 		for _, c := range overflowCases {
 			n := pct * overflowCapacity / 100
@@ -189,7 +191,7 @@ func TestRegisterHighOccupancyInvariants(t *testing.T) {
 			switch {
 			case r.admitted:
 				t.Errorf("%d%% %s: fresh ad admitted without credit (WaitTime=%v)", pct, c.name, r.required)
-			case r.wait > 0 && r.clientWait <= 0:
+			case r.wait > 0 && (r.clientWait <= 0 || r.clientWait > 24*time.Hour):
 				t.Errorf("%d%% %s: wait %v decodes to %v at the advertiser", pct, c.name, r.wait, r.clientWait)
 			case r.wait > 0 && r.ticketOK != "valid" && r.clientWait <= 6*time.Hour:
 				// Longer waits outlive the ticket key (ticketKeyLifetime); that is
@@ -217,7 +219,8 @@ func TestRegisterFullCacheNaN(t *testing.T) {
 }
 
 // TestTicketOutlivesKey records that a ticket whose wait exceeds the 6h ticket
-// key lifetime is rejected when the key has not been used since it was issued.
+// key lifetime is rejected when the key has not been used since it was issued
+// (F3, still open: the registrar quotes up to maxWaitTime = 24h).
 func TestTicketOutlivesKey(t *testing.T) {
 	clock := new(mclock.Simulated)
 	sealer := topicindex.NewTicketSealer(clock)

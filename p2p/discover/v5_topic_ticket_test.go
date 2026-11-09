@@ -19,54 +19,19 @@ package discover
 import (
 	"net"
 	"net/netip"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
-	"github.com/ethereum/go-ethereum/internal/testlog"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/discover/v5wire"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 )
 
-// newUDPV5TestClock is newUDPV5Test with a simulated clock, so that a test can
-// wait out a ticket.
-func newUDPV5TestClock(t *testing.T, clock mclock.Clock) *udpV5Test {
-	test := &udpV5Test{
-		t:          t,
-		pipe:       newpipe(),
-		localkey:   newkey(),
-		remotekey:  newkey(),
-		remoteaddr: netip.MustParseAddrPort("10.0.1.99:30303"),
-		nodesByID:  make(map[enode.ID]*enode.LocalNode),
-		nodesByIP:  make(map[netip.Addr]*enode.LocalNode),
-	}
-	test.db, _ = enode.OpenDB("")
-	ln := enode.NewLocalNode(test.db, test.localkey)
-	ln.SetStaticIP(net.IP{10, 0, 0, 1})
-	ln.Set(enr.UDP(30303))
-	test.udp, _ = ListenV5(test.pipe, ln, Config{
-		PrivateKey:   test.localkey,
-		Log:          testlog.Logger(t, log.LvlTrace),
-		ValidSchemes: enode.ValidSchemesForTesting,
-		PingInterval: 1000 * time.Hour,
-		Clock:        clock,
-	})
-	test.udp.codec = &testCodec{test: test, id: ln.ID()}
-	test.table = test.udp.tab
-	test.nodesByID[ln.ID()] = ln
-	<-test.table.initDone
-	return test
-}
-
-// TestTicketNotBoundToAdvertiser records that a ticket carries only the topic
-// (topicindex.Ticket has no node ID or ad digest), so a ticket issued to one
-// advertiser is accepted from another, which is then credited with the first
-// advertiser's waiting time (B never waited). The specification binds tickets to adDigest
-// (service, ENR, payload). With TOPDISC_SPEC_STRICT=1 the test fails when the
-// second advertiser is admitted.
+// TestTicketNotBoundToAdvertiser checks that a ticket issued to one advertiser
+// is not credited to another (F4 of the registrar overhead study, fixed by #160:
+// tickets carry the advertiser's node ID). The second advertiser is treated as
+// a new attempt and must not be admitted on the first one's waiting time.
 func TestTicketNotBoundToAdvertiser(t *testing.T) {
 	clock := new(mclock.Simulated)
 	clock.Run(time.Hour)
@@ -115,7 +80,7 @@ func TestTicketNotBoundToAdvertiser(t *testing.T) {
 		}
 	}
 	t.Logf("ticket issued to A (wait %v), presented by B after the wait: confirmed=%v, B in cache=%v", wait, confirmed, admitted)
-	if admitted && os.Getenv("TOPDISC_SPEC_STRICT") != "" {
+	if admitted || confirmed {
 		t.Error("advertiser B was admitted with a ticket issued to advertiser A")
 	}
 }

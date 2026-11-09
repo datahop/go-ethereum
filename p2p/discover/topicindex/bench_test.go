@@ -78,9 +78,9 @@ func benchTable(n, t int, concentrated bool) (*TopicTable, *mclock.Simulated, To
 	for i := 0; i < n; i++ {
 		nd := benchNode(r, concentrated)
 		if i < t {
-			tab.add(nd, topic)
+			tab.add(nd, topic, clock.Now())
 		} else {
-			tab.add(nd, others[i%len(others)])
+			tab.add(nd, others[i%len(others)], clock.Now())
 		}
 		nodes = append(nodes, nd)
 	}
@@ -227,7 +227,7 @@ func BenchmarkExpire(b *testing.B) {
 			next := 0
 			addCohort := func() {
 				for j := 0; j < k; j++ {
-					tab.add(ring[next%len(ring)], topics[next%len(topics)])
+					tab.add(ring[next%len(ring)], topics[next%len(topics)], tab.config.Clock.Now())
 					next++
 				}
 			}

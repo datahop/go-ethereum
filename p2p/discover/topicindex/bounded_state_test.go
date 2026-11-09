@@ -68,7 +68,7 @@ func TestFullCacheWait(t *testing.T) {
 	tab := NewTopicTable(Config{AdCacheSize: 10, AdLifetime: time.Minute, Clock: clock})
 	var topic TopicID
 	for i := 0; i < 10; i++ {
-		tab.add(nodeWithIP(randomPublicIPv4(r)), topic)
+		tab.add(nodeWithIP(randomPublicIPv4(r)), topic, tab.config.Clock.Now())
 		clock.Run(time.Second)
 	}
 	n := nodeWithIP(randomPublicIPv4(r))

@@ -27,7 +27,6 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/netip"
-	"os"
 	"sort"
 	"testing"
 	"time"
@@ -146,14 +145,15 @@ func ipTreeTruth(tree *ipTree, ips []net.IP) (vertices, mismatched int) {
 func ipScoreDeviation(r *mrand.Rand, n, churn int, gen func() net.IP) (scoreDiff, queries, vertices, mismatched int, meanAbs float64) {
 	tree := newIPTree(32)
 	var ips []net.IP
+	var levels []byte
 	for i := 0; i < n+churn; i++ {
 		if len(ips) == n {
-			tree.remove(ips[0])
-			ips = ips[1:]
+			tree.remove(ips[0], levels[0])
+			ips, levels = ips[1:], levels[1:]
 		}
 		ip := gen()
-		tree.insert(ip)
-		ips = append(ips, ip)
+		_, l := tree.insert(ip)
+		ips, levels = append(ips, ip), append(levels, l)
 	}
 	for q := 0; q < 200; q++ {
 		x := gen()
@@ -205,12 +205,10 @@ func TestSpecIPScoreDeviation(t *testing.T) {
 	}
 }
 
-// TestIPTreeCountersMatchContents is the strict form of the check above. It
-// fails with the current ipTree and is skipped unless TOPDISC_SPEC_STRICT=1.
+// TestIPTreeCountersMatchContents: after churn, every tree counter equals the
+// number of cached addresses under its prefix. Failed before #159 (F2), when
+// removal walked a depth the address had not been inserted to.
 func TestIPTreeCountersMatchContents(t *testing.T) {
-	if os.Getenv("TOPDISC_SPEC_STRICT") == "" {
-		t.Skip("known deviation, see TestSpecIPScoreDeviation; set TOPDISC_SPEC_STRICT=1 to run")
-	}
 	r := mrand.New(mrand.NewSource(1))
 	d, q, v, m, _ := ipScoreDeviation(r, 1000, 10000, func() net.IP { return randomPublicIPv4(r) })
 	if d != 0 || m != 0 {
@@ -237,7 +235,7 @@ func TestSpecWaitTimeDeviations(t *testing.T) {
 		var ips []net.IP
 		for i := 0; i < c; i++ {
 			ip := randomPublicIPv4(r)
-			tab.add(nodeWithIP(ip), topics[r.Intn(len(topics))])
+			tab.add(nodeWithIP(ip), topics[r.Intn(len(topics))], tab.config.Clock.Now())
 			ips = append(ips, ip)
 		}
 		for q := 0; q < 10; q++ {
@@ -274,17 +272,19 @@ func TestSpecWaitTimeDeviations(t *testing.T) {
 	t.Logf("of %d quotes: spec > E in %d, implemented > E in %d, implemented <= 1s floor in %d", n, specAboveE, implAboveE, implUnderFloor)
 }
 
-// TestSpecNoGTerm: a diverse ad into an empty cache waits zero (spec: E*G > 0).
-func TestSpecNoGTerm(t *testing.T) {
+// TestSpecGTerm: a diverse ad into an empty cache waits base*G (restored by
+// #170). The implemented base includes the 0.1 factor (D1), so the G term is
+// 0.1*E*G, against E*G in the spec.
+func TestSpecGTerm(t *testing.T) {
 	clock := new(mclock.Simulated)
 	tab := NewTopicTable(Config{AdCacheSize: 1000, Clock: clock})
 	var topic TopicID
-	if w := tab.WaitTime(newNode(), topic); w != 0 {
-		t.Fatalf("empty-cache wait = %v, want 0", w)
+	want := secondsToDuration(waitTimeBaseModifier * 900 * waitTimeSafety)
+	if w := tab.WaitTime(newNode(), topic); w != want {
+		t.Fatalf("empty-cache wait = %v, want %v", w, want)
 	}
-	if spec := specWait(900, 1000, 0, 0, 0); spec <= 0 {
-		t.Fatalf("spec wait = %v, want > 0", spec)
-	}
+	spec := specWait(900, 1000, 0, 0, 0)
+	t.Logf("empty-cache wait: implemented %v, spec %v", want, time.Duration(spec*float64(time.Second)))
 }
 
 // TestSpecAdmissionFloor: required waits up to topicTableWaitTimeFloor are
@@ -295,9 +295,9 @@ func TestSpecAdmissionFloor(t *testing.T) {
 	var topic, other TopicID
 	other[0] = 1
 	for i := 0; i < 199; i++ {
-		tab.add(newNode(), other)
+		tab.add(newNode(), other, tab.config.Clock.Now())
 	}
-	tab.add(newNode(), topic)
+	tab.add(newNode(), topic, tab.config.Clock.Now())
 	n := newNode() // no IP: IP score 0
 	w := tab.WaitTime(n, topic)
 	if w <= 0 || w > topicTableWaitTimeFloor {
@@ -308,14 +308,15 @@ func TestSpecAdmissionFloor(t *testing.T) {
 	}
 }
 
-// TestSpecNoWaitCap: the registrar quotes single waits far above E.
+// TestSpecNoWaitCap: the registrar quotes single waits far above E. #155 caps
+// quotes at maxWaitTime (24h), not at E.
 func TestSpecNoWaitCap(t *testing.T) {
 	clock := new(mclock.Simulated)
 	tab := NewTopicTable(Config{AdCacheSize: 1000, Clock: clock})
 	r := mrand.New(mrand.NewSource(3))
 	var topic TopicID
 	for i := 0; i < 320; i++ {
-		tab.add(nodeWithIP(randomPublicIPv4(r)), topic)
+		tab.add(nodeWithIP(randomPublicIPv4(r)), topic, tab.config.Clock.Now())
 	}
 	w := tab.Register(nodeWithIP(randomPublicIPv4(r)), topic, 0)
 	if w <= tab.AdLifetime() {
@@ -329,14 +330,15 @@ func TestSpecNoWaitCap(t *testing.T) {
 func TestSpecLANAddressesInTree(t *testing.T) {
 	tab := NewTopicTable(Config{AdCacheSize: 1000, Clock: new(mclock.Simulated)})
 	var topic TopicID
-	tab.add(nodeWithIP(net.IP{192, 168, 0, 1}), topic)
+	tab.add(nodeWithIP(net.IP{192, 168, 0, 1}), topic, tab.config.Clock.Now())
 	if got := tab.wt.ipv4.count(); got != 1 {
 		t.Fatalf("IPv4 tree count = %d, want 1 (LAN address inserted)", got)
 	}
 }
 
+// TestSpecDefaultCapacity: the default capacity is the spec's C = 1000 (#182).
 func TestSpecDefaultCapacity(t *testing.T) {
-	if got := (Config{}).withDefaults().AdCacheSize; got != 5000 {
+	if got := (Config{}).withDefaults().AdCacheSize; got != 1000 {
 		t.Fatalf("default AdCacheSize = %d; spec default C is 1000", got)
 	}
 }
