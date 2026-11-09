@@ -78,7 +78,7 @@ func (cfg Config) withDefaults() Config {
 		cfg.AdLifetime = 15 * time.Minute
 	}
 	if cfg.AdCacheSize == 0 {
-		cfg.AdCacheSize = 5000
+		cfg.AdCacheSize = 1000
 	}
 	if cfg.RegAttemptTimeout == 0 {
 		// Note: RegAttemptTimeout == AdLifetime is a good choice because, when AdLifetime
