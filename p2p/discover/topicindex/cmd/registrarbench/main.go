@@ -193,7 +193,7 @@ func rates(c counters, seconds float64) map[string]float64 {
 	r := func(n uint64) float64 { return float64(n) / seconds }
 	return map[string]float64{"fresh_arrival_rps": r(c.FreshArrivals), "registration_rps": r(c.Registrations), "fresh_attempt_rps": r(c.Fresh),
 		"retry_rps": r(c.Retries), "admission_rps": r(c.Admissions), "wait_rps": r(c.Waits), "abandon_rps": r(c.Abandoned),
-		"expired_retry_rps": r(c.ExpiredRetries), "scarcity_rps": r(c.PopulationScarcity), "query_rps": r(c.Queries)}
+		"expired_retry_rps": r(c.ExpiredRetries), "late_retry_rps": r(c.LateRetries), "scarcity_rps": r(c.PopulationScarcity), "query_rps": r(c.Queries)}
 }
 
 func windowStats(c counters, seconds, occupancySeconds float64) map[string]any {

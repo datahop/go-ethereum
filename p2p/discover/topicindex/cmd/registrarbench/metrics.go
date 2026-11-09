@@ -130,6 +130,7 @@ type counters struct {
 	AbandonedCumulative uint64    `json:"abandoned_cumulative_quotes"`
 	AbandonedWrapped    uint64    `json:"abandoned_wrapped_wait"`
 	ExpiredRetries      uint64    `json:"expired_retries"`
+	LateRetries         uint64    `json:"late_retries"`
 	Queries             uint64    `json:"queries_processed"`
 	Returned            uint64    `json:"advertisements_returned"`
 	Expiries            uint64    `json:"expiry_calls"`
@@ -156,7 +157,7 @@ func (c counters) sub(o counters) counters {
 		Registrations: c.Registrations - o.Registrations, Fresh: c.Fresh - o.Fresh, Retries: c.Retries - o.Retries,
 		Admissions: c.Admissions - o.Admissions, Immediate: c.Immediate - o.Immediate, Eventual: c.Eventual - o.Eventual,
 		Waits: c.Waits - o.Waits, Abandoned: c.Abandoned - o.Abandoned, AbandonedSingle: c.AbandonedSingle - o.AbandonedSingle,
-		AbandonedCumulative: c.AbandonedCumulative - o.AbandonedCumulative, AbandonedWrapped: c.AbandonedWrapped - o.AbandonedWrapped, ExpiredRetries: c.ExpiredRetries - o.ExpiredRetries,
+		AbandonedCumulative: c.AbandonedCumulative - o.AbandonedCumulative, AbandonedWrapped: c.AbandonedWrapped - o.AbandonedWrapped, ExpiredRetries: c.ExpiredRetries - o.ExpiredRetries, LateRetries: c.LateRetries - o.LateRetries,
 		Queries: c.Queries - o.Queries, Returned: c.Returned - o.Returned, Expiries: c.Expiries - o.Expiries, Expired: c.Expired - o.Expired}
 }
 

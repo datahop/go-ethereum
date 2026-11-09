@@ -92,16 +92,19 @@ func summaryOf(t *testing.T, recs []map[string]any) map[string]any {
 	return nil
 }
 
+// The harness's retry classification must match production Ticket.TimingAt.
 func TestProductionRetryValidity(t *testing.T) {
-	for _, offset := range []time.Duration{0, 5*time.Second - time.Nanosecond, 5 * time.Second} {
-		clock := new(mclock.Simulated)
-		sealer := topicindex.NewTicketSealer(clock)
+	want := map[topicindex.TicketTiming]int{
+		topicindex.TicketOnTime:  retryOnTime,
+		topicindex.TicketLate:    retryLate,
+		topicindex.TicketExpired: retryExpired,
+	}
+	for _, offset := range []time.Duration{0, 5*time.Second - 1, 5 * time.Second, 15*time.Second - 1, 15 * time.Second, time.Hour} {
 		ticket := topicindex.Ticket{WaitTimeIssued: time.Second}
-		encoded := sealer.Pack(&ticket)
-		clock.Run(time.Second + offset)
-		_, err := sealer.Unpack(ticket.Topic, encoded)
-		if (err != nil) != retryExpired(mclock.AbsTime(time.Second), clock.Now()) {
-			t.Fatal("production grace boundary differs", offset, err)
+		due := ticket.WindowStart()
+		now := due.Add(offset)
+		if got, prod := retryTiming(due, now), want[ticket.TimingAt(now)]; got != prod {
+			t.Fatalf("offset %v: harness %d, production %d", offset, got, prod)
 		}
 	}
 }
@@ -127,7 +130,7 @@ func productionClient(t *testing.T, quotes []time.Duration, timeout time.Duratio
 		}
 		r.StartRequest(att)
 		r.HandleTicketResponse(att, []byte{1}, q)
-		clock.Run(q)
+		clock.Run(max(q, time.Second))
 	}
 	return r.Update() == nil
 }
@@ -140,10 +143,13 @@ func TestAbandonmentMatchesProductionClient(t *testing.T) {
 		{60 * time.Second, 30 * time.Second},
 		{60 * time.Second, 30*time.Second + time.Millisecond},
 		{10 * time.Second, 10 * time.Second, 10 * time.Second},
+		// Quotes below the 1 s floor count as 1 s toward the sum.
+		{89 * time.Second, 500 * time.Millisecond, 500 * time.Millisecond},
+		{88 * time.Second, 500 * time.Millisecond, 500 * time.Millisecond},
 	}
 	// The 1.5E limit applies to each single quote and to the sum of quotes;
 	// both comparisons are strict.
-	expected := []bool{false, true, false, true, false}
+	expected := []bool{false, true, false, true, false, true, false}
 	for i, quotes := range cases {
 		want := productionClient(t, quotes, timeout)
 		if want != expected[i] {
@@ -198,19 +204,19 @@ func TestAbandonPolicies(t *testing.T) {
 
 func TestClientWaitRoundsUpToMilliseconds(t *testing.T) {
 	w := &workload{ads: make([]advertiser, 1)}
-	if _, err := w.quoted(0, 0, 1500*time.Microsecond+1, abandonNone, time.Hour, time.Hour); err != nil {
+	if _, err := w.quoted(0, 0, 1500*time.Millisecond+1, abandonNone, time.Hour, time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if got := w.retries[0].at; got != mclock.AbsTime(2*time.Millisecond) {
-		t.Fatalf("retry at %v, want 2ms", got)
+	if got := w.retries[0].at; got != mclock.AbsTime(1501*time.Millisecond) {
+		t.Fatalf("retry at %v, want 1.501s", got)
 	}
-	if w.ads[0].quoteSum != 2*time.Millisecond {
+	if w.ads[0].quoteSum != 1501*time.Millisecond {
 		t.Fatalf("quote sum %v", w.ads[0].quoteSum)
 	}
 }
 
 // An abandoned advertiser is not retried; it can only come back through a
-// fresh arrival.
+// fresh arrival after an ad lifetime.
 func TestAbandonedReturnsOnlyViaFreshArrival(t *testing.T) {
 	c := simConfig()
 	c.Advertisers, c.Topics, c.CacheSize = 50, 1, 1000
@@ -231,7 +237,8 @@ func TestAbandonedReturnsOnlyViaFreshArrival(t *testing.T) {
 	if abandoned == 0 || len(e.workload.retries) != 0 {
 		t.Fatalf("abandoned=%d pending retries=%d", abandoned, len(e.workload.retries))
 	}
-	if e.total.Abandoned != uint64(abandoned) || e.workload.readyCount() != c.Advertisers-int(e.total.Admissions)-0 {
+	// Abandoned advertisers are in the cooldown (one ad lifetime), not ready.
+	if e.total.Abandoned != uint64(abandoned) || e.workload.readyCount() != c.Advertisers-int(e.total.Admissions)-abandoned {
 		t.Fatalf("counters %+v ready %d", e.total, e.workload.readyCount())
 	}
 }
@@ -594,6 +601,32 @@ func TestWrappedWaitAbandons(t *testing.T) {
 		reason, err := w.quoted(0, mclock.AbsTime(time.Hour), time.Duration(math.MaxInt64), policy, time.Hour, time.Hour)
 		if err != nil || reason != "wrapped" || len(w.retries) != 0 {
 			t.Fatalf("%s: reason %q err %v retries %d", policy, reason, err, len(w.retries))
+		}
+	}
+}
+
+// After abandoning, the production client does not ask the same registrar
+// again for an ad lifetime; the harness's cooldown mirrors that.
+func TestAbandonCooldownMatchesProduction(t *testing.T) {
+	clock := new(mclock.Simulated)
+	var topic topicindex.TopicID
+	cfg := topicindex.Config{Clock: clock, AdLifetime: time.Minute, RegAttemptTimeout: 90 * time.Second, RegBucketSize: 1}
+	r := topicindex.NewRegistration(topic, cfg)
+	var rec enr.Record
+	rec.Set(topicindex.TopicDiscoveryVersion)
+	rec.Set(enr.IPv4{1, 2, 3, 4})
+	n := enode.SignNull(&rec, enode.ID{0xff})
+	r.AddNodes(nil, []*enode.Node{n})
+	att := r.Update()
+	r.StartRequest(att)
+	r.HandleTicketResponse(att, []byte{1}, time.Hour) // above budget: dropped
+	for _, after := range []time.Duration{time.Minute - 2*time.Second, 2 * time.Second} {
+		clock.Run(after)
+		r.AddNodes(nil, []*enode.Node{n})
+		got := r.Update() != nil
+		inCooldown := clock.Now() < mclock.AbsTime(time.Minute)
+		if got == inCooldown {
+			t.Fatalf("at %v: production attempt scheduled=%v, harness cooldown=%v", clock.Now(), got, inCooldown)
 		}
 	}
 }

@@ -12,12 +12,30 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
-// Mirrors topicindex/ticket.go's [due, due+5s) interval. A focused test compares
-// these boundaries against production TicketSealer.Unpack. No ticket crypto is
-// used by the benchmark engine.
-const retryValidityWindow = 5 * time.Second
+// Mirrors topicindex/ticket.go: a retry is on time in [due, due+5s), late (credited
+// with the scheduled wait) until due+15s, and expired after that. A focused test
+// compares these boundaries against production Ticket.TimingAt. No ticket crypto
+// is used by the benchmark engine.
+const (
+	retryValidityWindow = 5 * time.Second
+	retryLateGrace      = 10 * time.Second
+)
 
-func retryExpired(due, now mclock.AbsTime) bool { return now.Sub(due) >= retryValidityWindow }
+const (
+	retryOnTime = iota
+	retryLate
+	retryExpired
+)
+
+func retryTiming(due, now mclock.AbsTime) int {
+	switch late := now.Sub(due); {
+	case late >= retryValidityWindow+retryLateGrace:
+		return retryExpired
+	case late >= retryValidityWindow:
+		return retryLate
+	}
+	return retryOnTime
+}
 
 // queryRequester is the source address of benchmark TOPICQUERY requests. It is
 // a public address, so the production relay check accepts any public ad.
@@ -205,6 +223,22 @@ func (e *engine) expire() operation {
 	return op
 }
 
+// expireDue removes ads that have expired by now, outside the timed region,
+// and refreshes op's occupancy. Production's expiry alarm normally does this
+// before a request is served; TopicTable.RegisterAt and RandomNodes also expire
+// internally, which would otherwise make the occupancy change of a call ambiguous.
+func (e *engine) expireDue(op *operation, now mclock.AbsTime) {
+	if e.table.NextExpiryTime() > now {
+		return
+	}
+	before := e.table.Occupancy()
+	e.table.Expire()
+	removed := before - e.table.Occupancy()
+	op.Occupancy = e.table.Occupancy()
+	op.Utilisation = float64(op.Occupancy) / float64(e.cfg.CacheSize)
+	e.eachCount(func(c *counters) { c.Expired += uint64(removed) })
+}
+
 // requestNode returns the record the registrar receives with a request.
 func (e *engine) requestNode(a *advertiser) (*enode.Node, error) {
 	if !e.cfg.IndependentENR {
@@ -220,7 +254,7 @@ func (e *engine) execute(event workEvent) (operation, error) {
 		e.query.consume()
 		topic := w.z.sample(w.rng)
 		op := e.newOperation("query", event.due, topic)
-		e.stamp(&op)
+		e.expireDue(&op, e.stamp(&op))
 		before := auditBefore(e.cfg.AllocationAudit)
 		start := time.Now()
 		nodes := e.table.RandomNodes(w.topics[topic], 16, e.accept)
@@ -262,17 +296,26 @@ func (e *engine) register(event workEvent, id int, retry bool) (operation, error
 	op.Fresh = !retry
 	op.Advertiser = id
 	now := e.stamp(&op)
+	e.expireDue(&op, now)
 	if retry {
+		due := e.scheduler.origin.Add(event.due)
 		op.RetryDue = int64(event.due)
-		if retryExpired(e.scheduler.origin.Add(event.due), now) {
-			// Served too late (realtime backlog): production drops the request
-			// on ticket validation and the client's attempt fails.
-			op.Type, op.Outcome = "retry_expired", "expired_retry"
+		switch retryTiming(due, now) {
+		case retryOnTime:
+			op.Credited = int64(now.Sub(a.first))
+		case retryLate:
+			// v5_udp.go regtopicCredit: credited with the scheduled wait; the
+			// time past the window is not credited on later retries either.
+			op.Credited = int64(due.Sub(a.first))
+			a.first = now.Add(-time.Duration(op.Credited))
+			e.eachCount(func(c *counters) { c.LateRetries++ })
+		case retryExpired:
+			// Served past the grace (realtime backlog): the registrar treats
+			// the request as a new attempt; the client keeps its quote sum.
+			op.Type = "retry_expired"
+			a.first = now
 			e.eachCount(func(c *counters) { c.ExpiredRetries++ })
-			w.enqueueFresh(id)
-			return op, nil
 		}
-		op.Credited = int64(now.Sub(a.first))
 	}
 	node, err := e.requestNode(a)
 	if err != nil {
@@ -280,7 +323,7 @@ func (e *engine) register(event workEvent, id int, retry bool) (operation, error
 	}
 	before := auditBefore(e.cfg.AllocationAudit)
 	start := time.Now()
-	wait := e.table.Register(node, w.topics[a.topic], time.Duration(op.Credited))
+	wait := e.table.RegisterAt(node, w.topics[a.topic], time.Duration(op.Credited), now)
 	op.Latency = int64(time.Since(start))
 	completed := e.scheduler.clock.Now()
 	op.Wait = int64(wait)
@@ -302,9 +345,10 @@ func (e *engine) register(event workEvent, id int, retry bool) (operation, error
 			if a.waiting {
 				op.Credited = int64(now.Sub(a.first))
 			}
-			// The advertiser leaves this registrar and can only return
-			// through a later fresh arrival.
-			w.enqueueFresh(id)
+			// The advertiser leaves this registrar. Production lists the
+			// registrar as overloaded for an ad lifetime (Registration.overloaded),
+			// so the advertiser becomes eligible for a fresh arrival only then.
+			w.cooldown(id, now.Add(e.cfg.Lifetime))
 		}
 	} else {
 		op.Outcome = "admitted"

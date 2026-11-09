@@ -364,12 +364,20 @@ const (
 )
 
 // clientWait is the waiting time as received by the client: REGCONFIRMATION
-// carries it in milliseconds, rounded up (v5_udp.go:waitTimeToMs), and
-// v5_topic.go converts it back with time.Duration(ms) * time.Millisecond,
-// which wraps for waits close to the int64 limit.
+// carries it in milliseconds, rounded up (v5_udp.go:waitTimeToMs), and the
+// client converts it back with waitTimeFromMs, which saturates. A wait below
+// the registrar's 1 s floor is raised to the floor
+// (Registration.HandleTicketResponse).
 func clientWait(d time.Duration) time.Duration {
-	return time.Duration(math.Ceil(d.Seconds()*1000)) * time.Millisecond
+	ms := math.Ceil(d.Seconds() * 1000)
+	if ms >= float64(math.MaxInt64/int64(time.Millisecond)) {
+		return math.MaxInt64
+	}
+	return max(time.Duration(ms)*time.Millisecond, clientWaitFloor)
 }
+
+// clientWaitFloor mirrors topicindex.topicTableWaitTimeFloor.
+const clientWaitFloor = time.Second
 
 // quoted applies the client's response to a ticket with waiting time wait,
 // issued at registrar time 'issued'. It returns "" if the advertiser will
@@ -409,6 +417,14 @@ func (w *workload) quoted(id int, issued mclock.AbsTime, wait time.Duration, pol
 	a.quoteSum += cw
 	heap.Push(&w.retries, wake{at: issued.Add(cw), id: id})
 	return "", nil
+}
+
+// cooldown takes an advertiser that abandoned this registrar out of the
+// population until at, when it becomes eligible for a fresh arrival again.
+func (w *workload) cooldown(id int, at mclock.AbsTime) {
+	a := &w.ads[id]
+	a.waiting, a.first, a.quoteSum = false, 0, 0
+	heap.Push(&w.active, wake{at: at, id: id})
 }
 
 // admitted records an admission; the advertiser becomes eligible again once
