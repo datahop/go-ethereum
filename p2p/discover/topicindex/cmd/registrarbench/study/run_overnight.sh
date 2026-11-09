@@ -38,7 +38,7 @@ write_status() {
     echo
     echo "| stage | started | ended | result |"
     echo "|---|---|---|---|"
-    for r in "${rows[@]}"; do echo "$r"; done
+    for r in ${rows[@]+"${rows[@]}"}; do echo "$r"; done
     echo
     echo "Log: \`results/overnight.log\`. Realtime point status: \`$ROOT/realtime/status.json\`."
   } > "$status"
@@ -68,16 +68,16 @@ smoke_args=()
 
 # 2/3. Simulated sweeps: required experiments first, then topic skew.
 stage sims "$STOP_SIMS" python3 "$study/run_sweeps.py" "$ROOT" --only demand query capacity ipdist bounded skew \
-  --seeds "$SEEDS" --jobs "$JOBS" "${smoke_args[@]}"
+  --seeds "$SEEDS" --jobs "$JOBS" ${smoke_args[@]+"${smoke_args[@]}"}
 stage findings "$STOP_AUX" "$study/run_findings.sh" "$ROOT"
-stage memory-audit "$STOP_AUX" "$study/run_memory_audit.sh" "$ROOT" "${smoke_args[@]}"
+stage memory-audit "$STOP_AUX" "$study/run_memory_audit.sh" "$ROOT" ${smoke_args[@]+"${smoke_args[@]}"}
 # 2. Microbenchmarks on an otherwise idle machine.
 stage microbench "$STOP_MICRO" "$study/run_microbench.sh" "$ROOT/microbench" "$MICRO_COUNT" "${MICRO_BENCHTIME:-1s}"
 # 5. Realtime block; nothing else runs during it.
-stage realtime "$STOP_REALTIME" python3 "$study/run_realtime.py" "$ROOT" --deadline "$STOP_REALTIME" "${smoke_args[@]}"
+stage realtime "$STOP_REALTIME" python3 "$study/run_realtime.py" "$ROOT" --deadline "$STOP_REALTIME" ${smoke_args[@]+"${smoke_args[@]}"}
 # 3 (optional). Abandonment-policy sweep, shortened to 36 h runs (24 h warm-up).
 stage abandon "$STOP_ABANDON" python3 "$study/run_sweeps.py" "$ROOT" --only abandon --seeds "$SEEDS" --jobs 10 \
-  --abandon-duration 36h --abandon-warmup 24h "${smoke_args[@]}"
+  --abandon-duration 36h --abandon-warmup 24h ${smoke_args[@]+"${smoke_args[@]}"}
 # 6. Regenerate the write-up and commit the regenerated documents.
 stage regenerate 23:59 "$study/regenerate.sh" "$ROOT" docs/registrar-overhead
 if [ "${NOCOMMIT:-}" != 1 ]; then
