@@ -1,0 +1,15 @@
+{{if:table:before_after}}The first version of this study measured production code at `2a8e47735`
+(backup branch `{{ba.ref|s}}`). The table compares the main admission dynamics of the
+demand sweep (§6.2) with the new code; the old values are read from the generated
+values committed on the backup branch, the new ones from this run. Both use the same
+workload, seeds and analysis.
+
+{{table:before_after}}
+
+The harness's client model also changed with the production client (§5.3): an
+advertiser that abandons now stays away from the registrar for one ad lifetime
+(Registration's overloaded set), late retries are credited with the scheduled wait,
+and sub-floor quotes are raised to 1 s. The differences therefore combine registrar
+changes (G term, expiry on access, lower-bound changes #166/#177) and client changes;
+they are not attributed to individual pull requests.
+{{else}}*Provisional: no comparison was generated (missing old values or new demand sweep).*{{endif}}

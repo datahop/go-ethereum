@@ -1,0 +1,72 @@
+# Task 3.3.4: TopDisc registrar overhead
+
+Report for datahop/go-ethereum#121. Full document with methods, all tables and the
+validity discussion: [registrar-overhead.md](registrar-overhead.md). Every number
+here is generated from the raw results by `study/regenerate.sh`.
+
+**Scope.** We measured the cost of one TopDisc registrar in the go-ethereum
+implementation (`p2p/discover/topicindex`, current `topdisc` with the fixes for the
+earlier findings). The registrar core is `TopicTable`: the ad cache plus admission
+control (waiting time, IP-similarity tree, lower bounds) and lookup. We measured it
+with microbenchmarks, with the `REGTOPIC` validation steps (record decoding,
+signature check, tickets), with simulated multi-hour runs under a population of
+advertisers that behave like the production client, with controlled memory fills and
+with wall-clock runs under offered load on one core (Apple M5, arm64). Network-level
+behaviour, packet I/O and adversarial load are out of scope. Loads observed in the
+10k-node network runs are placed on the results.
+
+## Required results
+
+| issue requirement | where (full document) | result |
+|---|---|---|
+| memory vs cache capacity / occupancy | §6.3, `figures/memory_fill` | {{mem.C1000-empirical.independent.bytes_per_ad|f:0}} B per cached ad (typical record), {{mem.C1000-empirical-maxenr.independent.bytes_per_ad|f:0}} B (300-byte record); linear in occupancy |
+| registration latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | {{if:occ.register-wait.N250.ns}}{{occ.register-wait.N250.ns|f:0}} ns for a wait reply at 25% occupancy, {{occ.register-admit.N250.ns|f:0}} ns for an admission; flat in occupancy{{else}}not measured{{endif}} |
+| lookup latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | {{if:occ.lookup.N250.ns}}{{occ.lookup.N250.ns|f:0}} ns at 25%, {{occ.lookup.N950.ns|f:0}} ns at 95%; linear in the topic's ad count{{else}}not measured{{endif}} |
+| CPU utilisation vs request rate | §6.4.2, `figures/realtime_throughput` | {{if:rt.max_busy}}registrar core busy at most {{rt.max_busy|pct:1}} of one core in the sweep{{else}}provisional: not measured in real time{{endif}} |
+| throughput vs offered rate | §6.4.2, `figures/realtime_throughput` | {{if:rt.knee_requests_rps}}served in full up to {{rt.knee_requests_rps|sig:3}} requests/s on one core (harness included){{else}}provisional: no knee measured{{endif}} |
+| lower-bound state vs occupancy | §6.6, `figures/bounds_vs_occupancy` | {{if:bounds.max_topic_bounds_per_ad}}at most {{bounds.max_topic_bounds_per_ad|f:2}} topic and {{bounds.max_ip_bounds_per_ad|f:2}} IP bounds per cached ad{{else}}not measured{{endif}} |
+| validation latency / cost | §6.1, validation table | {{if:share.cgo.total_ns}}full `REGTOPIC` ≈ {{share.cgo.total_ns|sig:2}} ns; registrar core {{share.cgo.core_fraction|pct:1}} of it; ENR signature check {{share.cgo.enr_fraction|pct:0}}{{else}}not measured{{endif}} |
+| varying capacity, occupancy, IP distribution, registration and lookup rate | §6.2, §6.5, `figures/occupancy_vs_demand`, `figures/occupancy_vs_capacity` | occupancy {{demand.C1000-fresh0.25.utilisation|pct:0}}–{{demand.C1000-fresh100.utilisation|pct:0}} of C from {{demand.C1000-fresh0.25.fresh_attempt_rps|f:2}} to {{demand.C1000-fresh100.fresh_attempt_rps|f:0}} fresh attempts/s; lookup rate has no effect on admission |
+| inputs from the 10k runs | §6.7 | {{if:eval10k.hot_5_busy}}hottest registrar ≈ {{eval10k.rt_hot_5|f:0}} REGTOPIC/s, {{eval10k.tq_hot_5|f:1}} TOPICQUERY/s → {{eval10k.hot_5_busy|pct:2}} of a core{{else}}not placed{{endif}} |
+| pprof | §6.4.2 | {{if:table:pprof_cpu}}CPU profile at the knee (top functions){{else}}not recorded{{endif}} |
+
+## Headline numbers
+
+* **Per request:** registrar core {{fit.RegisterFresh.T.small.intercept|f:0}} ns + {{fit.RegisterFresh.T.small.slope|f:2}} ns per ad of
+  the topic for a `REGTOPIC`; {{fit.RandomNodes.T.all.slope|f:1}} ns per ad of the topic for a lookup.{{if:share.cgo.total_ns}}
+  With validation a `REGTOPIC` costs {{share.cgo.total_ns|sig:2}} ns, i.e. about
+  {{share.cgo.regtopic_per_core|sig:2}} per second on one core.{{endif}}
+* **Equilibrium:** at C = 1000 with production advertisers, {{demand.C1000-fresh5.utilisation|pct:1}} of C is
+  occupied at 5 fresh attempts/s; admissions saturate at {{demand.C1000-fresh100.admission_rps|f:2}}/s and the
+  rest of the demand abandons ({{demand.C1000-fresh100.abandon_fraction|pct:1}} at 100 attempts/s).
+* **Memory:** {{mem.C1000-empirical-maxenr.independent.at_capacity_mib|f:2}} MiB for a full default cache of
+  maximum-size records.
+* **Throughput:** {{if:rt.knee_requests_rps}}{{rt.knee_requests_rps|sig:3}} requests/s served without queueing on one core.{{else}}provisional, {{cap.implied_min|sig:2}}–{{cap.implied_max|sig:2}} requests/s implied by per-call costs.{{endif}}
+
+{{if:figure:latency_vs_occupancy}}![Latency vs occupancy](figures/latency_vs_occupancy.png)
+{{endif}}{{if:figure:realtime_throughput}}![Throughput, CPU and queueing vs offered rate](figures/realtime_throughput.png)
+{{endif}}![Occupancy and admissions vs demand](figures/occupancy_vs_demand.png)
+
+## Findings and fixes
+
+* F1 waiting-time overflow at high occupancy: fixed by #155/#157; regression test
+  `TestRegisterHighOccupancyInvariants`.
+* F2 IP-tree counters drift under churn: fixed by #159; `TestIPTreeCountersMatchContents`.
+  Scores still differ from the spec while the tree grows (transient).
+* F3 ticket keys (6 h) expire before a 24 h quote ends: **open**.
+* F4 tickets not bound to the advertiser: fixed by #160; `TestTicketNotBoundToAdvertiser`.
+* F5 waiting-time deviations: G restored (#170), default C = 1000 (#182), quotes
+  capped at 24 h (#155); the 0.1 factor, the service term, the 1 s floor and LAN
+  scoring remain decisions for the specification (§4.2).
+
+## Missing or provisional
+
+{{if:rt.knee_requests_rps}}{{else}}* Realtime throughput and CPU utilisation: no knee was measured; numbers are provisional.
+{{endif}}{{if:rt.validation.utilisation_ratio}}{{else}}* Hybrid-clock validation against a fully realtime run did not run.
+{{endif}}{{if:table:pprof_cpu}}{{else}}* No CPU profile.
+{{endif}}* The 10k reports give no per-registrar REGTOPIC rate as a number, no occupancy and
+  no cache capacity; the registrar loads above are partly figure readings from older
+  code.
+* Packet decryption, session handling and response encoding are not measured; the
+  registrar core plus validation is a lower bound on a full handler.
+* One platform (Apple M5, macOS); the core type of the worker cannot be pinned.

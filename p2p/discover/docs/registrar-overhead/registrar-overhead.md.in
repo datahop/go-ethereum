@@ -80,20 +80,24 @@ capacity C:
 
 ```text
 base       = 0.1 · E / (1 − N/C)^10
-service    = base · T / (N + 1)
+service    = base · T / (N + 1)            (0 when T = 0, also at N = C)
 ip         = base · max(score_IPv4, score_IPv6)
 required   = max(service, remaining topic bound) + max(ip, max remaining bound on the IP path)
-admit if     credited ≥ required − 1 s      (credited = now − first ticket time)
-otherwise    return required − credited, and record the component bounds
+             + base · G                     (G = 10⁻⁷, not lower-bounded)
+quote      = min(required, 24 h)
+admit if     credited ≥ quote − 1 s         (credited per the ticket's timing, §4.2 D9)
+otherwise    return quote − credited, and record the service and IP bounds
 if full:     return the time until the next expiry
 ```
 
-## 4. Production findings and specification differences
+Expired ads are removed at the start of every `RegisterAt`, `RandomNodes`, `Add` and
+`WaitTime` call (#173), and the handler reads the clock once per request (#165).
 
-§4.1 lists defects and deviations found in the production code, with the tests that
-show them and suggested fixes. §4.2 lists the differences that are decisions for the
-specification editors. Measured effects refer to the experiments of §6. Nothing in
-`topicindex` was changed for this study.
+## 4. Findings and their resolution
+
+§4.1 lists the findings of the first study, the pull requests that fixed them, and the
+regression tests. §4.2 re-checks the specification differences that are decisions for
+the specification editors. Nothing in `topicindex` was changed for this study.
 
 {{section:spec_differences}}
 
@@ -170,6 +174,14 @@ are excluded and listed.
 ### 6.6 Bounded registrar state
 
 {{section:bounded}}
+
+### 6.7 Placement against the 10k-node network runs
+
+{{section:eval10k}}
+
+### 6.8 Old code versus new code
+
+{{section:before_after}}
 
 ## 7. Implications for parameters and implementers
 

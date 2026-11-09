@@ -1,49 +1,37 @@
-* **Per-request cost of the registrar core is small and topic-local.** A fresh
-  `REGTOPIC` that receives a wait ticket costs {{fit.RegisterFresh.T.small.intercept|f:0}} ns
-  plus {{fit.RegisterFresh.T.small.slope|f:2}} ns per cached ad of the requested topic
-  (T ≤ 256). An admitted retry costs about {{fit.RegisterRetryAdmit.N.all.intercept|f:0}} ns.
-  Neither depends on the total occupancy N. A `TOPICQUERY` lookup (`RandomNodes`) visits
-  **every** cached ad of the topic, {{fit.RandomNodes.T.all.slope|f:1}} ns each, regardless of
-  the 16-result limit: {{micro.RandomNodes/N=5000/T=16.ns|f:0}} ns at T = 16 and
-  {{micro.RandomNodes/N=5000/T=4096.ns|f:0}} ns at T = 4096. All registrar work runs on the
-  single Discovery v5 dispatch goroutine, so capacity is per core (§3.3).
-* **With production advertisers, occupancy settles at about a quarter of C, whatever
-  the demand.** The production client abandons an attempt once its quoted waits exceed
-  1.5·E. At C = 1000, as fresh demand grows
-  ({{demand.C1000-fresh0.25.fresh_attempt_rps|f:2}} to {{demand.C1000-fresh100.fresh_attempt_rps|f:0}}
-  attempts/s), the time-averaged occupancy rises only from
-  {{demand.C1000-fresh0.25.utilisation|pct:1}} to {{demand.C1000-fresh100.utilisation|pct:1}} of C.
-  Admissions saturate at {{demand.C1000-fresh100.admission_rps|f:2}}/s. Further demand
-  turns into abandoned attempts ({{demand.C1000-fresh100.abandon_fraction|pct:1}} of fresh
-  attempts) and into extra requests: {{demand.C1000-fresh100.requests_per_admission|f:0}}
-  `REGTOPIC` per admission. A one-line model of the waiting-time function predicts
-  {{model.ustar.1.0|pct:0}}–{{model.ustar.0.25|pct:0}} (§6.2). Admitted advertisers waited a median of
-  {{demand.C1000-fresh5.cumwait_waited_median_s|f:0}} s (p95 {{demand.C1000-fresh5.cumwait_waited_p95_s|f:0}} s;
-  E = 900 s).
+All results describe the production code after the fixes merged into `topdisc`
+(§4, §5.5). The first version of this study (old code) is on branch
+`registrar-overhead-oct27`; §6.8 compares the two.
+
+* **The registrar core is cheap per request; validation dominates.** A `REGTOPIC`
+  that receives a wait ticket costs {{fit.RegisterFresh.T.small.intercept|f:0}} ns plus
+  {{fit.RegisterFresh.T.small.slope|f:2}} ns per cached ad of the requested topic, and does not
+  grow with occupancy (§6.1).{{if:share.cgo.core_fraction}} With record decoding, signature verification and
+  ticket handling included, a full `REGTOPIC` costs about {{share.cgo.total_ns|sig:2}} ns, of which
+  the registrar core is {{share.cgo.core_fraction|pct:1}}.{{endif}} A `TOPICQUERY` lookup visits every cached
+  ad of the topic ({{fit.RandomNodes.T.all.slope|f:1}} ns each), regardless of the 16-result
+  limit. All registrar work runs on the single Discovery v5 dispatch goroutine (§3.3).
+* **With production advertisers, occupancy settles well below C.** At C = 1000 the
+  time-averaged occupancy is {{demand.C1000-fresh0.25.utilisation|pct:1}} of C at
+  {{demand.C1000-fresh0.25.fresh_attempt_rps|f:2}} fresh attempts/s and
+  {{demand.C1000-fresh100.utilisation|pct:1}} at {{demand.C1000-fresh100.fresh_attempt_rps|f:0}}/s. Admissions saturate
+  at {{demand.C1000-fresh100.admission_rps|f:2}}/s; further demand becomes abandoned attempts
+  ({{demand.C1000-fresh100.abandon_fraction|pct:1}} of fresh attempts) and
+  {{demand.C1000-fresh100.requests_per_admission|f:0}} `REGTOPIC` per admission. Admitted advertisers
+  waited a median of {{demand.C1000-fresh5.cumwait_waited_median_s|f:0}} s (p95
+  {{demand.C1000-fresh5.cumwait_waited_p95_s|f:0}} s; E = 900 s) at 5 attempts/s (§6.2).
 * **Memory is dominated by the decoded ENR.** Each cached ad costs
   {{mem.C1000-empirical.independent.bytes_per_ad|ci:0}} B with typical records and
-  {{mem.C1000-empirical-maxenr.independent.bytes_per_ad|f:0}} B with maximum-size (300-byte)
-  records. A full production-default cache (C = 5000) of maximum-size records holds
-  {{mem.C5000-empirical-maxenr.independent.at_capacity_mib|f:1}} MiB. The analytic bound
-  C·(300 B + overhead) underestimates this by a factor of
-  {{mem.C5000-empirical-maxenr.bound_ratio|f:1}}. The admission state is
-  bounded by the cache contents in every run and test (§6.6).
-* **Production findings** (§4.1, each with a test and a suggested fix; none applied):
-  * F1: the waiting time overflows int64 above about {{findings.arm64.threshold_min|f:0}}/1000
-    occupancy (admission without waiting on amd64, a wrapped wait on arm64); this is
-    unreachable with production advertisers (highest sampled occupancy
-    {{sim.max_utilisation_production|pct:0}});
-  * F2: IP-similarity scores depend on insertion history and deviate from the
-    specification; the candidate fix lowers occupancy by a few percent (§6.5);
-  * F3: ticket keys can expire before a long wait ends;
-  * F4: tickets are not bound to the advertiser, so one advertiser's ticket admits
-    another;
-  * F5: the waiting-time function deviates from the specification (D1–D5).
-* **Throughput is provisional.** Measured per-call costs imply that one core could
-  serve roughly {{cap.implied_min|sig:2}}–{{cap.implied_max|sig:2}} registrar-core requests/s,
-  depending on load and request mix; at every load measured so far the registrar core
-  used at most {{cap.busy_max|pct:2}} of a core. These are not measured saturation
-  points; the realtime validation is pending (§6.4).
-* The specification–implementation differences D1–D10 are listed for decision (§4.2). The 0.1
-  scale factor and the client's 1.5·E attempt timeout together set the equilibrium
-  occupancy; the missing G term is negligible.
+  {{mem.C1000-empirical-maxenr.independent.bytes_per_ad|f:0}} B with maximum-size records; a full
+  default cache (C = 1000) of maximum-size records holds
+  {{mem.C1000-empirical-maxenr.independent.at_capacity_mib|f:2}} MiB (§6.3). Lower-bound state stays
+  bounded by the cache contents (§6.6).
+* **Throughput.** {{if:rt.knee_requests_rps}}On one core the harness served up to {{rt.knee_requests_rps|sig:3}} requests/s
+  without queueing (§6.4.2); the registrar core used at most {{rt.max_busy|pct:1}} of that core
+  in the sweep.{{else}}*Provisional:* the realtime block produced no knee. From per-call costs, one core could
+  serve roughly {{cap.implied_min|sig:2}}–{{cap.implied_max|sig:2}} registrar-core requests/s.{{endif}}
+  {{if:eval10k.hot_5_busy}}The hottest registrar of the 10k-node runs would keep a core
+  {{eval10k.hot_5_busy|pct:2}} busy (§6.7).{{endif}}
+* **Findings (§4).** F1 (waiting-time overflow), F2 (IP-tree counters under churn)
+  and F4 (ticket binding) are fixed, each with a regression test; G is restored and the
+  default capacity is now 1000. F3 (ticket keys expire before a 24 h quote ends) is
+  still open, as are the spec decisions D1, D2, D4 and D7 (§4.2).

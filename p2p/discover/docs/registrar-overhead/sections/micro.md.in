@@ -36,3 +36,35 @@ operation mix:
 
 Per expired entry this is {{audit.expiry_bytes_per_entry|ci:0}} B in
 {{audit.expiry_allocations_per_entry|f:2}} allocations, matching the microbenchmark.
+
+**Latency against occupancy.** At the default capacity C = 1000, with the requested
+topic holding a tenth of the cached ads (`BenchmarkOccupancy`):
+
+{{if:figure:latency_vs_occupancy}}![Registration and lookup latency vs occupancy](figures/latency_vs_occupancy.png)
+
+{{table:micro_occupancy}}
+
+A wait response costs {{occ.register-wait.N100.ns|f:0}}–{{occ.register-wait.N950.ns|f:0}} ns from 10% to 95%
+occupancy and an admission {{occ.register-admit.N100.ns|f:0}}–{{occ.register-admit.N950.ns|f:0}} ns; neither
+grows with the occupancy factor, which only changes the computed number. The lookup
+grows with the topic size T = N/10: {{occ.lookup.N100.ns|f:0}} ns at 10% and
+{{occ.lookup.N950.ns|f:0}} ns at 95%. At N = 0 a registration is always admitted (no wait).
+{{else}}*Provisional: the occupancy benchmarks did not run.*{{endif}}
+
+**Validation cost.** `handleRegtopic` does more than the registrar core. Per request it
+decodes and verifies the advertiser's record, compares its address with the packet
+source, unseals a presented ticket and checks it against the replay memory, and seals
+a new ticket for a wait response (`v5_validation_bench_test.go`):
+
+{{if:table:validation}}{{table:validation}}
+
+{{if:share.cgo.total_ns}}For a retry that receives a new ticket, the parts add up as follows (cgo build;
+registrar core at 25% occupancy):
+
+{{table:regtopic_share}}
+
+The registrar core is {{share.cgo.core_fraction|pct:1}} of this per-request work; ENR signature
+verification is {{share.cgo.enr_fraction|pct:0}}. Without cgo (pure-Go secp256k1) the core's
+share drops to {{share.purego.core_fraction|pct:1}}. Packet decryption, session handling
+and response encoding come on top and are not measured.{{endif}}
+{{else}}*Provisional: the validation benchmarks did not run.*{{endif}}

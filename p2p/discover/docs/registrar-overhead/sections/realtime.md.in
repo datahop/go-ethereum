@@ -51,63 +51,58 @@ Interpretation:
 
 #### 6.4.2 Throughput and saturation
 
-> **Provisional — realtime validation pending.** No saturation point of the registrar
-> core has been measured yet. This subsection reports only what the per-call costs
-> already measured imply. The realtime experiments that will replace it are listed at
-> the end.
+{{if:table:realtime}}The realtime block ran each point with the hybrid clock (a simulated warm-up of
+3 h to reach the equilibrium state, then wall-clock measurement), spin pacing,
+Poisson arrivals and no per-operation records, on an otherwise idle machine. A monitor
+recorded the load average, the busiest processes and the thermal state every minute;
+points whose window overlapped foreign load or a thermal limit are marked in the
+last column ({{rt.contaminated_points|f:0}} of {{rt.points|f:0}} points).
 
-**Per-call cost under three instruments.** The registrar core's busy time at a given
-load is (registrations/s × mean cost per registration) + (queries/s × mean cost per
-query). Its inverse, at the same request mix, is the request rate at which one core
-would be fully busy with registrar-core work alone:
+{{table:realtime}}
+
+**CPU utilisation.** Under spin pacing the worker thread never blocks, so the
+process uses one core all the time and process CPU time says nothing about load
+(§6.4.1). "Registrar busy" is therefore the time spent inside `TopicTable` calls
+divided by wall time: (registrations/s × mean ns per registration + queries/s × mean
+ns per query) / 10⁹. It is the registrar core's share of one core; the harness's own
+work (arrival generation, bookkeeping) is excluded.
+
+{{if:figure:realtime_throughput}}![Throughput, busy fraction and queueing vs offered rate](figures/realtime_throughput.png)
+{{endif}}
+{{if:rt.knee_offered_query}}**Saturation.** The highest offered rate that was served in full (≥ 98% of the offered
+queries, queue-delay p99 below 10 ms) was {{rt.knee_offered_query|sig:2}} queries/s plus 100
+fresh attempts/s, i.e. {{rt.knee_requests_rps|sig:3}} requests/s served. At that point the
+registrar core was busy {{rt.knee_busy|pct:1}} of the time and the p99 queue delay was
+{{rt.knee_qd_p99_us|f:1}} µs. {{if:rt.first_saturated_offered}}At {{rt.first_saturated_offered|sig:2}} offered queries/s the process served only
+{{rt.first_saturated_served|sig:3}} requests/s.{{endif}} The limit is the single
+worker thread, harness included: the registrar core accounts for at most
+{{rt.max_busy|pct:1}} of the thread's time in the sweep, so the knee is a bound set by the
+harness and dispatch loop, not by `TopicTable`.{{else}}*No query-sweep point was served in full, or the sweep did not run; no knee is reported.*{{endif}}
+
+{{if:rt.validation.utilisation_ratio}}**Hybrid clock validation.** A fully realtime run with a 45 min real warm-up and the
+same configuration as a hybrid point gave an occupancy ratio (realtime/hybrid) of
+{{rt.validation.utilisation_ratio|f:3}}, a mean query cost ratio of {{rt.validation.q_mean_ns_ratio|f:2}} and a mean
+registration cost ratio of {{rt.validation.r_mean_ns_ratio|f:2}}.{{else}}*Provisional: the fully realtime validation point did not run; the hybrid clock is
+validated only by `TestHybridTableEquivalence`.*{{endif}}
+
+{{if:table:pprof_cpu}}**CPU profile** at the knee (top functions by flat time, measurement phase only):
+
+{{table:pprof_cpu}}
+{{else}}*No CPU profile was recorded.*{{endif}}
+{{else}}> **Provisional — realtime validation pending.** The realtime block produced no
+> admissible point. The estimates below come from per-call costs only.{{endif}}
+
+**Per-call costs under the other instruments.** For comparison, the request rate at
+which one core would be fully busy with registrar-core work alone, at the same request
+mix, from the simulated runs and the pacing check:
 
 {{table:capacity_provisional}}
-
-("simulated": mean over seeds, calls run back to back on the simulated clock;
-"realtime-spin": the spin-paced runs of §6.4.1, all calls of the 15 min window. Latency
-means include timer quantisation.)
 
 From the microbenchmarks alone (§6.1), one core executes about
 {{cap.micro.RegisterFresh/N=1000/T=16.ops_per_s|sig:2}} fresh registrations/s (N = 1000, T = 16),
 {{cap.micro.RandomNodes/N=1000/T=16.ops_per_s|sig:2}} lookups/s at T = 16 and
 {{cap.micro.RandomNodes/N=5000/T=64.ops_per_s|sig:2}} lookups/s at T = 64.
-
-What these numbers support:
-
-* At every load measured so far the registrar core is almost idle: at most
-  {{cap.busy_max|pct:2}} of one core. Admission control, not CPU, limits registrations
-  (§6.2).
-* The implied rates span {{cap.implied_min|sig:2}}–{{cap.implied_max|sig:2}} requests/s. The
-  low end comes from the low-load point, where calls are slower after idle gaps
-  (§6.4.1). Near saturation the core is never idle, so the high-load costs are the
-  relevant ones.
-* These are upper bounds for the registrar core only. They exclude packet decoding,
-  session cryptography, ENR signature verification, ticket MAC computation and the
-  other Discovery v5 work on the same dispatch goroutine (§3.3), all of which a real
-  `REGTOPIC` or `TOPICQUERY` handler adds.
-
-What they do not support: a measured knee, queueing behaviour near saturation, the
-effect of GC under sustained load, or the share of the dispatch goroutine left for the
-rest of the protocol.
-
-*Exploratory throughput probes.* Short probes (hybrid clock, spin pacing, one seed,
-20–30 s windows, outside the study scripts) were run only to size the realtime sweep.
-They are not used here: the windows are too short, two repetitions near the harness
-limit disagreed by orders of magnitude in queue delay, and at those rates the harness,
-not the registrar core, uses most of the CPU.
-
-**Planned realtime experiments** (hybrid clock, spin pacing, Poisson arrivals, idle
-machine, 10 min measurement windows, raw operation records off):
-
-1. query-rate sweep at C = 1000 and 100 fresh attempts/s, from 10³ to about 6·10⁵
-   queries/s, to locate the knee and report registrar busy fraction, queue delay and
-   per-call latency by load;
-2. registration-heavy points (10³–5·10⁴ fresh attempts/s at 10³ queries/s);
-3. two points at C = 5000;
-4. one hybrid point repeated as a fully realtime run (45 min real warm-up) to validate
-   the hybrid clock in real time (the equivalence of the table state is already tested by
-   `TestHybridTableEquivalence`);
-5. CPU and heap profiles (pprof) at one point near the knee.
-
-Throughput in these runs includes the harness. The registrar's share is reported as the
-sum of call latencies over wall time, as in the table above.
+{{if:share.cgo.total_ns}}A full `REGTOPIC` costs about {{share.cgo.total_ns|sig:2}} ns once validation is included (§6.1),
+so a core spent only on `REGTOPIC` handling would serve about
+{{share.cgo.regtopic_per_core|sig:2}} requests/s; validation, not the registrar core, sets that
+limit.{{endif}}

@@ -1,131 +1,83 @@
-### 4.1 Findings
+### 4.1 Findings and their resolution
 
-These are defects in, or deviations of, the production registrar code. Each has a test
-that records the current behaviour; the tests marked *strict* fail with the current code
-when `TOPDISC_SPEC_STRICT=1` is set. None was fixed for this study. All test output
-quoted here comes from `run_findings.sh` (§9), run on a clean tree for both GOARCH=arm64
-and GOARCH=amd64.
+The first version of this study (backup branch `registrar-overhead-oct27`, production
+code at `2a8e47735`) reported five findings. `topdisc` has since merged fixes for most
+of them. Every result in this document was measured on the new code (§5.5). Each
+finding now has a regression test that passes on the new code, or, where the finding
+is still open, a characterisation test that records the current behaviour. The test
+output quoted here comes from `run_findings.sh` (§9), run on a clean tree for
+GOARCH=arm64 and GOARCH=amd64.
 
-| # | finding | tests (strict variant in bold) | suggested fix | affects results here? |
+| # | finding (old code) | fix | regression / characterisation test | status on the new code |
 |---|---|---|---|---|
-| F1 | waiting time overflows int64 at high occupancy | `TestRegisterHighOccupancy`, `TestRegisterOverflowThreshold`, `TestRegisterFullCacheNaN`, **`TestRegisterHighOccupancyInvariants`** (`v5_topic_overflow_test.go`) | clamp the float wait before every conversion | no (unreachable with production advertisers) |
-| F2 | IP-tree counters drift; scores depend on insertion history | `TestSpecIPScoreDeviation`, **`TestIPTreeCountersMatchContents`** (`topicindex/spec_conformance_test.go`) | fixed insertion depth (branch `registrar-overhead-iptree-fix`) | small (§6.5) |
-| F3 | ticket keys expire before long waits end | `TestTicketOutlivesKey` (`v5_topic_overflow_test.go`) | keep keys ≥ the maximum wait, or cap waits | no |
-| F4 | tickets are not bound to the advertiser | **`TestTicketNotBoundToAdvertiser`** (`v5_topic_ticket_test.go`) | bind the ticket to the node ID (spec: adDigest) | no (harness advertisers use only their own tickets) |
-| F5 | the waiting-time function deviates from the specification | `TestSpecWaitTimeDeviations`, `TestSpecNoGTerm`, `TestSpecAdmissionFloor`, `TestSpecNoWaitCap` | a decision for the editors (§4.2); not a defect by itself | yes: it sets the equilibrium occupancy (§6.2) |
+| F1 | the float waiting time overflowed int64 above ~84% occupancy: admission without waiting (amd64), a −292-year wait at the client (arm64) | #155 (cap quotes at 24 h), #157 (saturating wire decode, client clamps sub-floor waits to 1 s) | `TestRegisterOverflowThreshold`, `TestRegisterHighOccupancyInvariants`, `TestRegisterFullCacheNaN` (`v5_topic_overflow_test.go`) | fixed: no overflowing occupancy on arm64 ({{findings.arm64.overflow_free|s}}) or amd64 ({{findings.amd64.overflow_free|s}}); invariants test {{findings.arm64.invariants|s}} |
+| F2 | IP-tree counters drifted under churn, so scores depended on insertion history | #159 (remove walks only the levels insert incremented) | `TestIPTreeCountersMatchContents`, `TestSpecIPScoreDeviation` (`topicindex/spec_conformance_test.go`) | fixed under churn ({{findings.arm64.ip_counters|s}}); scores still differ from the spec while the tree grows (table below) |
+| F3 | ticket keys (6 h lifetime) could expire before a long wait ended | — | `TestTicketOutlivesKey` | **open**: quotes are now capped at 24 h, still above the 6 h key lifetime |
+| F4 | tickets were not bound to the advertiser: one advertiser's ticket admitted another | #160 (ticket carries the node ID; mismatches start a new attempt) | `TestTicketNotBoundToAdvertiser` (`v5_topic_ticket_test.go`) | fixed ({{findings.arm64.ticket_binding|s}}): the second advertiser is not admitted (admitted: {{findings.ticket_transfer_admitted|s}}) |
+| F5 | the waiting-time function deviated from the specification (D1–D5) | #170 restores G; #155 adds a 24 h cap | `TestSpecWaitTimeDeviations`, `TestSpecGTerm`, `TestSpecAdmissionFloor`, `TestSpecNoWaitCap` | partly: D3 resolved, D5 changed, D1/D2/D4 open (§4.2) |
 
-**F1. Waiting-time overflow at high occupancy.** `TopicTable.WaitTime` computes the wait
-in `float64` and converts it to `time.Duration` (int64 ns) without range checks. At
-occupancy N ≥ {{findings.arm64.threshold_min|f:0}}–{{findings.arm64.threshold_max|f:0}}
-of C = 1000, depending on topic share and IP score, the float value exceeds 2^63
-ns (≈ 292 years). Go leaves an out-of-range float-to-integer conversion
-implementation-defined, and the two architectures differ:
-
-* **amd64:** the conversion yields `math.MinInt64`. The negative wait is below the 1 s
-  floor, so every fresh request is **admitted without waiting**, from the threshold up to
-  99% occupancy (table below). Admission control is off exactly when the cache is nearly full.
-* **arm64:** the conversion saturates to `math.MaxInt64`. The registrar quotes about 292
-  years. `waitTimeToMs` rounds this up to 9,223,372,036,855 ms, and the advertiser's
-  `time.Duration(ms) * time.Millisecond` wraps to about −292 years. The advertiser
-  retries at once with a ticket that is outside its window, and the registrar
-  rejects it.
-* **Full cache:** with a full cache, an empty topic and no IP score, both terms are
-  0·∞ = NaN. This converts to 0 on arm64 and to MinInt64 on amd64; both fall through
-  to the next-expiry branch. On arm64 the topic-share case saturates instead.
+**F1, waiting-time overflow.** `secondsToDuration` now caps every quote at
+`maxWaitTime` = 24 h and maps NaN to 0, and `scaleBase` avoids 0·∞. At 80–100%
+occupancy the registrar quotes the cap, the client decodes it intact
+(`waitTimeFromMs` saturates) and does not admit without credit:
 
 {{table:findings_overflow}}
 
-(Probe: `v5_topic_overflow_test.go`, a fresh ad without credit; "ticket" is the ticket
-validation result when the advertiser retries as told. The wait at 80% outlives the 6 h
-ticket key lifetime; see F3.)
+A full cache with an empty topic and no IP answers {{findings.arm64.fullcache_wait|s}}
+(admitted: {{findings.arm64.fullcache_admitted|s}}). A 24 h quote is far above the
+client's attempt budget (1.5·E), so a production advertiser abandons at once (§5.3).
+The ticket of a 24 h quote cannot be redeemed anyway (F3).
 
-`TestRegisterHighOccupancyInvariants` reports
-{{findings.arm64-strict.overflow_violations|f:0}} violations on arm64 and
-{{findings.amd64-strict.overflow_violations|f:0}} on amd64. The same pattern applies to
-`waitTimeToMs` (float ms to `uint`) and to the client decode (uint ms × 1 ms).
-
-*Reachability in normal operation:* the highest occupancy sampled in any simulated
-run was {{sim.max_utilisation_production|pct:1}} with the production client, and
-{{sim.max_utilisation|pct:1}} with the never-abandoning sensitivity policy, and no run produced a wrapped wait
-({{sim.wrapped_waits|f:0}} in total). With production-like advertisers the cache stays far
-below the threshold (§6.2), so F1 is a robustness defect, not something that affects
-the results here.
-
-*Suggested fix (one line in `WaitTime`, not applied):* clamp in float before converting, treating
-NaN as the maximum, e.g. `if !(w < maxWait) { w = maxWait }` with
-`maxWait = float64(E)` (or another cap). Apply the same clamp in `waitTimeToMs` and in
-the client decode.
-
-**F2. IP-similarity scores depend on insertion history.** The `ipTree` inserts each
-address to a depth that depends on the tree size at insertion time. Removal walks the
-depth implied by the current size, so vertex counters drift away from the set of
-addresses actually in the tree. Scores then differ from the specification's definition
-(§"IP Similarity Tree": counts of cached addresses per prefix):
+**F2, IP-tree counters.** With #159, each entry remembers the depth to which it was
+inserted and removal decrements exactly those levels. After churn the counters match
+the cache contents, and scores equal the specification's. While the tree grows, an
+address inserted when the tree was small is counted only down to the shallow depth
+of that time, so scores still differ from the specification's definition until the
+early addresses have left the cache:
 
 {{table:findings_ip}}
 
 (`TestSpecIPScoreDeviation`: 1000 addresses inserted, or inserted and removed in 10
 rounds of churn; 200 probe addresses scored against a reference implementation of the
-specification.) The strict test `TestIPTreeCountersMatchContents` fails
-({{findings.arm64-strict.ip_counters_wrong|s}} vertex counters wrong after churn). *Suggested fix:* use a fixed depth (⌊log₂ C⌋) for both insertion and removal, so
-removal always walks the path that insertion incremented. This candidate is on branch
-`registrar-overhead-iptree-fix` (not merged); its effect on admission and occupancy is
-reported in §6.5.
+specification.) A registrar is in the growth state only during its first ad lifetime
+after start-up, so the residual deviation is transient.
 
-**F3. Ticket keys can expire before a long wait ends.** Ticket MAC keys are
-garbage-collected 6 h after their last use (`ticketKeyLifetime`) and rotate after
-100,000 uses. A ticket with a wait above 6 h (quoted at occupancy ≳ 80%, F1, or with the
-no-abandonment sensitivity policy, §6.5) is rejected as `unknown ticket MAC keyID` if
-the key has not been used in the meantime (`TestTicketOutlivesKey`). Production-like
-advertisers never wait that long: they abandon quotes above 1.5·E.
+**F3, ticket key lifetime (open).** Ticket MAC keys are collected 6 h after their last
+use (`ticketKeyLifetime`). The registrar may quote up to 24 h, and a ticket for a wait
+above 6 h is rejected as `unknown ticket MAC keyID` if the key was not used in between
+(`TestTicketOutlivesKey`). Production advertisers abandon quotes above 1.5·E long
+before that, so this does not affect the results. *Suggested fix:* cap quotes at or
+below the key lifetime (a cap at E, D5, would do), or keep keys for at least
+`maxWaitTime`.
 
-*Suggested fix:* keep a ticket key for at least the longest wait the registrar can
-quote, or cap single quotes below `ticketKeyLifetime` (with the D5 cap at E, both
-issues disappear).
+**F4, ticket binding.** The ticket now carries the advertiser's node ID, and
+`handleRegtopic` ignores a ticket presented by another node. In
+`TestTicketNotBoundToAdvertiser`, advertiser A receives a wait of
+{{findings.ticket_transfer_wait|s}}; after that wait, B presents A's ticket, is treated as
+a new attempt and receives its own quote. The handler also remembers credited tickets
+(`UsedTickets`, at most 16,384 MACs for 15 s) so that a ticket is credited once, and
+re-quotes early tickets without moving their window. The specification binds tickets
+to `adDigest` (service, ENR and payload); binding to the node ID does not detect an
+ENR change during an attempt (D6).
 
-**F4. Tickets are not bound to the advertiser.** A `topicindex.Ticket` holds the topic,
-the issued wait and two timestamps; it contains no node ID and no ad digest, and
-`handleRegtopic` checks only the MAC and the time window. A ticket issued to advertiser
-A is therefore accepted from advertiser B, and B is credited with A's waiting time. In
-`TestTicketNotBoundToAdvertiser`, A receives a ticket with a wait of
-{{findings.ticket_transfer_wait|s}}; after that wait, B (a different key, address and
-record) presents A's ticket and is admitted (B in cache: {{findings.ticket_transfer_admitted|s}}),
-although B never waited. The specification binds a ticket to `adDigest`
-(service, ENR and payload), which would also reject a changed ENR (D6).
-
-*Suggested fix:* add the requester's node ID (or the spec's `adDigest`) to the sealed
-ticket and compare it in `handleRegtopic` before crediting the waiting time.
-
-*Effect on this study:* none. Harness advertisers only present their own tickets. The
-finding matters for the admission-control guarantees, not for the overhead numbers.
-
-**F5. The waiting-time function deviates from the specification.** The implemented
-function (§3.4) differs from discv5-theory.md in the base scale (an extra factor 0.1),
-the service term, the missing safety constant G, the 1 s admission floor and the
-absence of a cap on single quotes. These are listed with measured or derived effects as
-D1–D5 in §4.2. They are reported as a finding because the implementation does not state
-them as intended deviations, but the choice of which side to change belongs to the
-specification editors.
-
-*Suggested fix:* decide D1–D5 (§4.2), then align either the specification or
-`TopicTable.WaitTime`. If the implementation keeps its form, the factor 0.1 and the
-1 s floor should be named constants with a reference to the specification change.
+**F5, waiting-time deviations.** See D1–D5 below. G is restored (#170) but, like the
+other terms, scaled by the factor 0.1: the empty-cache wait is
+{{findings.g_impl|s}} against {{findings.g_spec|s}} in the specification.
 
 ### 4.2 Specification-alignment decisions
 
-The following differences are behavioural choices for the specification editors. They
-were measured where the harness allows it and left unchanged. "Model" marks values
-derived from the waiting-time formula, not from a run.
+These are behavioural choices for the specification editors, re-checked against the
+new code. "Model" marks values derived from the waiting-time formula.
 
-| # | item | specification (discv5-theory.md) | implementation | measured or derived effect |
-|---|---|---|---|---|
-| D1 | base scale | w = E/(1 − c/C)^Pocc · (…) | an extra factor 0.1 (`waitTimeBaseModifier`) | Over {{findings.quotes|f:0}} quotes on random cache states (`TestSpecWaitTimeDeviations`: occupancy uniform in 0–90%, 1–50 topics, random public addresses; lower bounds excluded), the implemented/spec ratio has median {{findings.wait_ratio_median|f:3}} and maximum {{findings.wait_ratio_max|f:2}}. Below 0.1, the gap comes from T/(N+1) and from the IP-score deviation F2. On these states, spec quotes exceed E in {{findings.spec_over_E|pct:0}} of cases and implemented quotes in {{findings.impl_over_E|pct:0}}. Model: equilibrium occupancy with the 0.1 factor is {{model.ustar.0.5|pct:0}} (x+s = 0.5), and {{model.ustar_spec.0.5|pct:0}} without it. |
-| D2 | service term | c(service)/c | T/(N+1) | Differs only at very small N. |
-| D3 | safety constant G | G = 10⁻⁷ | absent | Model: E·G = {{model.G_wait_empty_s|f:5}} s at an empty cache and {{model.G_wait_at_30pct_ms|f:1}} ms at 30% occupancy. G alone exceeds the 1 s floor only above {{model.G_exceeds_floor_u|pct:0}} occupancy. Negligible. |
-| D4 | admission threshold | admit if t_remaining ≤ 0 | admit if t_remaining ≤ 1 s | {{findings.impl_floor|pct:1}} of the D1 sample quotes fall at or below the floor. In the sweeps, at most {{sim.max_immediate_fraction|pct:1}} of fresh requests were admitted immediately in any run. |
-| D5 | single-wait cap | "a single waiting interval SHOULD NOT exceed E" | no cap; quotes up to the int64 limit (F1) | A single quote of {{findings.nocap_wait|s}} at {{findings.nocap_occupancy_pct|f:0}}% occupancy (E = 15 min). The production client abandons quotes above 1.5·E. An advertiser policy that drops quotes above E (§6.5, "spec") changes occupancy by a few percent. |
-| D6 | ticket binding | ticket bound to `adDigest` (service, ENR, payload) | ticket bound to the topic only | A ticket is accepted from any advertiser (F4). A changed ENR during an attempt was not measured (harness advertisers never change their ENR). |
-| D7 | LAN addresses | the IP tree scores advertisers' addresses | LAN/special addresses are inserted and scored like public ones (`TestSpecLANAddressesInTree`) | Not measured (the empirical dataset contains only public addresses). |
-| D8 | capacity default | C = 1000 | `AdCacheSize` default 5000 (`TestSpecDefaultCapacity`) | At C = 5000 the equilibrium occupancy fraction is similar (§6.2); memory at full occupancy is 5× (§6.3). |
-| D9 | retry window | tmod + twait ≤ now ≤ tmod + twait + δ (closed) | `[tmod+twait, tmod+twait+5 s)` (half-open) | None measurable. |
-| D10 | attempt timeout | implementation-defined ("MAY abandon") | client drops an attempt when one quote, or the sum of quotes, exceeds 1.5·E | Dominant factor in equilibrium occupancy (§6.2). |
+| # | item | specification (discv5-theory.md) | implementation (new code) | status | measured or derived effect |
+|---|---|---|---|---|---|
+| D1 | base scale | w = E/(1 − c/C)^Pocc · (…) | extra factor 0.1 (`waitTimeBaseModifier`) | open | Over {{findings.quotes|f:0}} quotes on random cache states (`TestSpecWaitTimeDeviations`), implemented/spec ratio median {{findings.wait_ratio_median|f:3}}, max {{findings.wait_ratio_max|f:2}}; spec quotes exceed E in {{findings.spec_over_E|pct:0}} of cases, implemented in {{findings.impl_over_E|pct:0}}. Model: equilibrium occupancy {{model.ustar.0.5|pct:0}} (x+s = 0.5) with the factor, {{model.ustar_spec.0.5|pct:0}} without. |
+| D2 | service term | c(service)/c | T/(N+1) | open | Differs only at very small N. |
+| D3 | safety constant G | G = 10⁻⁷ | `waitTimeSafety` = 10⁻⁷, times the base (which includes 0.1) | **resolved** (#170) | Empty-cache wait {{findings.g_impl|s}} (spec {{findings.g_spec|s}}); below the 1 s floor at any occupancy below {{model.G_exceeds_floor_u|pct:0}}. |
+| D4 | admission threshold | admit if t_remaining ≤ 0 | admit if t_remaining ≤ 1 s; the client raises sub-floor quotes to 1 s (#157) | open | {{findings.impl_floor|pct:1}} of the D1 sample quotes are at or below the floor; at most {{sim.max_immediate_fraction|pct:1}} of fresh requests were admitted immediately in any run. |
+| D5 | single-wait cap | "a single waiting interval SHOULD NOT exceed E" | cap at 24 h (`maxWaitTime`, #155) | changed | A single quote of {{findings.nocap_wait|s}} at {{findings.nocap_occupancy_pct|f:0}}% occupancy (E = 15 min). |
+| D6 | ticket binding | ticket bound to `adDigest` | ticket bound to the node ID (#160) | changed | A changed ENR during an attempt is not detected; not measured. |
+| D7 | LAN addresses | the IP tree scores advertisers' addresses | LAN/special addresses are inserted and scored like public ones (`TestSpecLANAddressesInTree`) | open | Not measured (the empirical dataset contains only public addresses). |
+| D8 | capacity default | C = 1000 | `AdCacheSize` default 1000 (#182) | **resolved** | C = 1000 is now the baseline of every experiment. |
+| D9 | retry window | tmod + twait ≤ now ≤ tmod + twait + δ | on time in [start, start + 5 s); late tickets credited with the scheduled wait for 10 s more; early tickets re-quoted (#153 and later) | changed | Modelled exactly by the harness (`TestProductionRetryValidity`). |
+| D10 | attempt timeout | implementation-defined ("MAY abandon") | client drops an attempt when one quote, or the sum of quotes, exceeds 1.5·E, and then skips that registrar for one ad lifetime | changed | Still the dominant factor in equilibrium occupancy (§6.2). |

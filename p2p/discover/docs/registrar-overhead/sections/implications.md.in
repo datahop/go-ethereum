@@ -15,6 +15,7 @@
    as the rest of the protocol (§6.4).
 2. *Memory.* Budget the decoded record size: up to
    {{mem.C1000-empirical-maxenr.independent.bytes_per_ad|f:0}} B per ad, i.e.
+   {{mem.C1000-empirical-maxenr.independent.at_capacity_mib|f:2}} MiB for the default C = 1000 and
    {{mem.C5000-empirical-maxenr.independent.at_capacity_mib|f:1}} MiB for C = 5000.
    Lower-bound state adds at most one ~{{mem.C1000-empirical.shared.bytes_per_topic_bound|f:0}} B
    entry per occupied topic. The specification's storage argument holds, but its
@@ -36,16 +37,15 @@
   {{model.ustar_spec.0.5|pct:0}} of C (model, x + s = 0.5).
 * The specification should state the attempt timeout, or the intended utilisation,
   because occupancy depends on it more than on any registrar parameter.
-* G (D3) is negligible next to the 1 s floor (D4); either may be dropped from the
-  specification or the implementation, as long as both agree.
-* A registrar-side cap on single quotes (D5) would bound quoted waits to E and remove
-  the overflow path of F1 at the same time.
+* G (D3) is restored but scaled by the 0.1 factor; it stays below the 1 s floor (D4)
+  at ordinary occupancy. Specification and implementation should agree on whether G
+  multiplies the scaled or the unscaled base.
+* The 24 h cap on single quotes (D5) removed the overflow (F1). A cap at E, as the
+  specification suggests for advertisers, would also close F3.
 
-**Implementation fixes (not applied):**
+**Implementation status:**
 
-* F1: clamp the float wait before converting.
-* F2: make the IP-tree depth fixed (candidate on a separate branch).
-* F3: either cap waits below the ticket key lifetime, or keep keys for at least the
-  maximum wait.
-* F4: seal the requester's node ID (or the spec's adDigest) into the ticket and check it
-  before crediting the wait.
+* F1, F2 (under churn), F4, G and the default capacity are fixed on `topdisc` (§4.1).
+* F3 is open: cap quotes at or below the ticket key lifetime, or keep keys for at
+  least `maxWaitTime`.
+* Ticket binding uses the node ID, not the specification's `adDigest` (D6).

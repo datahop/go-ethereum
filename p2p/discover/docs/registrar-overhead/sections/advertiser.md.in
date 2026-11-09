@@ -3,18 +3,29 @@ Advertisers behave like the production client, `topicindex.Registration.HandleTi
 against the production state machine):
 
 1. The first request carries no ticket. A wait response is decoded as on the wire:
-   ceil-milliseconds, then `time.Duration(ms) * time.Millisecond`.
+   ceil-milliseconds, then `waitTimeFromMs`, which saturates. A quote below the 1 s
+   floor is raised to 1 s (#157).
 2. The advertiser **drops the attempt if a single quote exceeds `RegAttemptTimeout`**
    (1.5·E = 22.5 min). Otherwise it adds the quote to its running sum and **drops the
    attempt if the sum exceeds `RegAttemptTimeout`**. Both comparisons are strict. Since
    the registrar credits the time since the first ticket, the sum of quotes is the
    advertiser's own estimate of its cumulative wait.
-3. A continuing advertiser retries exactly when its wait ends. The ticket window
-   `[due, due + 5 s)` is respected; a retry served late is counted as expired.
-4. **An abandoning advertiser leaves this registrar.** It goes to the back of the idle
-   queue and can come back only through a later fresh arrival, which starts a new
-   attempt with no credit. (In a network, it would try another registrar instead.)
+3. A continuing advertiser retries exactly when its wait ends. The registrar credits a
+   retry in `[due, due + 5 s)` with the time since the first ticket, a late retry (up
+   to 10 s more) with the scheduled wait, and treats a retry later than that as a new
+   attempt (`regtopicCredit`; `TestProductionRetryValidity` compares the boundaries
+   with `Ticket.TimingAt`). The handler's clock is read once per request, as
+   `RegisterAt` in production (#165).
+4. **An abandoning advertiser leaves this registrar for one ad lifetime.** The
+   production client lists a registrar that quoted above its budget as overloaded and
+   skips it for E (`TestAbandonCooldownMatchesProduction`). In the harness the
+   advertiser rejoins the idle population after E and can come back only through a
+   later fresh arrival, which starts a new attempt with no credit. (In a network, it
+   would try another registrar instead.)
 5. An admitted advertiser stays busy until its ad expires; renewals are not modelled.
+
+Ads are expired outside the timed region before each call, as the dispatch loop's
+expiry alarm does; `RegisterAt` and `RandomNodes` also expire internally (#173).
 
 Two sensitivity policies (§6.5):
 

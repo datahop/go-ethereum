@@ -31,10 +31,34 @@
 
 * Single platform: Apple M5 under macOS. The P/E core of the worker thread cannot be
   pinned or observed, so realtime results may mix core types.
-* F1 behaves differently on amd64 (§4.1); the simulated dynamics are unaffected
-  because no run approached the overflow threshold.
+* The old float-to-integer overflow (F1) depended on the architecture; the fix makes
+  both architectures agree (§4.1).
 * The empirical IP dataset is one snapshot of public addresses; the `diverse` and
   `concentrated` distributions bracket it.
 * The `none`-policy runs assume that tickets stay valid for days. Production ticket
   keys expire after 6 h (F3), so these runs overstate what a never-abandoning
   advertiser could achieve.
+* The 10k-node loads (§6.7) come from older code and partly from figure readings.
+
+**Decisions made overnight.** The experiments of this version ran unattended. These
+choices were made without consultation:
+
+* The harness's client model follows the new production client exactly, including the
+  one-ad-lifetime cooldown after abandoning. This changes the old dynamics as well as
+  the registrar fixes do; §6.8 does not separate the two.
+* Realtime points use a 3 h simulated warm-up (instead of 6 h) and, when time ran
+  short, 5 min instead of 10 min windows (see the window column of §6.4.2).
+* Registration-heavy realtime points are limited to 500, 1,500 and 4,000 fresh
+  attempts/s: with the cooldown, each needs about fresh-rate × 1,200 idle advertisers
+  in memory.
+* The knee is defined as the highest offered rate served in full (≥ 98% of offered
+  queries, queue-delay p99 below 10 ms).
+* The abandonment-policy sweep ran after the realtime block with 36 h runs (24 h
+  warm-up) instead of 72 h (48 h), and only if time remained before 07:05.
+* Validation costs are reported for the cgo build (libsecp256k1, as release builds
+  use) and for pure Go; the share of the registrar core uses the cgo build.
+* 10k-node REGTOPIC rates are figure readings, because the reports state them only in
+  bytes; they are marked as approximate.
+* Section text written for the old code was updated where the change was known before
+  the runs; qualitative statements in §6.2, §6.5 and §7 are checked in the morning
+  review against the new numbers.

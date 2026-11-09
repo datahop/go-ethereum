@@ -19,7 +19,20 @@ Checks:
 | 5 | {{bounded.C1000-fresh5-topics50000-uniform-diverse.occupied_topics|ci:0}} | {{bounded.C1000-fresh5-topics50000-uniform-diverse.topic_bounds|ci:0}} | {{bounded.C1000-fresh5-topics50000-uniform-diverse.ipv4_tree_nodes|ci:0}} | {{bounded.C1000-fresh5-topics50000-uniform-diverse.max_tree_nodes_per_entry|f:2}} |
 | 50 | {{bounded.C1000-fresh50-topics50000-uniform-diverse.occupied_topics|ci:0}} | {{bounded.C1000-fresh50-topics50000-uniform-diverse.topic_bounds|ci:0}} | {{bounded.C1000-fresh50-topics50000-uniform-diverse.ipv4_tree_nodes|ci:0}} | {{bounded.C1000-fresh50-topics50000-uniform-diverse.max_tree_nodes_per_entry|f:2}} |
 
-Lower-bound state is bounded by the occupied topics and by the IP-tree vertices of
-cached addresses. Pending registrations hold no registrar state: the ticket carries it.
-Ticket MAC keys are the only other state: one key per 100,000 tickets, collected after
-6 h.
+Pending registrations hold no registrar state: the ticket carries it. Ticket MAC keys
+are the only other long-lived state: one key per 100,000 tickets, collected after 6 h.
+
+The new code changes the topic lower bounds: a bound is kept until it decays (#166)
+and dropped with the topic's last ad (#177). The handler also keeps a replay memory of
+credited tickets (`UsedTickets`), capped at 16,384 entries of 15 s each.
+
+{{if:figure:bounds_vs_occupancy}}**Lower-bound state against occupancy.** Every 10 s sample of the C = 1000 runs
+({{bounds.samples|f:0}} samples, occupancy up to {{bounds.max_occupancy|f:0}} ads):
+
+![Lower-bound state vs occupancy](figures/bounds_vs_occupancy.png)
+
+At most {{bounds.max_topic_bounds_per_ad|f:2}} live topic bounds and {{bounds.max_ip_bounds_per_ad|f:2}} live IP
+bounds per cached ad were observed, and at most {{bounds.max_tree_nodes_per_ad|f:2}} IPv4 tree
+vertices per cached ad.{{if:bounds.max_topic_bound_bytes}} At the measured cost per topic-bound entry, the largest topic-bound
+state seen is about {{bounds.max_topic_bound_bytes|f:0}} B.{{endif}}
+{{else}}*Provisional: no samples were available for the lower-bound figure.*{{endif}}

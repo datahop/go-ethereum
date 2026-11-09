@@ -1,12 +1,16 @@
-* **Realtime throughput and saturation** (§6.4.2): the planned realtime block, which
-  replaces the provisional capacity estimates.
-* **Wire-level handler benchmark.** `handleRegtopic` and `handleTopicQuery` add costs
-  on top of the registrar core: packet decoding, ENR signature verification, ticket MAC
-  and encoding, and `NODES` responses. This study measures only the core (§2).
+{{if:rt.knee_requests_rps}}{{else}}* **Realtime throughput and saturation** (§6.4.2): the realtime block did not produce a
+  knee; the provisional estimates stand.
+{{endif}}{{if:rt.validation.utilisation_ratio}}{{else}}* **Hybrid-clock validation** against a fully realtime run (§6.4.2) did not run.
+{{endif}}* **Wire-level handler benchmark.** The validation benchmarks (§6.1) measure the
+  handler's steps separately. Packet decryption, session handling and response
+  encoding, and the handler as a whole on the dispatch goroutine, are not measured.
+* **10k-network inputs.** Per-registrar REGTOPIC rates, occupancy and cache capacity
+  are missing from the 10k reports (§6.7); a rerun on the new code that records them
+  would allow a direct comparison.
+* **F3** (ticket key lifetime below the 24 h cap) is open.
 * **Multi-registrar behaviour:** where abandoning advertisers go next, and the
   network-level effect of the low equilibrium occupancy.
 * **Renewals, multi-topic advertisers, IPv6 addresses** and advertisers that change
   their ENR during an attempt (D6).
-* **Another platform** (Linux/x86-64 server), where the core type can be pinned and
-  the amd64 overflow behaviour of F1 applies natively.
+* **Another platform** (Linux/x86-64 server), where the core type can be pinned.
 * **Adversarial workloads** (out of scope by design).

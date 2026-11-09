@@ -10,6 +10,10 @@ The installed Go toolchain is darwin/amd64. All study binaries were therefore bu
 with `GOARCH=arm64`, and each run records `sysctl.proc_translated`. Earlier results
 were produced by amd64 binaries under Rosetta 2; they are not used here.
 
+The validation benchmarks (§6.1) are built twice: with cgo, which uses libsecp256k1
+for signature verification as release builds of geth do, and without cgo
+(pure-Go verification). All other binaries are pure Go.
+
 Results come from these revisions. The production registrar code
 (`topicindex/*.go` except tests and `stats.go`) is identical across all of them
 (checked with `git diff` by `study.py`):
