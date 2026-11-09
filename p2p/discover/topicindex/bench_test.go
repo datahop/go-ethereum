@@ -37,6 +37,10 @@ import (
 
 const benchCapacity = 20000
 
+// benchTableCapacity is the capacity of tables built by benchTable. The
+// occupancy benchmarks set it to the production default.
+var benchTableCapacity = benchCapacity
+
 var (
 	benchSizesN = []int{0, 100, 1000, 2500, 5000, 10000}
 	benchSizesT = []int{1, 16, 64, 256, 1024, 4096}
@@ -66,7 +70,7 @@ func benchTable(n, t int, concentrated bool) (*TopicTable, *mclock.Simulated, To
 	}
 	r := mrand.New(mrand.NewSource(int64(n*131 + t)))
 	clock := new(mclock.Simulated)
-	tab := NewTopicTable(Config{AdCacheSize: benchCapacity, Clock: clock})
+	tab := NewTopicTable(Config{AdCacheSize: benchTableCapacity, Clock: clock})
 	var topic TopicID
 	topic[0] = 0xaa
 	others := make([]TopicID, 299)
@@ -298,6 +302,35 @@ func BenchmarkRemoveNode(b *testing.B) {
 			}
 			if tab.Occupancy() != n {
 				b.Fatal("removed")
+			}
+		})
+	}
+}
+
+// BenchmarkOccupancy measures the registrar operations against cache occupancy
+// at the default capacity C = 1000, where the occupancy factor of the waiting
+// time applies. The requested topic holds a tenth of the cached ads (about the
+// most popular topic's share in the simulated workload).
+func BenchmarkOccupancy(b *testing.B) {
+	const capacity = 1000
+	benchTableCapacity = capacity
+	defer func() { benchTableCapacity = benchCapacity }()
+	requester := netip.MustParseAddr("93.184.216.34")
+	check := func(n *enode.Node) bool { return netutil.CheckRelayAddr(requester, n.IPAddr()) == nil }
+	for _, n := range []int{0, 100, 250, 400, 600, 800, 950} {
+		t := max(1, n/10)
+		if n == 0 {
+			t = 0
+		}
+		name := fmt.Sprintf("C=%d/N=%d/T=%d", capacity, n, t)
+		b.Run(name+"/op=register-wait", func(b *testing.B) { benchRegisterWait(b, n, t) })
+		b.Run(name+"/op=register-admit", func(b *testing.B) { benchRegisterAdmit(b, n, t) })
+		b.Run(name+"/op=lookup", func(b *testing.B) {
+			tab, _, topic, _ := benchTable(n, t, false)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				tab.RandomNodes(topic, 16, check)
 			}
 		})
 	}
