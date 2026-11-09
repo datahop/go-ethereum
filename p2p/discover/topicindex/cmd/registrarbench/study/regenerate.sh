@@ -6,4 +6,6 @@
 set -euo pipefail
 root="${1:-results/registrar-overhead}"
 docs="${2:-docs/registrar-overhead}"
+# Start from empty output directories so that no stale table or figure survives.
+rm -rf "$docs/generated" "$docs/figures"
 "${PYTHON:-python3}" "$(dirname "$0")/study.py" "$root" "$docs"
