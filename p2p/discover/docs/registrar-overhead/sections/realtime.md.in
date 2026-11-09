@@ -60,8 +60,9 @@ Interpretation:
 3 h to reach the equilibrium state, then wall-clock measurement), spin pacing,
 Poisson arrivals and no per-operation records, on an otherwise idle machine. A monitor
 recorded the load average, the busiest processes and the thermal state every minute;
-points whose window overlapped foreign load or a thermal limit are marked in the
-last column ({{rt.contaminated_points|f:0}} of {{rt.points|f:0}} points).
+points whose window overlapped foreign load (load average above 3, or another process
+above 30% CPU — the machine runs endpoint-security software) or a thermal limit are
+marked in the last column ({{rt.contaminated_points|f:0}} of {{rt.points|f:0}} points).
 
 {{table:realtime}}
 
@@ -79,13 +80,15 @@ queries, queue-delay p99 below 10 ms) was {{rt.knee_offered_query|sig:2}} querie
 fresh attempts/s, i.e. {{rt.knee_requests_rps|sig:3}} requests/s served. At that point the
 registrar core was busy {{rt.knee_busy|pct:1}} of the time and the p99 queue delay was
 {{rt.knee_qd_p99_us|f:1}} µs. {{if:rt.first_saturated_offered}}At {{rt.first_saturated_offered|sig:2}} offered queries/s the process served only
-{{rt.first_saturated_served|sig:3}} requests/s.{{endif}} The limit is the single
-worker thread, harness included: the registrar core accounts for at most
-{{rt.max_busy|pct:1}} of the thread's time in the sweep, so the knee is a bound set by the
-harness and dispatch loop, not by `TopicTable`.{{else}}*No query-sweep point was served in full, or the sweep did not run; no knee is reported.*{{endif}}
+{{rt.first_saturated_served|sig:3}} requests/s. The limit is the single worker thread,
+harness included: the registrar core accounts for at most {{rt.max_busy|pct:1}} of the
+thread's time in the sweep, so the knee is a bound set by the harness and dispatch
+loop, not by `TopicTable`.{{else}}No offered rate in the sweep saturated the worker; the
+knee lies above the highest rate offered, and the registrar core used at most
+{{rt.max_busy|pct:1}} of one core.{{endif}}{{else}}*No query-sweep point was served in full, or the sweep did not run; no knee is reported.*{{endif}}
 
-{{if:rt.validation.utilisation_ratio}}**Hybrid clock validation.** A fully realtime run with a 45 min real warm-up and the
-same configuration as a hybrid point gave an occupancy ratio (realtime/hybrid) of
+{{if:rt.validation.utilisation_ratio}}**Hybrid clock validation.** A fully realtime run (45 min real warm-up, so its
+occupancy may still be rising) with the same configuration as a hybrid point gave an occupancy ratio (realtime/hybrid) of
 {{rt.validation.utilisation_ratio|f:3}}, a mean query cost ratio of {{rt.validation.q_mean_ns_ratio|f:2}} and a mean
 registration cost ratio of {{rt.validation.r_mean_ns_ratio|f:2}}.{{else}}*Provisional: the fully realtime validation point did not run; the hybrid clock is
 validated only by `TestHybridTableEquivalence`.*{{endif}}
