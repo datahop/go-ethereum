@@ -1317,3 +1317,9 @@ func (test *udpV5Test) close() {
 		test.t.Fatalf("%d unmatched UDP packets in queue", len(test.pipe.queue))
 	}
 }
+
+// The instrumentation build has these limits as defaults of topicLimits.
+const (
+	regtopicNodesLimit    = 8
+	topicNodesResultLimit = 16
+)

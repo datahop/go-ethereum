@@ -705,7 +705,7 @@ func (t *UDPv5) regtopic(quit <-chan struct{}, n *enode.Node, topic topicindex.T
 		total     = -1
 	)
 	for result.err == nil && (!confirmed || (total >= 0 && received < total)) {
-		if packets >= regtopicNodesLimit {
+		if packets >= t.topicLimits.auxNodes {
 			if !confirmed {
 				result.err = errTooManyResponses
 			}
@@ -773,7 +773,7 @@ func (t *UDPv5) topicQuery(quit <-chan struct{}, n *enode.Node, topic topicindex
 		total      = -1
 	)
 	for result.err == nil && (total < 0 || received < total) {
-		if packets >= topicNodesResultLimit {
+		if packets >= t.topicLimits.topicNodes {
 			result.err = errTooManyResponses
 			break
 		}
