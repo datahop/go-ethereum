@@ -468,6 +468,266 @@ func TestUDPv5_findnodeCall_InvalidNodes(t *testing.T) {
 	}
 }
 
+func (test *udpV5Test) startRegtopic(quit <-chan struct{}) <-chan topicRegResult {
+	remote := test.getNode(test.remotekey, test.remoteaddr).Node()
+	done := make(chan topicRegResult, 1)
+	go func() { done <- test.udp.regtopic(quit, remote, testTopic1, nil, nil, 0) }()
+	return done
+}
+
+func (test *udpV5Test) startTopicQuery() <-chan topicQueryResult {
+	remote := test.getNode(test.remotekey, test.remoteaddr).Node()
+	done := make(chan topicQueryResult, 1)
+	go func() { done <- test.udp.topicQuery(nil, remote, testTopic1, nil, 0) }()
+	return done
+}
+
+// This test checks that a ticket survives the loss of the NODES packets following
+// its REGCONFIRMATION.
+func TestUDPv5_RegtopicLostNodes(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	ticket := []byte("ticket")
+	node := nodesAtDistance(enode.ID(testTopic1), 200, 1)[0]
+	done := test.startRegtopic(nil)
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {
+		test.packetIn(&v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 3, Ticket: ticket, WaitTime: 1000})
+		test.packetIn(&v5wire.Nodes{ReqID: p.ReqID, RespCount: 3, Nodes: []*enr.Record{node.Record()}})
+	})
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+	if res.msg == nil || !bytes.Equal(res.msg.Ticket, ticket) {
+		t.Fatalf("wrong confirmation: %+v", res.msg)
+	}
+	if len(res.nodes) != 1 {
+		t.Fatalf("got %d nodes, want 1", len(res.nodes))
+	}
+}
+
+// This test checks that a timeout without REGCONFIRMATION stays an error and keeps
+// the nodes received so far.
+func TestUDPv5_RegtopicNodesOnlyTimeout(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	node := nodesAtDistance(enode.ID(testTopic1), 200, 1)[0]
+	done := test.startRegtopic(nil)
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {
+		test.packetIn(&v5wire.Nodes{ReqID: p.ReqID, RespCount: 3, Nodes: []*enr.Record{node.Record()}})
+	})
+	res := <-done
+	if res.err != errTimeout {
+		t.Fatalf("want errTimeout, got %v", res.err)
+	}
+	if res.msg != nil {
+		t.Fatalf("unexpected confirmation: %+v", res.msg)
+	}
+	if len(res.nodes) != 1 {
+		t.Fatalf("got %d nodes, want 1", len(res.nodes))
+	}
+}
+
+// This test checks that a shutdown after REGCONFIRMATION is reported as errClosed,
+// both when the caller quits and when the transport closes.
+func TestUDPv5_RegtopicClosedAfterConfirmation(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		stop func(test *udpV5Test, quit chan struct{})
+	}{
+		{"quit", func(_ *udpV5Test, quit chan struct{}) { close(quit) }},
+		{"transport closed", func(test *udpV5Test, _ chan struct{}) { test.udp.Close() }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			test := newUDPV5Test(t)
+			defer test.close()
+
+			quit := make(chan struct{})
+			done := test.startRegtopic(quit)
+			test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {
+				test.packetIn(&v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: 3, Ticket: []byte("ticket"), WaitTime: 1000})
+				// c.ch holds one packet, so accepting this one means the confirmation was read.
+				test.packetIn(&v5wire.TalkResponse{ReqID: p.ReqID})
+			})
+			tt.stop(test, quit)
+			if res := <-done; res.err != errClosed {
+				t.Fatalf("want errClosed, got %v", res.err)
+			}
+		})
+	}
+}
+
+// This test checks how REGTOPIC treats replies that reach the packet limit.
+func TestUDPv5_RegtopicPacketLimit(t *testing.T) {
+	t.Parallel()
+
+	const limit = regtopicNodesLimit
+	confirm := func(total int) []v5wire.Packet {
+		return []v5wire.Packet{&v5wire.Regconfirmation{RespCount: uint8(total), Ticket: []byte("ticket"), WaitTime: 1000}}
+	}
+	talk := func(count int) (packets []v5wire.Packet) {
+		for i := 0; i < count; i++ {
+			packets = append(packets, &v5wire.TalkResponse{})
+		}
+		return packets
+	}
+	nodes := func(count, total int) (packets []v5wire.Packet) {
+		for _, n := range nodesAtDistance(enode.ID(testTopic1), 200, count) {
+			packets = append(packets, &v5wire.Nodes{RespCount: uint8(total), Nodes: []*enr.Record{n.Record()}})
+		}
+		return packets
+	}
+
+	for _, tt := range []struct {
+		name      string
+		packets   []v5wire.Packet
+		wantErr   error
+		confirmed bool
+		wantNodes int
+	}{
+		{"unexpected types only", talk(limit), errTooManyResponses, false, 0},
+		{"confirmation above the limit then unexpected types", slices.Concat(confirm(200), talk(limit-1)), nil, true, 0},
+		{"unexpected types then confirmation", slices.Concat(talk(limit-1), confirm(1)), nil, true, 0},
+		{"confirmation and nodes filling the limit", slices.Concat(confirm(limit), nodes(limit-1, limit)), nil, true, limit - 1},
+		{"confirmation and nodes then unexpected types", slices.Concat(confirm(limit), nodes(2, limit), talk(limit-3)), nil, true, 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// The clock is never advanced, so only the packet limit can end these calls.
+			test := newUDPV5TestClock(t, new(mclock.Simulated))
+			defer test.close()
+
+			done := test.startRegtopic(nil)
+			test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {
+				for _, packet := range tt.packets {
+					packet.SetRequestID(p.ReqID)
+					test.packetIn(packet)
+				}
+			})
+			var res topicRegResult
+			select {
+			case res = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("call did not finish at the packet limit")
+			}
+			if res.err != tt.wantErr {
+				t.Fatalf("want error %v, got %v", tt.wantErr, res.err)
+			}
+			if (res.msg != nil) != tt.confirmed {
+				t.Fatalf("confirmation: got %+v, want confirmed=%v", res.msg, tt.confirmed)
+			}
+			if len(res.nodes) != tt.wantNodes {
+				t.Fatalf("got %d nodes, want %d", len(res.nodes), tt.wantNodes)
+			}
+		})
+	}
+}
+
+// This test checks that REGTOPIC gives up on a peer sending NODES packets without
+// ever confirming.
+func TestUDPv5_RegtopicTooManyNodes(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	nodes := nodesAtDistance(enode.ID(testTopic1), 200, regtopicNodesLimit)
+	done := test.startRegtopic(nil)
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {
+		for _, n := range nodes {
+			test.packetIn(&v5wire.Nodes{ReqID: p.ReqID, RespCount: 1, Nodes: []*enr.Record{n.Record()}})
+		}
+	})
+	res := <-done
+	if res.err != errTooManyResponses {
+		t.Fatalf("want errTooManyResponses, got %v", res.err)
+	}
+	if len(res.nodes) != len(nodes) {
+		t.Fatalf("got %d nodes, want %d", len(res.nodes), len(nodes))
+	}
+}
+
+// This test checks that packets of an unexpected type count toward the TOPICQUERY
+// packet limit.
+func TestUDPv5_TopicQueryUnexpectedPackets(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	done := test.startTopicQuery()
+	test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {
+		for i := 0; i < topicNodesResultLimit; i++ {
+			test.packetIn(&v5wire.TalkResponse{ReqID: p.ReqID})
+		}
+	})
+	res := <-done
+	if res.err != errTooManyResponses {
+		t.Fatalf("want errTooManyResponses, got %v", res.err)
+	}
+	if len(res.topicNodes)+len(res.auxNodes) != 0 {
+		t.Fatalf("unexpected nodes in result: %+v", res)
+	}
+}
+
+// This test checks that records received before TOPICQUERY reaches the packet limit
+// are returned with the error.
+func TestUDPv5_TopicQueryPartialAtLimit(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	nodes := nodesAtDistance(enode.ID(testTopic1), 200, 2)
+	done := test.startTopicQuery()
+	test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {
+		test.packetIn(&v5wire.Nodes{ReqID: p.ReqID, RespCount: 16, Nodes: []*enr.Record{nodes[0].Record()}})
+		test.packetIn(&v5wire.TopicNodes{ReqID: p.ReqID, RespCount: 16, Nodes: []*enr.Record{nodes[1].Record()}})
+		for i := 0; i < 14; i++ {
+			test.packetIn(&v5wire.TalkResponse{ReqID: p.ReqID})
+		}
+	})
+	res := <-done
+	if res.err != errTooManyResponses {
+		t.Fatalf("want errTooManyResponses, got %v", res.err)
+	}
+	if len(res.auxNodes) != 1 || len(res.topicNodes) != 1 {
+		t.Fatalf("got %d aux and %d topic nodes, want 1 and 1", len(res.auxNodes), len(res.topicNodes))
+	}
+}
+
+// This test checks that a TOPICQUERY reply of the announced size finishes without
+// error, also when the size equals the packet limit.
+func TestUDPv5_TopicQueryAnnouncedTotal(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	for _, tt := range []struct{ announced, packets int }{
+		{2, 2},
+		{topicNodesResultLimit, topicNodesResultLimit},
+		{200, topicNodesResultLimit}, // a total above the cap is complete at the cap
+	} {
+		nodes := nodesAtDistance(enode.ID(testTopic1), 200, tt.packets)
+		done := test.startTopicQuery()
+		test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {
+			test.packetIn(&v5wire.Nodes{ReqID: p.ReqID, RespCount: uint8(tt.announced), Nodes: []*enr.Record{nodes[0].Record()}})
+			for _, n := range nodes[1:] {
+				test.packetIn(&v5wire.TopicNodes{ReqID: p.ReqID, RespCount: uint8(tt.announced), Nodes: []*enr.Record{n.Record()}})
+			}
+		})
+		res := <-done
+		if res.err != nil {
+			t.Fatalf("announced %d: unexpected error: %v", tt.announced, res.err)
+		}
+		if len(res.auxNodes) != 1 || len(res.topicNodes) != tt.packets-1 {
+			t.Fatalf("announced %d: got %d aux and %d topic nodes", tt.announced, len(res.auxNodes), len(res.topicNodes))
+		}
+	}
+}
+
 // This test checks that pending calls are re-sent when a handshake happens.
 func TestUDPv5_callResend(t *testing.T) {
 	t.Parallel()
