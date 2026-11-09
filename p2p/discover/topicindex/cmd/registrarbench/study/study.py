@@ -598,9 +598,24 @@ def op_latencies(path):
     return {k: np.array(v) for k, v in lat.items()}, np.array(qd), {k: np.array(v) for k, v in idle.items()}
 
 
+def pacing_dir(root):
+    """The pacing check's results: this root's, or else the first study's
+    (registrar-overhead-oct27 next to the root), which the overnight run reuses."""
+    own = os.path.join(root, "pacing")
+    if glob.glob(os.path.join(own, "*.jsonl")):
+        put("pacing.source", "this run")
+        return own
+    old = os.path.join(os.path.dirname(os.path.normpath(root)), "registrar-overhead-oct27", "pacing")
+    if glob.glob(os.path.join(old, "*.jsonl")):
+        put("pacing.source", "first study (old code)")
+        put("pacing.old", "yes")
+        return old
+    return own
+
+
 def pacing(root, docs):
     """Sleep vs spin pacing check (hybrid runs with raw operation records)."""
-    paths = sorted(glob.glob(os.path.join(root, "pacing", "*.jsonl")))
+    paths = sorted(glob.glob(os.path.join(pacing_dir(root), "*.jsonl")))
     rows, idle_rows = [], []
     for path in paths:
         meta, s, _, _ = read_run(path)
@@ -703,7 +718,7 @@ def capacity_provisional(root, docs):
             qr.append(s["rates"]["query_rps"])
         if regs:
             row("simulated", point, np.mean(regs), np.mean(qs), np.mean(rr), np.mean(qr))
-    for path in sorted(glob.glob(os.path.join(root, "pacing", "*-spin.jsonl"))):
+    for path in sorted(glob.glob(os.path.join(pacing_dir(root), "*-spin.jsonl"))):
         meta, s, _, _ = read_run(path)
         if not s or admissibility(meta):
             continue
@@ -1186,7 +1201,7 @@ def findings(root, docs):
                 put(f"findings.{arch}.ip_counters_wrong", f"{m.group(3)}/{m.group(4)}")
             put(f"findings.{arch}.failed_tests", ", ".join(re.findall(r"--- FAIL: (\w+)", text)))
             continue
-        for m in re.finditer(r"(\S+): GOARCH=\w+ first overflowing occupancy N=(\d+) of C=(\d+)", text):
+        for m in re.finditer(r"(\S+): GOARCH=\w+ first overflowing occupancy N=(-?\d+) of C=(\d+)", text):
             put(f"findings.{arch}.threshold.{m.group(1)}", int(m.group(2)))
         th = [v for k, v in VALUES.items() if k.startswith(f"findings.{arch}.threshold.")]
         if th:

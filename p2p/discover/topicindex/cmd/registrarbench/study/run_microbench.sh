@@ -8,6 +8,7 @@ out="$1"; count="${2:-10}"; bt="${3:-1s}"; fixed=20000x
 [ "$bt" != 1s ] && fixed=500x
 here="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$out"
+out="$(cd "$out" && pwd)"  # absolute: the topicindex benchmarks run from that directory
 arch=$(uname -m); [ "$arch" = x86_64 ] && arch=amd64
 native() {
   case "$(file -b "$1")" in

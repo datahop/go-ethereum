@@ -8,11 +8,12 @@
 # and committing the regenerated documents locally. It never pushes.
 #
 # Environment overrides (for the smoke test): ROOT, SEEDS, JOBS, MICRO_COUNT,
-# STOP_SIMS, STOP_AUX, STOP_MICRO, STOP_REALTIME, STOP_ABANDON, SMOKE=1, NOCOMMIT=1.
+# DOCS, STOP_SIMS, STOP_AUX, STOP_MICRO, STOP_REALTIME, STOP_ABANDON, SMOKE=1, NOCOMMIT=1.
 set -uo pipefail
 cd "$(dirname "$0")/../../../.."   # p2p/discover
 study=topicindex/cmd/registrarbench/study
 ROOT="${ROOT:-results/registrar-overhead}"
+DOCS="${DOCS:-docs/registrar-overhead}"
 SEEDS="${SEEDS:-5}"
 JOBS="${JOBS:-8}"
 MICRO_COUNT="${MICRO_COUNT:-10}"
@@ -79,9 +80,9 @@ stage realtime "$STOP_REALTIME" python3 "$study/run_realtime.py" "$ROOT" --deadl
 stage abandon "$STOP_ABANDON" python3 "$study/run_sweeps.py" "$ROOT" --only abandon --seeds "$SEEDS" --jobs 10 \
   --abandon-duration 36h --abandon-warmup 24h ${smoke_args[@]+"${smoke_args[@]}"}
 # 6. Regenerate the write-up and commit the regenerated documents.
-stage regenerate 23:59 "$study/regenerate.sh" "$ROOT" docs/registrar-overhead
+stage regenerate 23:59 "$study/regenerate.sh" "$ROOT" "$DOCS"
 if [ "${NOCOMMIT:-}" != 1 ]; then
-  git add docs/registrar-overhead
+  git add "$DOCS"
   if git commit -q -m "p2p/discover/docs: regenerate the registrar overhead write-up from the overnight runs
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"; then

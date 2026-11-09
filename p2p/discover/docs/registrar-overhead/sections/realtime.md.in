@@ -1,5 +1,10 @@
 #### 6.4.1 Pacing and the cost of idle time
 
+{{if:pacing.old}}*These pacing runs are from the first study ({{pacing.source|s}}, branch
+`registrar-overhead-oct27`); they were not repeated on the new code. Pacing concerns the
+harness's idle strategy, which the registrar changes do not affect; the per-call
+costs in them are those of the old registrar.*
+{{endif}}
 Earlier realtime results reported registration latencies of tens of microseconds,
 against sub-microsecond costs in the microbenchmarks. Before the realtime sweep, a
 pacing check separated the possible causes. It ran two load points, each 15 min of real
