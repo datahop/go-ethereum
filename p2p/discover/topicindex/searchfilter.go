@@ -29,7 +29,7 @@ const (
 
 	// Results are handed out once this many registrars replied with ads in
 	// the pass, or once the first result has waited this long.
-	searchMixRegistrars = 5
+	searchMixRegistrars = 10
 	searchMixWait       = 5 * time.Second
 )
 
