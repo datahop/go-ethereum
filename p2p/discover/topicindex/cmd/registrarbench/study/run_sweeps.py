@@ -33,7 +33,7 @@ BASE = {
 FRESH = [0.25, 0.5, 1, 2, 5, 10, 20, 50, 100]
 
 
-def experiments():
+def experiments(abandon_duration="72h", abandon_warmup="48h"):
     """Yields (experiment, point-name, overrides)."""
     for c in (1000, 5000):
         for r in FRESH:
@@ -53,7 +53,7 @@ def experiments():
     for policy in ("production", "spec", "none"):
         for r in (1, 5, 20):
             yield "abandon", f"C1000-fresh{r:g}-{policy}", {"abandon": policy, "fresh-rate": r,
-                                                           "advertisers": 1000000, "duration": "72h", "warmup": "48h"}
+                                                           "advertisers": 1000000, "duration": abandon_duration, "warmup": abandon_warmup}
     # Bounded registrar state: high topic churn, many distinct IPs.
     for r in (5, 50):
         yield "bounded", f"C1000-fresh{r:g}-topics50000-uniform-diverse", {
@@ -89,15 +89,24 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--src", default=".", help="p2p/discover directory to build from")
     p.add_argument("--out", default="sim", help="output directory under the results root")
+    p.add_argument("--abandon-duration", default="72h")
+    p.add_argument("--abandon-warmup", default="48h")
+    p.add_argument("--smoke", action="store_true", help="one tiny point per experiment, for a functional check")
     a = p.parse_args()
     a.root = os.path.abspath(a.root)
     binary = os.path.join(a.root, "bin", "registrarbench" if a.out == "sim" else f"registrarbench-{a.out}")
     src = os.path.abspath(a.src)
     subprocess.check_call([os.path.join(src, "topicindex/cmd/registrarbench/study/build.sh"), binary], cwd=src)
     jobs = []
-    for exp, point, over in experiments():
+    seen = set()
+    for exp, point, over in experiments(a.abandon_duration, a.abandon_warmup):
         if a.only and exp not in a.only:
             continue
+        if a.smoke:
+            if exp in seen:
+                continue
+            seen.add(exp)
+            over = dict(over, duration="40m", warmup="20m", advertisers=20000)
         for seed in range(1, a.seeds + 1):
             path = os.path.join(a.root, a.out, exp, point, f"seed{seed}.jsonl")
             if done(path):

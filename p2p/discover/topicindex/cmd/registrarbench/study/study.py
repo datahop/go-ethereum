@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 from collections import defaultdict
 
@@ -719,6 +720,337 @@ def capacity_provisional(root, docs):
                         "registrar busy (one core)", "implied requests/s at 100% busy (same mix)"], rows)
 
 
+# ---------------------------------------------------------------- overnight additions
+
+
+def micro_extra(root, docs, figdir):
+    """Validation-cost benchmarks (p2p/discover, cgo and pure Go), the occupancy
+    sweep at C = 1000, and the share of a full REGTOPIC that is registrar core."""
+    gen = os.path.join(docs, "generated")
+    res = {}
+    for v in ("cgo", "purego"):
+        p = os.path.join(root, "microbench", f"validation-{v}.txt")
+        if os.path.exists(p):
+            res[v] = load_bench(p)
+    rows = []
+    for v, r in res.items():
+        for name in sorted(r):
+            ns = ci(r[name]["ns/op"])
+            key = name.replace("Benchmark", "")
+            put(f"valid.{v}.{key}.ns", {"mean": ns[0], "ci": ns[1], "n": ns[2]})
+            put(f"valid.{v}.{key}.bytes", np.mean(r[name].get("B/op", [float("nan")])))
+            put(f"valid.{v}.{key}.allocs", np.mean(r[name].get("allocs/op", [float("nan")])))
+            rows.append([v, key, fmt_ci(ns[0], ns[1], 1), fmt_num(np.mean(r[name].get("B/op", [float("nan")])), 0),
+                         fmt_num(np.mean(r[name].get("allocs/op", [float("nan")])), 1)])
+    if rows:
+        write_md_table(os.path.join(gen, "validation.md"), ["build", "benchmark", "ns/op", "B/op", "allocs/op"], rows)
+    path = os.path.join(root, "microbench", "bench.txt")
+    occ = load_bench(path) if os.path.exists(path) else {}
+    pts = defaultdict(list)
+    for name in occ:
+        p = bench_params(name)
+        if p["family"] != "Occupancy":
+            continue
+        m = ci(occ[name]["ns/op"])
+        pts[p["op"]].append((p["N"] / p["C"], m[0], m[1], p["N"], p["T"]))
+        put(f"occ.{p['op']}.N{int(p['N'])}.ns", {"mean": m[0], "ci": m[1], "n": m[2]})
+    if pts:
+        fig, ax = plt.subplots(figsize=(6.5, 4))
+        labels = {"register-wait": "REGTOPIC → wait ticket", "register-admit": "REGTOPIC → admitted", "lookup": "TOPICQUERY lookup (16 results)"}
+        rows = []
+        for op, xs in sorted(pts.items()):
+            xs.sort()
+            ax.errorbar([x[0] * 100 for x in xs], [x[1] for x in xs], yerr=[x[2] for x in xs], marker="o", capsize=3, label=labels.get(op, op))
+            for x in xs:
+                rows.append([op, f"{x[0] * 100:.0f}%", int(x[3]), int(x[4]), fmt_ci(x[1], x[2], 0)])
+        ax.set_xlabel("cache occupancy N/C (%), C = 1000; requested topic holds N/10 ads")
+        ax.set_ylabel("ns per call (registrar core)")
+        ax.set_yscale("log")
+        ax.grid(alpha=.3)
+        ax.legend(fontsize=8)
+        savefig(fig, figdir, "latency_vs_occupancy")
+        write_md_table(os.path.join(gen, "micro_occupancy.md"), ["operation", "N/C", "N", "T", "ns/call"], rows)
+    # Share of a full REGTOPIC (handler work modelled as the sum of its parts).
+    core = VALUES.get("occ.register-wait.N250.ns") or VALUES.get("micro.RegisterFresh/N=1000/T=16.ns")
+    for v in ("cgo", "purego"):
+        enr_ns = VALUES.get(f"valid.{v}.ValidationENR/size=typical.ns")
+        if not (core and enr_ns):
+            continue
+        parts = {
+            "ENR decode + signature": enr_ns["mean"],
+            "endpoint check": VALUES[f"valid.{v}.ValidationEndpoint.ns"]["mean"],
+            "ticket unpack (retry)": VALUES[f"valid.{v}.ValidationTicket/op=unpack.ns"]["mean"],
+            "replay check (retry)": VALUES[f"valid.{v}.ValidationTicket/op=replay-check.ns"]["mean"],
+            "ticket pack (wait reply)": VALUES[f"valid.{v}.ValidationTicket/op=pack.ns"]["mean"],
+            "registrar core (RegisterAt, N/C = 25%)": core["mean"],
+        }
+        total = sum(parts.values())
+        put(f"share.{v}.total_ns", total)
+        put(f"share.{v}.regtopic_per_core", 1e9 / total)
+        put(f"share.{v}.core_ns", core["mean"])
+        put(f"share.{v}.core_fraction", core["mean"] / total)
+        put(f"share.{v}.enr_fraction", enr_ns["mean"] / total)
+        if v == "cgo":
+            write_md_table(os.path.join(gen, "regtopic_share.md"), ["step of a REGTOPIC retry that receives a new ticket", "ns", "share"],
+                           [[k, fmt_num(x, 0), f"{100 * x / total:.1f}%"] for k, x in parts.items()] + [["total (excluding packet decryption and I/O)", fmt_num(total, 0), "100%"]])
+
+
+def bounds_vs_occupancy(root, docs, figdir):
+    """Lower-bound state against instantaneous occupancy, from the samples of
+    every admissible simulated run."""
+    occ, tb, ib, tree = [], [], [], []
+    for path in sorted(glob.glob(os.path.join(root, "sim", "*", "*", "seed1.jsonl"))):
+        meta, s, samples, _ = read_run(path)
+        if s is None or admissibility(meta) or meta["config"]["CacheSize"] != 1000:
+            continue
+        for x in samples:
+            st = x["state"]
+            occ.append(st["occupancy"])
+            tb.append(st["effective_topic_bounds"])
+            ib.append(st["effective_ip_bounds"])
+            tree.append(st["ipv4_tree_nodes"])
+    if not occ:
+        return
+    occ, tb, ib, tree = map(np.array, (occ, tb, ib, tree))
+    bins = np.arange(0, 1001, 50)
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    rows = []
+    for label, ys in (("live topic lower bounds", tb), ("live IP lower bounds (tree vertices)", ib), ("IPv4 tree vertices", tree)):
+        mx, my, mmax = [], [], []
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            sel = (occ >= lo) & (occ < hi)
+            if sel.sum() >= 5:
+                mx.append((lo + hi) / 2)
+                my.append(ys[sel].mean())
+                mmax.append(ys[sel].max())
+        ax.plot(mx, my, marker="o", ms=3, label=label + " (mean)")
+        ax.plot(mx, mmax, ls=":", lw=1, color=ax.lines[-1].get_color())
+    ax.plot([0, occ.max()], [0, occ.max()], color="grey", lw=.8, ls="--", label="one per cached ad")
+    ax.set_xlabel("ads cached N (C = 1000; 10 s samples of all simulated runs)")
+    ax.set_ylabel("entries (dotted: maximum)")
+    ax.grid(alpha=.3)
+    ax.legend(fontsize=8)
+    savefig(fig, figdir, "bounds_vs_occupancy")
+    put("bounds.samples", len(occ))
+    put("bounds.max_occupancy", int(occ.max()))
+    put("bounds.max_topic_bounds_per_ad", float(np.max(tb[occ > 0] / occ[occ > 0])))
+    put("bounds.max_ip_bounds_per_ad", float(np.max(ib[occ > 0] / occ[occ > 0])))
+    put("bounds.max_tree_nodes_per_ad", float(np.max(tree[occ > 0] / occ[occ > 0])))
+    bb = VALUES.get("mem.C1000-empirical.shared.bytes_per_topic_bound")
+    if bb:
+        put("bounds.max_topic_bound_bytes", float(tb.max()) * bb["mean"])
+
+
+def monitor_flags(root):
+    recs = []
+    p = os.path.join(root, "realtime", "monitor.jsonl")
+    if os.path.exists(p):
+        for line in open(p):
+            try:
+                recs.append(json.loads(line))
+            except ValueError:
+                pass
+    return recs
+
+
+def contaminated(recs, start, end):
+    reasons = set()
+    for r in recs:
+        if not (start <= r.get("time", 0) <= end):
+            continue
+        if r.get("loadavg") and r["loadavg"][0] > 3.0:
+            reasons.add(f"load {r['loadavg'][0]:.1f}")
+        for pc, name in r.get("top", []):
+            base = os.path.basename(name)
+            if pc > 30 and not base.startswith(("registrarbench", "ps", "pmset", "sysctl", "kernel_task", "WindowServer")):
+                reasons.add(f"{base} {pc:.0f}%")
+        th = r.get("therm", "")
+        m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", th)
+        if (m and int(m.group(1)) < 100) or ("warning level" in th and "No thermal warning" not in th):
+            reasons.add("thermal")
+    return sorted(reasons)
+
+
+def realtime(root, docs, figdir):
+    """Realtime block: throughput, queueing and the registrar's busy fraction."""
+    gen = os.path.join(docs, "generated")
+    recs = monitor_flags(root)
+    rows, pts = [], []
+    for path in sorted(glob.glob(os.path.join(root, "realtime", "*", "*.jsonl"))):
+        if path.endswith("monitor.jsonl"):
+            continue
+        meta, s, _, _ = read_run(path)
+        if not s or admissibility(meta):
+            continue
+        stage = path.split(os.sep)[-2]
+        name = os.path.basename(path)[:-6]
+        cfg = meta["config"]
+        r = s["rates"]
+        ql, rl, qd = s.get("query_latency") or {}, s.get("registration_latency") or {}, s.get("queue_delay") or {}
+        busy = (r["registration_rps"] * (rl.get("mean_ns") or 0) + r["query_rps"] * (ql.get("mean_ns") or 0)) / 1e9
+        end = os.path.getmtime(path)
+        start = end - (s.get("measurement_wall_seconds") or 0)
+        bad = contaminated(recs, start, end)
+        key = f"rt.{stage}.{name}"
+        vals = {"offered_query": cfg["QueryRate"], "offered_fresh": cfg["FreshRate"], "query_rps": r["query_rps"],
+                "registration_rps": r["registration_rps"], "requests_rps": r["query_rps"] + r["registration_rps"],
+                "busy": busy, "cpu_percent": s.get("cpu_percent_one_core"), "qd_p50_us": (qd.get("median_ns_upper") or 0) / 1e3,
+                "qd_p99_us": (qd.get("p99_ns_upper") or 0) / 1e3, "q_mean_ns": ql.get("mean_ns"), "r_mean_ns": rl.get("mean_ns"),
+                "utilisation": s.get("time_avg_utilisation"), "window_s": s.get("measurement_wall_seconds"),
+                "contaminated": ", ".join(bad) or "no", "capacity": cfg["CacheSize"], "mode": cfg["Mode"]}
+        for k, v in vals.items():
+            put(f"{key}.{k}", v)
+        pts.append((stage, name, vals))
+        rows.append([stage, name, cfg["Mode"], cfg["CacheSize"], fmt_num(cfg["FreshRate"], 0), fmt_num(cfg["QueryRate"], 0),
+                     fmt_num(vals["requests_rps"], 0), fmt_num(vals["r_mean_ns"], 0), fmt_num(vals["q_mean_ns"], 0),
+                     f"{100 * busy:.2f}%", fmt_num(vals["qd_p50_us"], 1), fmt_num(vals["qd_p99_us"], 1),
+                     f"{100 * (vals['utilisation'] or 0):.1f}%", fmt_num((vals["window_s"] or 0) / 60, 1), vals["contaminated"]])
+    if not rows:
+        return
+    put("rt.points", len(rows))
+    put("rt.contaminated_points", sum(1 for *_, v in pts if v["contaminated"] != "no"))
+    write_md_table(os.path.join(gen, "realtime.md"),
+                   ["stage", "point", "clock", "C", "fresh/s", "offered query/s", "served req/s", "mean ns/REGTOPIC", "mean ns/TOPICQUERY",
+                    "registrar busy (one core)", "queue delay p50 µs", "queue delay p99 µs", "occupancy N/C", "window min", "contamination"], rows)
+    sweep = sorted([v for st, _, v in pts if st == "a-query"], key=lambda v: v["offered_query"])
+    if sweep:
+        served = [v for v in sweep if v["query_rps"] >= 0.98 * v["offered_query"] and v["qd_p99_us"] < 1e4]
+        if served:
+            k = served[-1]
+            put("rt.knee_offered_query", k["offered_query"])
+            put("rt.knee_requests_rps", k["requests_rps"])
+            put("rt.knee_busy", k["busy"])
+            put("rt.knee_qd_p99_us", k["qd_p99_us"])
+        over = [v for v in sweep if v not in served]
+        if over:
+            put("rt.first_saturated_offered", over[0]["offered_query"])
+            put("rt.first_saturated_served", over[0]["requests_rps"])
+        put("rt.max_busy", max(v["busy"] for v in sweep))
+        put("rt.max_served", max(v["requests_rps"] for v in sweep))
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+        x = [v["offered_query"] + v["offered_fresh"] for v in sweep]
+        axes[0].plot(x, [v["requests_rps"] for v in sweep], "o-", label="served")
+        axes[0].plot(x, x, "--", color="grey", lw=.8, label="offered")
+        axes[0].set_ylabel("requests/s")
+        axes[0].set_title("Throughput vs offered rate")
+        axes[1].plot([v["requests_rps"] for v in sweep], [100 * v["busy"] for v in sweep], "o-")
+        axes[1].set_ylabel("registrar busy, % of one core")
+        axes[1].set_title("CPU utilisation (busy fraction) vs request rate")
+        axes[2].plot(x, [v["qd_p50_us"] for v in sweep], "o-", label="p50")
+        axes[2].plot(x, [v["qd_p99_us"] for v in sweep], "s-", label="p99")
+        axes[2].set_ylabel("queue delay (µs)")
+        axes[2].set_title("Queueing vs offered rate")
+        for ax in axes:
+            ax.set_xscale("log")
+            ax.set_xlabel("offered requests/s (100 fresh/s + queries)")
+            ax.grid(alpha=.3)
+        axes[1].set_xlabel("served requests/s")
+        axes[1].set_yscale("log")
+        axes[2].set_yscale("log")
+        axes[0].set_yscale("log")
+        axes[0].legend(fontsize=8)
+        axes[2].legend(fontsize=8)
+        savefig(fig, figdir, "realtime_throughput")
+    # Hybrid-vs-realtime validation pair.
+    pair = {v["mode"]: v for st, _, v in pts if st == "d-validation"}
+    if "hybrid" in pair and "realtime" in pair:
+        for k in ("utilisation", "q_mean_ns", "r_mean_ns", "qd_p99_us", "busy"):
+            if pair["hybrid"][k] and pair["realtime"][k]:
+                put(f"rt.validation.{k}_ratio", pair["realtime"][k] / pair["hybrid"][k])
+    # CPU profile: top functions.
+    prof = os.path.join(root, "realtime", "c-profile", "cpu.pprof")
+    if os.path.exists(prof):
+        try:
+            out = subprocess.run(["go", "tool", "pprof", "-top", "-nodecount=20", prof], capture_output=True, text=True, timeout=120).stdout
+            lines = [l for l in out.splitlines() if re.match(r"\s*[\d.]+m?s\s", l)]
+            prow = []
+            for l in lines[:20]:
+                f = l.split()
+                prow.append([f[0], f[1], f[3], f[4], " ".join(f[5:])])
+            if prow:
+                write_md_table(os.path.join(gen, "pprof_cpu.md"), ["flat", "flat %", "cum", "cum %", "function"], prow)
+                put("rt.profile", "yes")
+        except Exception as e:  # pprof is optional
+            print(f"warning: pprof: {e}", file=sys.stderr)
+
+
+def eval10k(docs):
+    """Per-registrar loads from the 10k network runs (inputs/eval10k.csv),
+    placed against the measured per-request costs."""
+    p = os.path.join(docs, "inputs", "eval10k.csv")
+    if not os.path.exists(p):
+        return
+    rows = list(csv.DictReader(open(p)))
+
+    def pick(quantity, scope_prefix):
+        for r in rows:
+            if r["quantity"] == quantity and r["scope"].startswith(scope_prefix):
+                v = re.sub(r"[~\s]", "", r["per_second"] or r["value"]).split("/")[0]
+                try:
+                    return float(v), r
+                except ValueError:
+                    return None, r
+        return None, None
+
+    picks = {
+        "tq_hot_1": ("TOPICQUERY received", "hottest registrar band (single topic"),
+        "tq_hot_5": ("TOPICQUERY received", "hottest/closest registrar (5 topics"),
+        "tq_far_1": ("TOPICQUERY received", "far registrar (single topic"),
+        "tq_mean_1": ("TOPICQUERY received", "network mean per node (single topic"),
+        "tq_mean_5": ("TOPICQUERY received", "network mean per node (5 topics"),
+        "rt_hot_1": ("REGTOPIC received rate", "hottest registrar (1 topic"),
+        "rt_hot_5": ("REGTOPIC received rate", "hottest registrar (5 topics"),
+    }
+    out = []
+    for k, (q, sc) in picks.items():
+        v, r = pick(q, sc)
+        if v is None:
+            continue
+        put(f"eval10k.{k}", v)
+        approx = "figure reading (approximate)" if "APPROX" in (r["note"] or "").upper() or (r["value"] or "").startswith("~") else "stated in report"
+        out.append([q, r["scope"], fmt_num(v, 3), approx, r["source_file"]])
+    write_md_table(os.path.join(docs, "generated", "eval10k.md"), ["quantity", "registrar", "per second", "provenance", "source (origin/docs/overhead-eval-10k)"], out)
+    # Placement: busy fraction of one core at the hottest registrar's load.
+    reg_ns = VALUES.get("share.cgo.total_ns")
+    q_ns = VALUES.get("occ.lookup.N250.ns")
+    for case in ("1", "5"):
+        rt, tq = VALUES.get(f"eval10k.rt_hot_{case}"), VALUES.get(f"eval10k.tq_hot_{case}")
+        if rt is not None and tq is not None and reg_ns and q_ns:
+            put(f"eval10k.hot_{case}_busy", (rt * reg_ns + tq * q_ns["mean"]) / 1e9)
+    if VALUES.get("rt.knee_requests_rps") and VALUES.get("eval10k.rt_hot_5") is not None:
+        put("eval10k.knee_over_hot5", VALUES["rt.knee_requests_rps"] / (VALUES["eval10k.rt_hot_5"] + VALUES.get("eval10k.tq_hot_5", 0)))
+
+
+OLD_REF = "registrar-overhead-oct27"
+
+
+def before_after(docs):
+    """Main dynamics on the old code (generated values committed on the backup
+    branch) against the new code."""
+    try:
+        old = json.loads(subprocess.check_output(["git", "show", f"{OLD_REF}:p2p/discover/docs/registrar-overhead/generated/values.json"], text=True))
+    except Exception as e:
+        print(f"warning: before/after: {e}", file=sys.stderr)
+        return
+    rows = []
+    metrics = [("utilisation", "occupancy N/C", "pct"), ("admission_rps", "admissions/s", 3), ("abandon_fraction", "abandoned/fresh", "pct"),
+               ("requests_per_admission", "REGTOPIC per admission", 0), ("cumwait_waited_median_s", "cum. wait p50 (s)", 0),
+               ("cumwait_waited_p95_s", "cum. wait p95 (s)", 0)]
+    for point in ("C1000-fresh1", "C1000-fresh5", "C1000-fresh20", "C1000-fresh100", "C5000-fresh5"):
+        for k, label, nd in metrics:
+            o, n = old.get(f"demand.{point}.{k}"), VALUES.get(f"demand.{point}.{k}")
+            if not (o and n):
+                continue
+            om, nm = o["mean"], n["mean"]
+            f = (lambda x: f"{100 * x:.1f}%") if nd == "pct" else (lambda x: fmt_num(x, nd))
+            rows.append([point, label, f(om), f(nm), f"{100 * (nm - om) / om:+.0f}%" if om else "–"])
+            put(f"ba.{point}.{k}.old", om)
+            put(f"ba.{point}.{k}.new", nm)
+    if rows:
+        write_md_table(os.path.join(docs, "generated", "before_after.md"), ["point", "metric", f"old code ({OLD_REF})", "new code", "change"], rows)
+        put("ba.ref", OLD_REF)
+
+
 CONFIG_COLS = [("CacheSize", "C"), ("Lifetime", "E"), ("FreshRate", "fresh/s"), ("QueryRate", "query/s"), ("Advertisers", "advertisers"),
                ("Topics", "topics"), ("Alpha", "Zipf α"), ("IPDist", "IP dist."), ("Abandon", "abandon"), ("Arrivals", "arrivals"),
                ("Duration", "duration"), ("Warmup", "warm-up")]
@@ -860,6 +1192,20 @@ def findings(root, docs):
         if th:
             put(f"findings.{arch}.threshold_min", min(th))
             put(f"findings.{arch}.threshold_max", max(th))
+            put(f"findings.{arch}.overflow_free", "yes" if max(th) < 0 else "no")
+        m = re.search(r"(\S+) full cache, empty topic, no IP: WaitTime=(\S+) Register=(\S+) admitted=(\w+)", text)
+        if m:
+            put(f"findings.{arch}.fullcache_wait", m.group(3))
+            put(f"findings.{arch}.fullcache_admitted", m.group(4))
+        m = re.search(r"--- (PASS|FAIL): TestRegisterHighOccupancyInvariants", text)
+        if m:
+            put(f"findings.{arch}.invariants", m.group(1))
+        m = re.search(r"--- (PASS|FAIL): TestIPTreeCountersMatchContents", text)
+        if m:
+            put(f"findings.{arch}.ip_counters", m.group(1))
+        m = re.search(r"--- (PASS|FAIL): TestTicketNotBoundToAdvertiser", text)
+        if m:
+            put(f"findings.{arch}.ticket_binding", m.group(1))
         for m in OCC_RE.finditer(text):
             pct, case, req, reg, adm, wire, client, ticket, _ = m.groups()
             if adm == "true":
@@ -891,6 +1237,10 @@ def findings(root, docs):
             if m:
                 put("findings.ticket_transfer_wait", m.group(1))
                 put("findings.ticket_transfer_admitted", m.group(3))
+            m = re.search(r"empty-cache wait: implemented (\S+), spec (\S+)", text)
+            if m:
+                put("findings.g_impl", m.group(1))
+                put("findings.g_spec", m.group(2))
             m = re.search(r"single quoted wait at (\d+)% occupancy, single topic: (\S+) \(E", text)
             if m:
                 put("findings.nocap_occupancy_pct", int(m.group(1)))
@@ -960,8 +1310,28 @@ def fmt_value(key, spec):
     return fmt_num(m, nd)
 
 
-def render(docs):
-    tpl = os.path.join(docs, "registrar-overhead.md.in")
+def present(key):
+    """Whether a value exists and is usable (not None or NaN)."""
+    try:
+        v = lookup(key)
+    except KeyError:
+        return False
+    if isinstance(v, dict):
+        v = v.get("mean")
+    return v is not None and not (isinstance(v, float) and math.isnan(v))
+
+
+# Innermost first: neither branch may contain another {{if:.
+_NOIF = r"((?:(?!\{\{if:).)*?)"
+COND_RE = re.compile(r"\{\{if:([\w.\-=/:]+)\}\}" + _NOIF + r"(?:\{\{else\}\}" + _NOIF + r")?\{\{endif\}\}", re.S)
+
+
+def render_one(docs, name):
+    """Renders <name>.md.in into <name>.md. {{section:x}} includes
+    sections/x.md.in, {{table:x}} generated/x.md, {{key|fmt}} a value, and
+    {{if:key}}...{{else}}...{{endif}} keeps the first part when key has a value
+    (or table:x / section:x exists) and the second otherwise."""
+    tpl = os.path.join(docs, name + ".md.in")
     if not os.path.exists(tpl):
         return []
     text = open(tpl).read()
@@ -976,6 +1346,19 @@ def render(docs):
         return open(p).read().rstrip()
 
     text = re.sub(r"\{\{section:([\w.-]+)\}\}", section, text)
+
+    def cond(mm):
+        key = mm.group(1)
+        if key.startswith("table:"):
+            ok = os.path.exists(os.path.join(docs, "generated", key[6:] + ".md"))
+        elif key.startswith("figure:"):
+            ok = os.path.exists(os.path.join(docs, "figures", key[7:] + ".png"))
+        else:
+            ok = present(key)
+        return mm.group(2) if ok else (mm.group(3) or "")
+
+    while COND_RE.search(text):
+        text = COND_RE.sub(cond, text)
 
     def table(mm):
         p = os.path.join(docs, "generated", mm.group(1) + ".md")
@@ -993,9 +1376,13 @@ def render(docs):
 
     text = re.sub(r"\{\{table:([\w.-]+)\}\}", table, text)
     text = re.sub(r"\{\{([\w.\-=/]+)(?:\|([\w:]+))?\}\}", value, text)
-    header = "<!-- Generated by topicindex/cmd/registrarbench/study/study.py from registrar-overhead.md.in. Do not edit. -->\n"
-    open(os.path.join(docs, "registrar-overhead.md"), "w").write(header + text)
-    return missing
+    header = f"<!-- Generated by topicindex/cmd/registrarbench/study/study.py from {name}.md.in. Do not edit. -->\n"
+    open(os.path.join(docs, name + ".md"), "w").write(header + text)
+    return [f"{name}: {m}" for m in missing]
+
+
+def render(docs):
+    return render_one(docs, "registrar-overhead") + render_one(docs, "task-3.3.4-report")
 
 
 def main():
@@ -1032,6 +1419,11 @@ def main():
     audit(root, docs)
     pacing(root, docs)
     capacity_provisional(root, docs)
+    micro_extra(root, docs, figdir)
+    bounds_vs_occupancy(root, docs, figdir)
+    realtime(root, docs, figdir)
+    eval10k(docs)
+    before_after(docs)
     dataset(root, meta_of)
     revisions(root, docs)
     ab(root, docs)

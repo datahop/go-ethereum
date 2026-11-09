@@ -13,9 +13,9 @@ for arch in $archs; do
   {
     echo "$header"
     GOARCH=$arch go test ./topicindex -count=1 -v \
-      -run 'TestSpecIPScoreDeviation|TestSpecWaitTimeDeviations|TestSpecNoWaitCap|TestFullCacheWait|TestBoundedLowerBoundState' 2>&1
+      -run 'TestSpecIPScoreDeviation|TestIPTreeCountersMatchContents|TestSpecWaitTimeDeviations|TestSpecGTerm|TestSpecAdmissionFloor|TestSpecNoWaitCap|TestSpecLANAddressesInTree|TestSpecDefaultCapacity|TestFullCacheWait|TestBoundedLowerBoundState' 2>&1
     GOARCH=$arch go test . -count=1 -v \
-      -run 'TestRegisterHighOccupancy$|TestRegisterOverflowThreshold|TestRegisterFullCacheNaN|TestTicketOutlivesKey|TestTicketNotBoundToAdvertiser' 2>&1
+      -run 'TestRegisterHighOccupancy$|TestRegisterHighOccupancyInvariants|TestRegisterOverflowThreshold|TestRegisterFullCacheNaN|TestTicketOutlivesKey|TestTicketNotBoundToAdvertiser' 2>&1
   } > "$out/$arch.txt" || true
   # Strict variants are expected to fail with the current code.
   {
