@@ -109,7 +109,7 @@ type TopicDiscovery uint
 // TopicDiscoveryVersion is the protocol version implemented by this code.
 const TopicDiscoveryVersion TopicDiscovery = 1
 
-func (TopicDiscovery) ENRKey() string { return "ng" }
+func (TopicDiscovery) ENRKey() string { return "td" }
 
 // SupportsTopicDiscovery reports whether n advertises a version of the topic
 // discovery capability that this implementation supports. A node whose ENR
