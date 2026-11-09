@@ -19,6 +19,7 @@ package discover
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"math/bits"
 	"net"
 	"net/netip"
 	"slices"
@@ -304,7 +305,7 @@ func seedTopicTable(t *testing.T, node *UDPv5, topic topicindex.TopicID, regs ..
 	done := make(chan struct{})
 	fn := func() {
 		for _, n := range regs {
-			node.topicTable.Add(n, topic)
+			node.topicTable.Add(n, n.IPAddr(), topic)
 		}
 		close(done)
 	}
@@ -636,7 +637,7 @@ func TestTopicDHTEvictionEvictsAd(t *testing.T) {
 	// Seed the ad cache with n. The topic table is owned by the dispatch
 	// goroutine, so add it there.
 	done := make(chan struct{})
-	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, topic); close(done) }
+	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, n.IPAddr(), topic); close(done) }
 	<-done
 
 	if got := test.udp.LocalTopicNodes(topic); len(got) != 1 || got[0].ID() != n.ID() {
@@ -667,7 +668,7 @@ func TestTopicStopPendingEviction(t *testing.T) {
 	topic := topicindex.TopicID{1, 2, 3}
 	n := nodeAtDistance(test.table.self().ID(), 128, net.IP{203, 0, 113, 9})
 	added := make(chan struct{})
-	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, topic); close(added) }
+	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, n.IPAddr(), topic); close(added) }
 	<-added
 	test.table.removedFeed.Send(n.ID())
 	waitForCond(t, "ad removed from cache", func() bool {
@@ -722,7 +723,7 @@ func TestTopicRegTimeoutTracksNotEvicts(t *testing.T) {
 
 	// Seed n's ad in the local topic table (owned by the dispatch goroutine).
 	done := make(chan struct{})
-	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, topic); close(done) }
+	test.udp.onDispatchCh <- func() { test.udp.topicTable.Add(n, n.IPAddr(), topic); close(done) }
 	<-done
 
 	// Make n a registration target and start registering; catch the REGTOPIC and
@@ -1029,6 +1030,93 @@ func badSigRecord(t *testing.T, key *ecdsa.PrivateKey, addr netip.AddrPort) *enr
 	return &r
 }
 
+// TestHandleRegtopicCountsSourceFamily checks that records claiming addresses in
+// one prefix of the other family do not raise the quote of that prefix, and that
+// searchers get the records as signed.
+func TestHandleRegtopicCountsSourceFamily(t *testing.T) {
+	t.Parallel()
+
+	// Each registrant has its own top bits, so that its own family admits it at once.
+	spread := func(i int) byte { return bits.Reverse8(uint8(i)) | 0x0b }
+	spread4 := func(i int) netip.Addr { return netip.AddrFrom4([4]byte{spread(i), 1, 1, 1}) }
+	spread6 := func(i int) netip.Addr { return netip.AddrFrom16([16]byte{spread(i), 1, 15: 1}) }
+	prefix4 := func(i byte) netip.Addr { return netip.AddrFrom4([4]byte{11, 2, 3, i}) }
+	prefix6 := func(i byte) netip.Addr { return netip.AddrFrom16([16]byte{0x2a, 0x01, 15: i}) }
+
+	tests := []struct {
+		name            string
+		src             func(int) netip.Addr
+		claimed         func(byte) netip.Addr
+		victim, control netip.Addr
+	}{
+		{"over ipv6", spread6, prefix4, prefix4(200), netip.MustParseAddr("200.9.9.9")},
+		{"over ipv4", spread4, prefix6, prefix6(200), netip.MustParseAddr("c801::9")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			test := newUDPV5Test(t)
+			defer test.close()
+
+			record := func(key *ecdsa.PrivateKey, a, b netip.Addr, port uint16) *enr.Record {
+				if a.Is4() {
+					return signedRecord(t, key, a, b, port)
+				}
+				return signedRecord(t, key, b, a, port)
+			}
+
+			var (
+				firstRec   *enr.Record
+				firstTopic topicindex.TopicID
+			)
+			for i := 0; i < 7; i++ {
+				key, addr := newkey(), netip.AddrPortFrom(tt.src(i), 30303)
+				rec := record(key, addr.Addr(), tt.claimed(byte(i+1)), addr.Port())
+				topic := topicindex.TopicID{byte(i + 1)}
+				if i == 0 {
+					firstRec, firstTopic = rec, topic
+				}
+				test.packetInFrom(key, addr, &v5wire.Regtopic{ReqID: []byte{byte(i)}, Topic: topic, ENR: rec})
+				test.waitPacketOut(func(p *v5wire.Regconfirmation, _ netip.AddrPort, _ v5wire.Nonce) {
+					if len(p.Ticket) != 0 {
+						t.Errorf("registrant %d not admitted: wait time %d", i, p.WaitTime)
+					}
+				})
+			}
+
+			quote := func(addr netip.Addr) (wait time.Duration) {
+				n, err := enode.New(enode.ValidSchemes, record(newkey(), addr, netip.Addr{}, 30303))
+				if err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan struct{})
+				test.udp.onDispatchCh <- func() {
+					wait = test.udp.topicTable.WaitTime(n, addr, testTopic1)
+					close(done)
+				}
+				<-done
+				return wait
+			}
+			if got, want := quote(tt.victim), quote(tt.control); got != want {
+				t.Errorf("quote in the claimed prefix is %v, want %v as elsewhere", got, want)
+			}
+
+			querier := netip.MustParseAddrPort("11.9.9.9:30303")
+			test.packetInFrom(newkey(), querier, &v5wire.TopicQuery{ReqID: []byte{99}, Topic: firstTopic})
+			test.waitPacketOut(func(p *v5wire.TopicNodes, _ netip.AddrPort, _ v5wire.Nonce) {
+				if len(p.Nodes) != 1 {
+					t.Fatalf("got %d records, want 1", len(p.Nodes))
+				}
+				want, _ := rlp.EncodeToBytes(firstRec)
+				got, _ := rlp.EncodeToBytes(p.Nodes[0])
+				if !bytes.Equal(got, want) {
+					t.Errorf("record changed: got %x, want %x", got, want)
+				}
+			})
+		})
+	}
+}
+
 // TestHandleRegtopicReplies checks that the registrar answers every REGTOPIC:
 // valid and late tickets are credited, an early ticket is re-quoted for its
 // window, an invalid or expired ticket or one issued to another node starts a
@@ -1245,7 +1333,7 @@ func TestRegtopicTicketReplay(t *testing.T) {
 			if credited {
 				waited, firstIssued = regtopicCredit(ticket, timing, now)
 			}
-			wait = env.tab.Register(env.adv, topic, waited)
+			wait = env.tab.Register(env.adv, env.adv.IPAddr(), topic, waited)
 			if wait > 0 {
 				sealer.Pack(&topicindex.Ticket{Topic: topic, Node: env.adv.ID(), WaitTimeIssued: wait, LastUsed: now, FirstIssued: firstIssued})
 			}
@@ -1253,9 +1341,9 @@ func TestRegtopicTicketReplay(t *testing.T) {
 		}
 
 		// With one ad in the topic, a fresh attempt has to wait.
-		env.tab.Add(env.seed, topic)
+		env.tab.Add(env.seed, env.seed.IPAddr(), topic)
 		now := env.clock.Now()
-		env.w = env.tab.Register(env.adv, topic, 0)
+		env.w = env.tab.Register(env.adv, env.adv.IPAddr(), topic, 0)
 		if env.w <= 0 {
 			t.Fatal("fresh attempt admitted without waiting")
 		}
@@ -1276,8 +1364,8 @@ func TestRegtopicTicketReplay(t *testing.T) {
 			if n := len(env.tab.Nodes(topic)); n != 0 {
 				t.Fatalf("cycle %d: %d ads left after expiry", cycle, n)
 			}
-			env.tab.Add(env.seed, topic)
-			fresh := env.tab.WaitTime(env.adv, topic)
+			env.tab.Add(env.seed, env.seed.IPAddr(), topic)
+			fresh := env.tab.WaitTime(env.adv, env.adv.IPAddr(), topic)
 			if fresh <= 0 {
 				t.Fatalf("cycle %d: fresh attempt need not wait", cycle)
 			}
@@ -1306,7 +1394,7 @@ func TestRegtopicTicketReplay(t *testing.T) {
 				t.Fatalf("replay %d: advertiser still registered after eviction", i)
 			}
 			env.clock.Run(time.Second)
-			fresh := env.tab.WaitTime(env.adv, topic)
+			fresh := env.tab.WaitTime(env.adv, env.adv.IPAddr(), topic)
 			if fresh <= 0 {
 				t.Fatalf("replay %d: fresh attempt need not wait", i)
 			}
@@ -1443,7 +1531,7 @@ func TestHandleRegtopicOneClock(t *testing.T) {
 	test.udp.onDispatchCh <- func() {
 		defer close(done)
 		now := clock.Now()
-		credit := test.udp.topicTable.WaitTime(adv, testTopic1) - 5*time.Second
+		credit := test.udp.topicTable.WaitTime(adv, addr.Addr(), testTopic1) - 5*time.Second
 		ticket := test.udp.ticketSealer.Pack(&topicindex.Ticket{
 			Topic:          testTopic1,
 			Node:           adv.ID(),

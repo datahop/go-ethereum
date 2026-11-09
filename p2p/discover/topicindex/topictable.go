@@ -21,11 +21,11 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p/enode"
-	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 )
 
@@ -64,7 +64,8 @@ type topicTableEntry struct {
 	topicElem *list.Element
 	allElem   *list.Element
 
-	ipLevels [2]byte // IPv4/IPv6 tree levels incremented on insert
+	src      netip.Addr // packet source, the only address counted in the IP trees
+	ipLevels byte       // tree levels incremented on insert
 }
 
 // NewTopicTable creates a TopicTable.
@@ -187,19 +188,20 @@ func (tab *TopicTable) isRegistered(n *enode.Node, t TopicID) bool {
 
 // Add adds a registration of node n for a topic. This only works when the table
 // has space available.
-func (tab *TopicTable) Add(n *enode.Node, topic TopicID) bool {
+func (tab *TopicTable) Add(n *enode.Node, src netip.Addr, topic TopicID) bool {
 	now := tab.config.Clock.Now()
 	tab.expireAt(now)
 	if tab.all.Len() < tab.config.AdCacheSize {
-		tab.add(n, topic, now)
+		tab.add(n, src, topic, now)
 		return true
 	}
 	return false
 }
 
-func (tab *TopicTable) add(n *enode.Node, topic TopicID, now mclock.AbsTime) *topicTableEntry {
+func (tab *TopicTable) add(n *enode.Node, src netip.Addr, topic TopicID, now mclock.AbsTime) *topicTableEntry {
 	reg := &topicTableEntry{
 		node:  n,
+		src:   src.Unmap(),
 		exp:   now.Add(tab.config.AdLifetime),
 		topic: topic,
 	}
@@ -252,16 +254,17 @@ func (tab *TopicTable) topicSize(t TopicID) int {
 	return list.Len()
 }
 
-// WaitTime returns the amount of time that node n must have waited to register for topic t.
-func (tab *TopicTable) WaitTime(n *enode.Node, t TopicID) time.Duration {
+// WaitTime returns the amount of time that node n, sending from src, must have
+// waited to register for topic t.
+func (tab *TopicTable) WaitTime(n *enode.Node, src netip.Addr, t TopicID) time.Duration {
 	now := tab.config.Clock.Now()
 	tab.expireAt(now)
-	total, _ := tab.waitTime(n, t, now)
+	total, _ := tab.waitTime(src, t, now)
 	return total
 }
 
-// computes the required waiting time for (n, t) as of 'now'
-func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (time.Duration, waitTimeComponents) {
+// computes the required waiting time for (src, t) as of 'now'
+func (tab *TopicTable) waitTime(src netip.Addr, t TopicID, now mclock.AbsTime) (time.Duration, waitTimeComponents) {
 	regCount := tab.all.Len()
 
 	// occupancy is the *inverse* of the table fill-ratio.
@@ -277,13 +280,13 @@ func (tab *TopicTable) waitTime(n *enode.Node, t TopicID, now mclock.AbsTime) (t
 	topicMod := float64(tab.topicSize(t)) / float64(regCount+1)
 
 	// ipMod changes the waiting time based on IP address diversity.
-	ipMod, ipNodes, ipFloor := tab.wt.ipScore(n, now)
+	ipMod, ipNode, ipFloor := tab.wt.ipScore(src, now)
 
 	comps := waitTimeComponents{
 		topic:       t,
 		serviceSecs: scaleBase(baseTime, topicMod),
 		ipSecs:      scaleBase(baseTime, ipMod),
-		ipNodes:     ipNodes,
+		ipNode:      ipNode,
 	}
 
 	// Apply the per-component lower bounds (read-only).
@@ -318,15 +321,11 @@ func (tab *TopicTable) recordWaitTime(c waitTimeComponents, now mclock.AbsTime) 
 		b.bump(secondsToDuration(c.serviceSecs), now)
 		tab.wt.topicBounds[c.topic] = b
 	}
-	// IP component, stored on the longest-prefix-match node(s). Those nodes exist
+	// IP component, stored on the longest-prefix-match node. Those nodes exist
 	// only because of admitted ads, so nothing is allocated for a request that is
 	// never admitted.
-	if ipDur := secondsToDuration(c.ipSecs); ipDur > 0 {
-		for _, nd := range c.ipNodes {
-			if nd != nil {
-				nd.bound.bump(ipDur, now)
-			}
-		}
+	if ipDur := secondsToDuration(c.ipSecs); ipDur > 0 && c.ipNode != nil {
+		c.ipNode.bound.bump(ipDur, now)
 	}
 }
 
@@ -356,14 +355,15 @@ func secondsToDuration(s float64) time.Duration {
 //
 // Returns 0 if the node is admitted, otherwise the new wait time the
 // registrant should observe before retrying.
-func (tab *TopicTable) Register(n *enode.Node, t TopicID, waitTime time.Duration) time.Duration {
-	return tab.RegisterAt(n, t, waitTime, tab.config.Clock.Now())
+func (tab *TopicTable) Register(n *enode.Node, src netip.Addr, t TopicID, waitTime time.Duration) time.Duration {
+	return tab.RegisterAt(n, src, t, waitTime, tab.config.Clock.Now())
 }
 
 // RegisterAt is Register as of now. A caller that credited waitTime at now
 // passes the same instant, so that the credit and the required wait are
-// compared at one time.
-func (tab *TopicTable) RegisterAt(n *enode.Node, t TopicID, waitTime time.Duration, now mclock.AbsTime) time.Duration {
+// compared at one time. src is the address the request came from, the only
+// address of n the IP score counts: the others in its record are unverified.
+func (tab *TopicTable) RegisterAt(n *enode.Node, src netip.Addr, t TopicID, waitTime time.Duration, now mclock.AbsTime) time.Duration {
 	// Expired ads must not count as registered or toward the waiting time.
 	tab.expireAt(now)
 
@@ -372,7 +372,7 @@ func (tab *TopicTable) RegisterAt(n *enode.Node, t TopicID, waitTime time.Durati
 		return 0
 	}
 
-	requiredTime, comps := tab.waitTime(n, t, now)
+	requiredTime, comps := tab.waitTime(src, t, now)
 
 	// Check if the node has waited enough.
 	if waitTime < requiredTime {
@@ -390,7 +390,7 @@ func (tab *TopicTable) RegisterAt(n *enode.Node, t TopicID, waitTime time.Durati
 		return tab.nextAdExpiry().Sub(now)
 	}
 
-	tab.add(n, t, now)
+	tab.add(n, src, t, now)
 	return 0
 }
 
@@ -432,7 +432,7 @@ type waitTimeComponents struct {
 	topic       TopicID
 	serviceSecs float64
 	ipSecs      float64
-	ipNodes     [2]*ipTreeNode // longest-prefix-match nodes for IPv4/IPv6
+	ipNode      *ipTreeNode // longest-prefix-match node of the source address
 }
 
 // waitTimeState holds the state of waiting time modifier functions (including the lower bounds).
@@ -450,48 +450,31 @@ func newWaitTimeState() waitTimeState {
 	}
 }
 
-func (wt *waitTimeState) ipScore(n *enode.Node, now mclock.AbsTime) (float64, [2]*ipTreeNode, time.Duration) {
-	var (
-		ip4    enr.IPv4
-		ip6    enr.IPv6
-		score4 float64
-		score6 float64
-		nodes  [2]*ipTreeNode
-		floor  time.Duration
-	)
-	if n.Load(&ip4) == nil && !netutil.IsLAN(net.IP(ip4)) {
-		score4, nodes[0] = wt.ipv4.scoreNode(net.IP(ip4))
-		if f := wt.ipv4.pathFloor(net.IP(ip4), now); f > floor {
-			floor = f
-		}
+func (wt *waitTimeState) ipScore(src netip.Addr, now mclock.AbsTime) (float64, *ipTreeNode, time.Duration) {
+	src = src.Unmap()
+	if !src.IsValid() || netutil.AddrIsLAN(src) {
+		return 0, nil, 0
 	}
-	if n.Load(&ip6) == nil && !netutil.IsLAN(net.IP(ip6)) {
-		score6, nodes[1] = wt.ipv6.scoreNode(net.IP(ip6))
-		if f := wt.ipv6.pathFloor(net.IP(ip6), now); f > floor {
-			floor = f
-		}
-	}
-	return math.Max(score4, score6), nodes, floor
+	tree, ip := wt.ipTreeOf(src), net.IP(src.AsSlice())
+	score, node := tree.scoreNode(ip)
+	return score, node, tree.pathFloor(ip, now)
 }
 
 func (wt *waitTimeState) addReg(reg *topicTableEntry) {
-	var ip4 enr.IPv4
-	var ip6 enr.IPv6
-	if reg.node.Load(&ip4) == nil {
-		_, reg.ipLevels[0] = wt.ipv4.insert(net.IP(ip4))
-	}
-	if reg.node.Load(&ip6) == nil {
-		_, reg.ipLevels[1] = wt.ipv6.insert(net.IP(ip6))
+	if reg.src.IsValid() {
+		_, reg.ipLevels = wt.ipTreeOf(reg.src).insert(net.IP(reg.src.AsSlice()))
 	}
 }
 
 func (wt *waitTimeState) removeReg(reg *topicTableEntry) {
-	var ip4 enr.IPv4
-	var ip6 enr.IPv6
-	if reg.node.Load(&ip4) == nil {
-		wt.ipv4.remove(net.IP(ip4), reg.ipLevels[0])
+	if reg.src.IsValid() {
+		wt.ipTreeOf(reg.src).remove(net.IP(reg.src.AsSlice()), reg.ipLevels)
 	}
-	if reg.node.Load(&ip6) == nil {
-		wt.ipv6.remove(net.IP(ip6), reg.ipLevels[1])
+}
+
+func (wt *waitTimeState) ipTreeOf(addr netip.Addr) *ipTree {
+	if addr.Is4() {
+		return wt.ipv4
 	}
+	return wt.ipv6
 }

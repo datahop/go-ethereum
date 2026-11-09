@@ -1382,7 +1382,7 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 	responseCount := uint8(1 + len(nodesResponses))
 
 	// Attempt to register.
-	newTime := t.topicTable.RegisterAt(n, p.Topic, waitTime, now)
+	newTime := t.topicTable.RegisterAt(n, fromAddr.Addr(), p.Topic, waitTime, now)
 
 	// Build confirmation.
 	confirmation := &v5wire.Regconfirmation{ReqID: p.ReqID, RespCount: responseCount}
