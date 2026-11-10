@@ -21,15 +21,15 @@ behaviour, packet I/O and adversarial load are out of scope. Loads observed in t
 | issue requirement | where (full document) | result |
 |---|---|---|
 | memory vs cache capacity / occupancy | §6.3, `figures/memory_fill` | 859 B per cached ad (typical record), 1,370 B (300-byte record); linear in occupancy |
-| registration latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | 337 ns for a wait reply at 25% occupancy, 1,614 ns for an admission; flat in occupancy |
+| registration latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | 337 ns for a wait reply at 25% occupancy, 1,614 ns for an admission; growing slowly to 472 and 2,332 ns at 95% |
 | lookup latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | 951 ns at 25%, 3,927 ns at 95%; linear in the topic's ad count |
 | CPU utilisation vs request rate | §6.4.2, `figures/realtime_throughput` | registrar core busy at most 20.4% of one core in the sweep |
-| throughput vs offered rate | §6.4.2, `figures/realtime_throughput` | served in full up to 640,000 requests/s on one core (harness included) |
+| throughput vs offered rate | §6.4.2, `figures/realtime_throughput` | served in full up to 640,000 requests/s on one core (harness included), the highest rate offered: no saturation reached |
 | lower-bound state vs occupancy | §6.6, `figures/bounds_vs_occupancy` | at most 1.00 topic and 1.52 IP bounds per cached ad |
 | validation latency / cost | §6.1, validation table | full `REGTOPIC` ≈ 20,000 ns; registrar core 1.7% of it; ENR signature check 94% |
 | varying capacity, occupancy, IP distribution, registration and lookup rate | §6.2, §6.5, `figures/occupancy_vs_demand`, `figures/occupancy_vs_capacity` | occupancy 22%–27% of C from 0.25 to 100 fresh attempts/s; lookup rate has no effect on admission |
 | inputs from the 10k runs | §6.7 | hottest registrar ≈ 355 REGTOPIC/s, 5.3 TOPICQUERY/s → 0.72% of a core |
-| pprof | §6.4.2 | CPU profile at the knee (top functions) |
+| pprof | §6.4.2 | CPU profile at the highest served rate; dominated by allocator and clock overhead (see below) |
 
 ## Headline numbers
 
@@ -42,7 +42,7 @@ behaviour, packet I/O and adversarial load are out of scope. Loads observed in t
   rest of the demand abandons (99.7% at 100 attempts/s).
 * **Memory:** 1.31 MiB for a full default cache of
   maximum-size records.
-* **Throughput:** 640,000 requests/s served without queueing on one core.
+* **Throughput:** 640,000 requests/s served without queueing on one core (the highest rate offered, so a lower bound), with the registrar core busy 20.4% of it.
 
 ![Latency vs occupancy](figures/latency_vs_occupancy.png)
 ![Throughput, CPU and queueing vs offered rate](figures/realtime_throughput.png)
@@ -62,6 +62,15 @@ behaviour, packet I/O and adversarial load are out of scope. Loads observed in t
 
 ## Missing or provisional
 
+* The CPU profile is dominated by overhead outside the registrar logic: span
+  clearing in the allocator (40%, reached from the result slice of
+  `RandomNodes`, not visible in the timed per-call cost) and clock reads
+  (24%, almost all from the harness's hybrid clock). It shows that the registrar
+  core is not the bottleneck, not how registrar time divides.
+* 3 of the 3 registration-heavy realtime points were flagged for background
+  load; their queue-delay tails (p99 262–11,010 µs) are provisional.
+* The abandonment-policy sweep stopped at its deadline after 35 of
+  45 runs; the no-abandonment points at 5 and 20 attempts/s were not run.
 * The 10k reports give no per-registrar REGTOPIC rate as a number, no occupancy and
   no cache capacity; the registrar loads above are partly figure readings from older
   code.

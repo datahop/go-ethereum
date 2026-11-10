@@ -19,8 +19,8 @@ All results describe the production code after the fixes merged into `topdisc`
 
 * **The registrar core is cheap per request; validation dominates.** A `REGTOPIC`
   that receives a wait ticket costs 372 ns plus
-  1.88 ns per cached ad of the requested topic, and does not
-  grow with occupancy (§6.1). With record decoding, signature verification and
+  1.88 ns per cached ad of the requested topic; it grows with occupancy
+  only through that term (§6.1). With record decoding, signature verification and
   ticket handling included, a full `REGTOPIC` costs about 20,000 ns, of which
   the registrar core is 1.7%. A `TOPICQUERY` lookup visits every cached
   ad of the topic (46.6 ns each), regardless of the 16-result
@@ -291,8 +291,8 @@ used unmodified. The workload:
 The parameters of each experiment are listed in §10.1. The baseline is C = 1000 (the
 specification default), E = 15 min, 300 topics, α = 1, 200,000 advertisers, empirical
 IPs, 5 fresh attempts/s and 20 queries/s. Simulated runs last 18 h of logical time, of
-which the first 6 h are warm-up; the abandonment-policy runs last 72 h with 48 h of
-warm-up. State is sampled every 10 s.
+which the first 6 h are warm-up; the abandonment-policy runs last 36 h with 24 h of
+warm-up (§8). State is sampled every 10 s.
 
 In simulated mode, queries do not change registrar state. The query-rate experiment
 (§10.1) gives identical dynamics at 1–1000 queries/s. Query load matters only for CPU
@@ -799,6 +799,20 @@ registration cost ratio of 1.12.
 | 3.10s | 0.53% | 3.12s | 0.53% | net/netip.Addr.Is6 (inline) |
 | 2.90s | 0.5% | 3.11s | 0.53% | sort.Search (inline) |
 
+*Caveat.* The profile is dominated by overhead outside the registrar logic, so it shows
+that the registrar core is not the bottleneck rather than how registrar time divides.
+Span clearing (`runtime.memclrNoHeapPointers`, 40% flat) is reached through the
+allocator from the 16-entry result slice that `RandomNodes` allocates per lookup; it
+does not appear in the timed per-call cost (640,000 requests/s at
+20.4% busy), so it is a runtime/allocator effect under the harness's heap, not
+lookup work. Clock reads (`runtime.nanotime`, 24% cumulative) come almost entirely
+from the harness's hybrid clock (`hybridClock.Now`, 25%).
+
+
+*Caveat.* 3 of the 3 registration-heavy points (b) overlapped background
+load (see the contamination column), so their queue-delay tails (p99 262–11,010 µs)
+are provisional.
+
 
 
 **Per-call costs under the other instruments.** For comparison, the request rate at
@@ -826,30 +840,32 @@ limit.
 All points use C = 1000, 5 fresh attempts/s and 20 queries/s unless stated otherwise;
 per-point tables are in §10.1.
 
-**Advertiser abandonment policy.** These runs last 72 h with 48 h of warm-up and 10⁶
-advertisers.
+**Advertiser abandonment policy.** These runs last 36 h with 24 h of warm-up and 10⁶
+advertisers (shortened from 72 h / 48 h, §8). The sweep stopped at its 07:05 deadline
+after 35 of 45 runs; points without a completed run are marked.
 
 | fresh attempts/s | policy | occupancy / C | admissions/s | abandoned / fresh | cumulative wait at admission, median / p95 (s) |
 |---|---|---|---|---|---|
 | 1 | production | 0.242 ± 0.002 | 0.268 | 0.731 | 1,189 / 1,340 |
 | 1 | spec (single quote > E) | 0.242 ± 0.001 | 0.268 | 0.734 | 1,258 / 2,611 |
 | 1 | none | 0.436 ± 0.003 | 0.484 | 0.000 | 62,672 / 87,961 |
+| 5 | production | 0.258 ± 0.001 | 0.287 | 0.943 | 1,093 / 1,340 |
+| 5 | spec (single quote > E) | 0.279 ± 0.002 | 0.310 | 0.936 | 1,959 / 4,151 |
+| 5 | none | not run (stopped at deadline) | – | – | – |
 | 20 | production | 0.273 ± 0.001 | 0.304 | 0.984 | 1,106 / 1,340 |
 | 20 | spec (single quote > E) | 0.291 ± 0.002 | 0.322 | 0.985 | 2,151 / 4,549 |
-| 20 | none † | **MISSING** | **MISSING** | **MISSING** | **MISSING** / **MISSING** |
+| 20 | none | not run (stopped at deadline) | – | – | – |
 
-† Population-limited: with waits of days, all 10⁶ advertisers are busy, and only
-**MISSING** of the configured 20 attempts/s
-find an idle advertiser. All `none` runs at 5 and 20 attempts/s are flagged (§10.2).
 
 * The `spec` policy drops single quotes above E, which is stricter than production's
   1.5·E. But it has no cumulative limit: advertisers that keep receiving quotes ≤ E
-  stay. Occupancy is the same at 1 attempt/s and slightly higher at 5 and 20
-  attempts/s;
+  stay. Occupancy is the same at 1 attempt/s (0.242 against
+  0.242) and slightly higher at 5 and 20 attempts/s
+  (0.291 against 0.273 at 20/s);
   the p95 cumulative wait exceeds 1.5·E.
-* Without abandonment, occupancy roughly doubles. This comes at waits of more than a
-  day: the median cumulative wait at admission is
-  62,672 s at 1 attempt/s. Such waits
+* Without abandonment, occupancy rises from 0.242 to
+  0.436 of C at 1 attempt/s. This comes at waits of most of a day: the
+  median cumulative wait at admission is 62,672 s. Such waits
   also outlive the ticket keys (F3), which the harness does not model.
 * The attempt timeout is therefore the parameter that controls registrar utilisation.
 
