@@ -1,6 +1,6 @@
 | experiment | points | varied | fixed |
 |---|---|---|---|
-| abandon | 9 | fresh/s ∈ {1, 5, 20}; abandon ∈ {none, production, spec} | C = 1000; E = 15 min; query/s = 20; advertisers = 1000000; topics = 300; Zipf α = 1; IP dist. = empirical; arrivals = deterministic; duration = 72 h; warm-up = 48 h |
+| abandon | 7 | fresh/s ∈ {1, 5, 20}; abandon ∈ {none, production, spec} | C = 1000; E = 15 min; query/s = 20; advertisers = 1000000; topics = 300; Zipf α = 1; IP dist. = empirical; arrivals = deterministic; duration = 36 h; warm-up = 24 h |
 | bounded | 2 | fresh/s ∈ {5, 50} | C = 1000; E = 15 min; query/s = 20; advertisers = 200000; topics = 50000; Zipf α = 0; IP dist. = diverse; abandon = production; arrivals = deterministic; duration = 18 h; warm-up = 6 h |
 | capacity | 10 | C ∈ {500, 1000, 2000, 5000, 10000}; fresh/s ∈ {5, 20} | E = 15 min; query/s = 20; advertisers = 200000; topics = 300; Zipf α = 1; IP dist. = empirical; abandon = production; arrivals = deterministic; duration = 18 h; warm-up = 6 h |
 | demand | 18 | C ∈ {1000, 5000}; fresh/s ∈ {0.25, 0.5, 1, 2, 5, 10, 20, 50, 100} | E = 15 min; query/s = 20; advertisers = 200000; topics = 300; Zipf α = 1; IP dist. = empirical; abandon = production; arrivals = deterministic; duration = 18 h; warm-up = 6 h |
