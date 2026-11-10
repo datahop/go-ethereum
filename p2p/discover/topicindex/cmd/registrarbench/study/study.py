@@ -924,6 +924,12 @@ def realtime(root, docs, figdir):
         return
     put("rt.points", len(rows))
     put("rt.contaminated_points", sum(1 for *_, v in pts if v["contaminated"] != "no"))
+    reg = [v for st, _, v in pts if st == "b-registration"]
+    if reg:
+        put("rt.reg.points", len(reg))
+        put("rt.reg.flagged", sum(1 for v in reg if v["contaminated"] != "no"))
+        put("rt.reg.qd_p99_min_us", min(v["qd_p99_us"] for v in reg))
+        put("rt.reg.qd_p99_max_us", max(v["qd_p99_us"] for v in reg))
     write_md_table(os.path.join(gen, "realtime.md"),
                    ["stage", "point", "clock", "C", "fresh/s", "offered query/s", "served req/s", "mean ns/REGTOPIC", "mean ns/TOPICQUERY",
                     "registrar busy (one core)", "queue delay p50 µs", "queue delay p99 µs", "occupancy N/C", "window min", "contamination"], rows)
@@ -985,6 +991,18 @@ def realtime(root, docs, figdir):
             if prow:
                 write_md_table(os.path.join(gen, "pprof_cpu.md"), ["flat", "flat %", "cum", "cum %", "function"], prow)
                 put("rt.profile", "yes")
+            # Shares quoted in the caveats: span clearing, the clock, the lookup.
+            out = subprocess.run(["go", "tool", "pprof", "-top", "-nodecount=500", prof], capture_output=True, text=True, timeout=120).stdout
+            share = {}
+            for l in out.splitlines():
+                f = l.split()
+                if re.match(r"\s*[\d.]+m?s\s", l) and len(f) >= 6:
+                    share[" ".join(f[5:]).removesuffix(" (inline)").removesuffix(" (partial-inline)")] = (float(f[1].rstrip("%")) / 100, float(f[4].rstrip("%")) / 100)
+            for key, fn, i in (("memclr_flat", "runtime.memclrNoHeapPointers", 0), ("nanotime_cum", "runtime.nanotime", 1),
+                               ("hybridclock_cum", "main.(*hybridClock).Now", 1), ("makeslice_cum", "runtime.makeslice", 1),
+                               ("randomnodes_cum", "github.com/ethereum/go-ethereum/p2p/discover/topicindex.(*TopicTable).RandomNodes", 1)):
+                if fn in share:
+                    put("rt.pprof." + key, share[fn][i])
         except Exception as e:  # pprof is optional
             print(f"warning: pprof: {e}", file=sys.stderr)
 
@@ -1411,6 +1429,10 @@ def main():
     put("sim.excluded", len(excluded))
     put("sim.flagged", len(flagged))
     put("sim.min_seeds", min((len(v) for v in runs.values()), default=0))
+    # Runs of the abandonment sweep cut by its deadline leave a .partial file.
+    started = {f.removesuffix(".partial") for f in glob.glob(os.path.join(root, "sim", "abandon", "*", "seed*.jsonl*")) if not f.endswith(".log")}
+    put("abandon.runs_planned", len(started))
+    put("abandon.runs_done", sum(len(v) for (e, _), v in runs.items() if e == "abandon"))
     write_md_table(os.path.join(docs, "generated", "sim_excluded.md"), ["run", "reason"], [(os.path.relpath(p, root), r) for p, r in excluded] or [("–", "none")])
     write_md_table(os.path.join(docs, "generated", "sim_flagged.md"), ["run", "flags"], [(os.path.relpath(p, root), r) for p, r in flagged] or [("–", "none")])
     if meta_of:

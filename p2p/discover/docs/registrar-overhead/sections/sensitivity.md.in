@@ -1,30 +1,35 @@
 All points use C = 1000, 5 fresh attempts/s and 20 queries/s unless stated otherwise;
 per-point tables are in §10.1.
 
-**Advertiser abandonment policy.** These runs last 72 h with 48 h of warm-up and 10⁶
-advertisers.
+**Advertiser abandonment policy.** These runs last 36 h with 24 h of warm-up and 10⁶
+advertisers (shortened from 72 h / 48 h, §8). The sweep stopped at its 07:05 deadline
+after {{abandon.runs_done|f:0}} of {{abandon.runs_planned|f:0}} runs; points without a completed run are marked.
 
 | fresh attempts/s | policy | occupancy / C | admissions/s | abandoned / fresh | cumulative wait at admission, median / p95 (s) |
 |---|---|---|---|---|---|
-| 1 | production | {{abandon.C1000-fresh1-production.utilisation|ci:3}} | {{abandon.C1000-fresh1-production.admission_rps|f:3}} | {{abandon.C1000-fresh1-production.abandon_fraction|f:3}} | {{abandon.C1000-fresh1-production.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh1-production.cumwait_waited_p95_s|f:0}} |
-| 1 | spec (single quote > E) | {{abandon.C1000-fresh1-spec.utilisation|ci:3}} | {{abandon.C1000-fresh1-spec.admission_rps|f:3}} | {{abandon.C1000-fresh1-spec.abandon_fraction|f:3}} | {{abandon.C1000-fresh1-spec.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh1-spec.cumwait_waited_p95_s|f:0}} |
-| 1 | none | {{abandon.C1000-fresh1-none.utilisation|ci:3}} | {{abandon.C1000-fresh1-none.admission_rps|f:3}} | {{abandon.C1000-fresh1-none.abandon_fraction|f:3}} | {{abandon.C1000-fresh1-none.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh1-none.cumwait_waited_p95_s|f:0}} |
-| 20 | production | {{abandon.C1000-fresh20-production.utilisation|ci:3}} | {{abandon.C1000-fresh20-production.admission_rps|f:3}} | {{abandon.C1000-fresh20-production.abandon_fraction|f:3}} | {{abandon.C1000-fresh20-production.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh20-production.cumwait_waited_p95_s|f:0}} |
-| 20 | spec (single quote > E) | {{abandon.C1000-fresh20-spec.utilisation|ci:3}} | {{abandon.C1000-fresh20-spec.admission_rps|f:3}} | {{abandon.C1000-fresh20-spec.abandon_fraction|f:3}} | {{abandon.C1000-fresh20-spec.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh20-spec.cumwait_waited_p95_s|f:0}} |
-| 20 | none † | {{abandon.C1000-fresh20-none.utilisation|ci:3}} | {{abandon.C1000-fresh20-none.admission_rps|f:3}} | {{abandon.C1000-fresh20-none.abandon_fraction|f:3}} | {{abandon.C1000-fresh20-none.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh20-none.cumwait_waited_p95_s|f:0}} |
+| 1 | production | {{if:abandon.C1000-fresh1-production.utilisation}}{{abandon.C1000-fresh1-production.utilisation|ci:3}} | {{abandon.C1000-fresh1-production.admission_rps|f:3}} | {{abandon.C1000-fresh1-production.abandon_fraction|f:3}} | {{abandon.C1000-fresh1-production.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh1-production.cumwait_waited_p95_s|f:0}}{{else}}not run (stopped at deadline) | – | – | –{{endif}} |
+| 1 | spec (single quote > E) | {{if:abandon.C1000-fresh1-spec.utilisation}}{{abandon.C1000-fresh1-spec.utilisation|ci:3}} | {{abandon.C1000-fresh1-spec.admission_rps|f:3}} | {{abandon.C1000-fresh1-spec.abandon_fraction|f:3}} | {{abandon.C1000-fresh1-spec.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh1-spec.cumwait_waited_p95_s|f:0}}{{else}}not run (stopped at deadline) | – | – | –{{endif}} |
+| 1 | none | {{if:abandon.C1000-fresh1-none.utilisation}}{{abandon.C1000-fresh1-none.utilisation|ci:3}} | {{abandon.C1000-fresh1-none.admission_rps|f:3}} | {{abandon.C1000-fresh1-none.abandon_fraction|f:3}} | {{abandon.C1000-fresh1-none.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh1-none.cumwait_waited_p95_s|f:0}}{{else}}not run (stopped at deadline) | – | – | –{{endif}} |
+| 5 | production | {{if:abandon.C1000-fresh5-production.utilisation}}{{abandon.C1000-fresh5-production.utilisation|ci:3}} | {{abandon.C1000-fresh5-production.admission_rps|f:3}} | {{abandon.C1000-fresh5-production.abandon_fraction|f:3}} | {{abandon.C1000-fresh5-production.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh5-production.cumwait_waited_p95_s|f:0}}{{else}}not run (stopped at deadline) | – | – | –{{endif}} |
+| 5 | spec (single quote > E) | {{if:abandon.C1000-fresh5-spec.utilisation}}{{abandon.C1000-fresh5-spec.utilisation|ci:3}} | {{abandon.C1000-fresh5-spec.admission_rps|f:3}} | {{abandon.C1000-fresh5-spec.abandon_fraction|f:3}} | {{abandon.C1000-fresh5-spec.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh5-spec.cumwait_waited_p95_s|f:0}}{{else}}not run (stopped at deadline) | – | – | –{{endif}} |
+| 5 | none | {{if:abandon.C1000-fresh5-none.utilisation}}{{abandon.C1000-fresh5-none.utilisation|ci:3}} | {{abandon.C1000-fresh5-none.admission_rps|f:3}} | {{abandon.C1000-fresh5-none.abandon_fraction|f:3}} | {{abandon.C1000-fresh5-none.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh5-none.cumwait_waited_p95_s|f:0}}{{else}}not run (stopped at deadline) | – | – | –{{endif}} |
+| 20 | production | {{if:abandon.C1000-fresh20-production.utilisation}}{{abandon.C1000-fresh20-production.utilisation|ci:3}} | {{abandon.C1000-fresh20-production.admission_rps|f:3}} | {{abandon.C1000-fresh20-production.abandon_fraction|f:3}} | {{abandon.C1000-fresh20-production.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh20-production.cumwait_waited_p95_s|f:0}}{{else}}not run (stopped at deadline) | – | – | –{{endif}} |
+| 20 | spec (single quote > E) | {{if:abandon.C1000-fresh20-spec.utilisation}}{{abandon.C1000-fresh20-spec.utilisation|ci:3}} | {{abandon.C1000-fresh20-spec.admission_rps|f:3}} | {{abandon.C1000-fresh20-spec.abandon_fraction|f:3}} | {{abandon.C1000-fresh20-spec.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh20-spec.cumwait_waited_p95_s|f:0}}{{else}}not run (stopped at deadline) | – | – | –{{endif}} |
+| 20 | none | {{if:abandon.C1000-fresh20-none.utilisation}}{{abandon.C1000-fresh20-none.utilisation|ci:3}} | {{abandon.C1000-fresh20-none.admission_rps|f:3}} | {{abandon.C1000-fresh20-none.abandon_fraction|f:3}} | {{abandon.C1000-fresh20-none.cumwait_waited_median_s|f:0}} / {{abandon.C1000-fresh20-none.cumwait_waited_p95_s|f:0}}{{else}}not run (stopped at deadline) | – | – | –{{endif}} |
 
-† Population-limited: with waits of days, all 10⁶ advertisers are busy, and only
-{{abandon.C1000-fresh20-none.fresh_attempt_rps|f:2}} of the configured 20 attempts/s
-find an idle advertiser. All `none` runs at 5 and 20 attempts/s are flagged (§10.2).
-
+{{if:abandon.C1000-fresh20-none.utilisation}}Without abandonment at 20 attempts/s the run is population-limited: with waits of
+days all 10⁶ advertisers are busy, and only {{abandon.C1000-fresh20-none.fresh_attempt_rps|f:2}} of the configured
+20 attempts/s find an idle advertiser.
+{{endif}}
 * The `spec` policy drops single quotes above E, which is stricter than production's
   1.5·E. But it has no cumulative limit: advertisers that keep receiving quotes ≤ E
-  stay. Occupancy is the same at 1 attempt/s and slightly higher at 5 and 20
-  attempts/s;
+  stay. Occupancy is the same at 1 attempt/s ({{abandon.C1000-fresh1-spec.utilisation|f:3}} against
+  {{abandon.C1000-fresh1-production.utilisation|f:3}}) and slightly higher at 5 and 20 attempts/s
+  ({{abandon.C1000-fresh20-spec.utilisation|f:3}} against {{abandon.C1000-fresh20-production.utilisation|f:3}} at 20/s);
   the p95 cumulative wait exceeds 1.5·E.
-* Without abandonment, occupancy roughly doubles. This comes at waits of more than a
-  day: the median cumulative wait at admission is
-  {{abandon.C1000-fresh1-none.cumwait_waited_median_s|f:0}} s at 1 attempt/s. Such waits
+* Without abandonment, occupancy rises from {{abandon.C1000-fresh1-production.utilisation|f:3}} to
+  {{abandon.C1000-fresh1-none.utilisation|f:3}} of C at 1 attempt/s. This comes at waits of most of a day: the
+  median cumulative wait at admission is {{abandon.C1000-fresh1-none.cumwait_waited_median_s|f:0}} s. Such waits
   also outlive the ticket keys (F3), which the harness does not model.
 * The attempt timeout is therefore the parameter that controls registrar utilisation.
 

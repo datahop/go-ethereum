@@ -22,8 +22,8 @@ used unmodified. The workload:
 The parameters of each experiment are listed in §10.1. The baseline is C = 1000 (the
 specification default), E = 15 min, 300 topics, α = 1, 200,000 advertisers, empirical
 IPs, 5 fresh attempts/s and 20 queries/s. Simulated runs last 18 h of logical time, of
-which the first 6 h are warm-up; the abandonment-policy runs last 72 h with 48 h of
-warm-up. State is sampled every 10 s.
+which the first 6 h are warm-up; the abandonment-policy runs last 36 h with 24 h of
+warm-up (§8). State is sampled every 10 s.
 
 In simulated mode, queries do not change registrar state. The query-rate experiment
 (§10.1) gives identical dynamics at 1–1000 queries/s. Query load matters only for CPU

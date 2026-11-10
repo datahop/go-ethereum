@@ -20,15 +20,15 @@ behaviour, packet I/O and adversarial load are out of scope. Loads observed in t
 | issue requirement | where (full document) | result |
 |---|---|---|
 | memory vs cache capacity / occupancy | §6.3, `figures/memory_fill` | {{mem.C1000-empirical.independent.bytes_per_ad|f:0}} B per cached ad (typical record), {{mem.C1000-empirical-maxenr.independent.bytes_per_ad|f:0}} B (300-byte record); linear in occupancy |
-| registration latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | {{if:occ.register-wait.N250.ns}}{{occ.register-wait.N250.ns|f:0}} ns for a wait reply at 25% occupancy, {{occ.register-admit.N250.ns|f:0}} ns for an admission; flat in occupancy{{else}}not measured{{endif}} |
+| registration latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | {{if:occ.register-wait.N250.ns}}{{occ.register-wait.N250.ns|f:0}} ns for a wait reply at 25% occupancy, {{occ.register-admit.N250.ns|f:0}} ns for an admission; growing slowly to {{occ.register-wait.N950.ns|f:0}} and {{occ.register-admit.N950.ns|f:0}} ns at 95%{{else}}not measured{{endif}} |
 | lookup latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | {{if:occ.lookup.N250.ns}}{{occ.lookup.N250.ns|f:0}} ns at 25%, {{occ.lookup.N950.ns|f:0}} ns at 95%; linear in the topic's ad count{{else}}not measured{{endif}} |
 | CPU utilisation vs request rate | §6.4.2, `figures/realtime_throughput` | {{if:rt.max_busy}}registrar core busy at most {{rt.max_busy|pct:1}} of one core in the sweep{{else}}provisional: not measured in real time{{endif}} |
-| throughput vs offered rate | §6.4.2, `figures/realtime_throughput` | {{if:rt.knee_requests_rps}}served in full up to {{rt.knee_requests_rps|sig:3}} requests/s on one core (harness included){{else}}provisional: no knee measured{{endif}} |
+| throughput vs offered rate | §6.4.2, `figures/realtime_throughput` | {{if:rt.knee_requests_rps}}served in full up to {{rt.knee_requests_rps|sig:3}} requests/s on one core (harness included){{if:rt.first_saturated_offered}}{{else}}, the highest rate offered: no saturation reached{{endif}}{{else}}provisional: no knee measured{{endif}} |
 | lower-bound state vs occupancy | §6.6, `figures/bounds_vs_occupancy` | {{if:bounds.max_topic_bounds_per_ad}}at most {{bounds.max_topic_bounds_per_ad|f:2}} topic and {{bounds.max_ip_bounds_per_ad|f:2}} IP bounds per cached ad{{else}}not measured{{endif}} |
 | validation latency / cost | §6.1, validation table | {{if:share.cgo.total_ns}}full `REGTOPIC` ≈ {{share.cgo.total_ns|sig:2}} ns; registrar core {{share.cgo.core_fraction|pct:1}} of it; ENR signature check {{share.cgo.enr_fraction|pct:0}}{{else}}not measured{{endif}} |
 | varying capacity, occupancy, IP distribution, registration and lookup rate | §6.2, §6.5, `figures/occupancy_vs_demand`, `figures/occupancy_vs_capacity` | occupancy {{demand.C1000-fresh0.25.utilisation|pct:0}}–{{demand.C1000-fresh100.utilisation|pct:0}} of C from {{demand.C1000-fresh0.25.fresh_attempt_rps|f:2}} to {{demand.C1000-fresh100.fresh_attempt_rps|f:0}} fresh attempts/s; lookup rate has no effect on admission |
 | inputs from the 10k runs | §6.7 | {{if:eval10k.hot_5_busy}}hottest registrar ≈ {{eval10k.rt_hot_5|f:0}} REGTOPIC/s, {{eval10k.tq_hot_5|f:1}} TOPICQUERY/s → {{eval10k.hot_5_busy|pct:2}} of a core{{else}}not placed{{endif}} |
-| pprof | §6.4.2 | {{if:table:pprof_cpu}}CPU profile at the knee (top functions){{else}}not recorded{{endif}} |
+| pprof | §6.4.2 | {{if:table:pprof_cpu}}CPU profile at the highest served rate; dominated by allocator and clock overhead (see below){{else}}not recorded{{endif}} |
 
 ## Headline numbers
 
@@ -41,7 +41,7 @@ behaviour, packet I/O and adversarial load are out of scope. Loads observed in t
   rest of the demand abandons ({{demand.C1000-fresh100.abandon_fraction|pct:1}} at 100 attempts/s).
 * **Memory:** {{mem.C1000-empirical-maxenr.independent.at_capacity_mib|f:2}} MiB for a full default cache of
   maximum-size records.
-* **Throughput:** {{if:rt.knee_requests_rps}}{{rt.knee_requests_rps|sig:3}} requests/s served without queueing on one core.{{else}}provisional, {{cap.implied_min|sig:2}}–{{cap.implied_max|sig:2}} requests/s implied by per-call costs.{{endif}}
+* **Throughput:** {{if:rt.knee_requests_rps}}{{rt.knee_requests_rps|sig:3}} requests/s served without queueing on one core{{if:rt.first_saturated_offered}}{{else}} (the highest rate offered, so a lower bound){{endif}}, with the registrar core busy {{rt.max_busy|pct:1}} of it.{{else}}provisional, {{cap.implied_min|sig:2}}–{{cap.implied_max|sig:2}} requests/s implied by per-call costs.{{endif}}
 
 {{if:figure:latency_vs_occupancy}}![Latency vs occupancy](figures/latency_vs_occupancy.png)
 {{endif}}{{if:figure:realtime_throughput}}![Throughput, CPU and queueing vs offered rate](figures/realtime_throughput.png)
@@ -64,6 +64,15 @@ behaviour, packet I/O and adversarial load are out of scope. Loads observed in t
 {{if:rt.knee_requests_rps}}{{else}}* Realtime throughput and CPU utilisation: no knee was measured; numbers are provisional.
 {{endif}}{{if:rt.validation.utilisation_ratio}}{{else}}* Hybrid-clock validation against a fully realtime run did not run.
 {{endif}}{{if:table:pprof_cpu}}{{else}}* No CPU profile.
+{{endif}}{{if:table:pprof_cpu}}* The CPU profile is dominated by overhead outside the registrar logic: span
+  clearing in the allocator ({{rt.pprof.memclr_flat|pct:0}}, reached from the result slice of
+  `RandomNodes`, not visible in the timed per-call cost) and clock reads
+  ({{rt.pprof.nanotime_cum|pct:0}}, almost all from the harness's hybrid clock). It shows that the registrar
+  core is not the bottleneck, not how registrar time divides.
+{{endif}}{{if:rt.reg.flagged}}* {{rt.reg.flagged|f:0}} of the {{rt.reg.points|f:0}} registration-heavy realtime points were flagged for background
+  load; their queue-delay tails (p99 {{rt.reg.qd_p99_min_us|f:0}}–{{rt.reg.qd_p99_max_us|f:0}} µs) are provisional.
+{{endif}}{{if:abandon.runs_done}}* The abandonment-policy sweep stopped at its deadline after {{abandon.runs_done|f:0}} of
+  {{abandon.runs_planned|f:0}} runs; the no-abandonment points at 5 and 20 attempts/s were not run.
 {{endif}}* The 10k reports give no per-registrar REGTOPIC rate as a number, no occupancy and
   no cache capacity; the registrar loads above are partly figure readings from older
   code.

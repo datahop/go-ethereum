@@ -96,7 +96,21 @@ validated only by `TestHybridTableEquivalence`.*{{endif}}
 {{if:table:pprof_cpu}}**CPU profile** at the knee (top functions by flat time, measurement phase only):
 
 {{table:pprof_cpu}}
+
+*Caveat.* The profile is dominated by overhead outside the registrar logic, so it shows
+that the registrar core is not the bottleneck rather than how registrar time divides.
+Span clearing (`runtime.memclrNoHeapPointers`, {{rt.pprof.memclr_flat|pct:0}} flat) is reached through the
+allocator from the 16-entry result slice that `RandomNodes` allocates per lookup; it
+does not appear in the timed per-call cost ({{rt.knee_requests_rps|sig:3}} requests/s at
+{{rt.max_busy|pct:1}} busy), so it is a runtime/allocator effect under the harness's heap, not
+lookup work. Clock reads (`runtime.nanotime`, {{rt.pprof.nanotime_cum|pct:0}} cumulative) come almost entirely
+from the harness's hybrid clock (`hybridClock.Now`, {{rt.pprof.hybridclock_cum|pct:0}}).
 {{else}}*No CPU profile was recorded.*{{endif}}
+{{if:rt.reg.flagged}}
+*Caveat.* {{rt.reg.flagged|f:0}} of the {{rt.reg.points|f:0}} registration-heavy points (b) overlapped background
+load (see the contamination column), so their queue-delay tails (p99 {{rt.reg.qd_p99_min_us|f:0}}–{{rt.reg.qd_p99_max_us|f:0}} µs)
+are provisional.
+{{endif}}
 {{else}}> **Provisional — realtime validation pending.** The realtime block produced no
 > admissible point. The estimates below come from per-call costs only.{{endif}}
 

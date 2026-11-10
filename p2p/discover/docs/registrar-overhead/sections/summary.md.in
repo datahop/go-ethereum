@@ -4,8 +4,8 @@ All results describe the production code after the fixes merged into `topdisc`
 
 * **The registrar core is cheap per request; validation dominates.** A `REGTOPIC`
   that receives a wait ticket costs {{fit.RegisterFresh.T.small.intercept|f:0}} ns plus
-  {{fit.RegisterFresh.T.small.slope|f:2}} ns per cached ad of the requested topic, and does not
-  grow with occupancy (§6.1).{{if:share.cgo.core_fraction}} With record decoding, signature verification and
+  {{fit.RegisterFresh.T.small.slope|f:2}} ns per cached ad of the requested topic; it grows with occupancy
+  only through that term (§6.1).{{if:share.cgo.core_fraction}} With record decoding, signature verification and
   ticket handling included, a full `REGTOPIC` costs about {{share.cgo.total_ns|sig:2}} ns, of which
   the registrar core is {{share.cgo.core_fraction|pct:1}}.{{endif}} A `TOPICQUERY` lookup visits every cached
   ad of the topic ({{fit.RandomNodes.T.all.slope|f:1}} ns each), regardless of the 16-result
