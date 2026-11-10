@@ -30,16 +30,18 @@ Measured:
 * the admission dynamics a registrar experiences under a population of advertisers
   that behave like the production client (§5.3): occupancy, waiting times, retry and
   abandonment rates;
-* the throughput of the registrar core on one CPU core (provisional, §6.4.2).
+* the validation steps of a `REGTOPIC` outside the registrar core: ENR decoding and
+  signature verification, the endpoint check, and ticket MAC computation, encoding and
+  replay check (§6.1, validation cost);
+* the throughput of the registrar core on one CPU core under offered load (§6.4.2).
 
-Not measured: UDP I/O, Discovery v5 packet encoding, session cryptography and
-handshakes, ticket MAC computation and encoding, ENR signature verification of incoming
-records, auxiliary-ENR selection, response packetisation, and multi-registrar
-(network-level) behaviour. Adversarial workloads are out of scope; the only
+Not measured: UDP I/O, Discovery v5 packet decryption and encoding, session handling
+(cryptography and handshakes), auxiliary-ENR selection, response encoding and
+packetisation, and multi-registrar (network-level) behaviour. Adversarial workloads are out of scope; the only
 correctness check under unusual load is the bounded-state verification of §6.6.
 
-The registrar core is a lower bound on the per-request cost of a full `REGTOPIC` or
-`TOPICQUERY` handler. A wire-level handler benchmark is listed as deferred work (§10.3).
+The registrar core plus validation is a lower bound on the per-request cost of a full
+`REGTOPIC` or `TOPICQUERY` handler. A wire-level handler benchmark is listed as deferred work (§10.3).
 
 ## 3. System under test
 

@@ -6,7 +6,9 @@ two ways:
   `handleRegtopic` decodes the ENR from the packet;
 * `shared`: the ENR is shared, so only the registrar's own structures are charged.
 
-![Heap vs occupancy](figures/memory_fill.png)
+{{figref:memory_fill}} shows the fills.
+
+{{fig:memory_fill}}Post-GC live heap above the empty table against occupancy, filling the cache with `TopicTable.Add` from 0 to 100% of C at C = 1000 and C = 5000 (first of five repetitions; empirical and diverse addresses, typical and 300-byte records, shared and independent ENRs). The heap is linear in occupancy: {{mem.C1000-empirical.independent.bytes_per_ad|f:0}} B per ad with typical records, {{mem.C1000-empirical-maxenr.independent.bytes_per_ad|f:0}} B with 300-byte records.{{endfig}}
 
 {{table:memory}}
 

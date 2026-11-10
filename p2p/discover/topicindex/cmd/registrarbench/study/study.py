@@ -38,6 +38,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+# Figures are embedded at full page width: at least 10 in wide, 12 pt text.
+plt.rcParams.update({"font.size": 12, "axes.labelsize": 13, "axes.titlesize": 13, "xtick.labelsize": 12,
+                     "ytick.labelsize": 12, "legend.fontsize": 12, "savefig.dpi": 200})
+
 # Validation thresholds.
 LITTLE_TOL = 0.02  # |time-avg occupancy / (admission rate * E) - 1|
 DRIFT_OCC = 0.05  # relative occupancy change between measurement halves
@@ -337,7 +341,7 @@ def sim_figures(summary, meta_of, figdir):
     if not summary:
         return
     # Equilibrium occupancy vs fresh demand.
-    fig, axes = plt.subplots(1, 3, figsize=(13, 3.8))
+    fig, axes = plt.subplots(3, 1, figsize=(10, 13))
     for C, color in ((1000, "C0"), (5000, "C1")):
         x, y, h = series(summary, "demand", "time_avg_occupancy", lambda p: p.get("C") == C, "fresh")
         axes[0].errorbar(x, y, yerr=h, marker="o", color=color, label=f"C = {C}", capsize=3)
@@ -356,11 +360,11 @@ def sim_figures(summary, meta_of, figdir):
     axes[0].set_ylabel("time-averaged occupancy (ads)")
     axes[1].set_ylabel("admissions / s")
     axes[2].set_ylabel("fraction")
-    axes[0].legend(fontsize=8)
-    axes[2].legend(fontsize=7)
+    axes[0].legend()
+    axes[2].legend(ncol=2)
     savefig(fig, figdir, "occupancy_vs_demand")
     # Capacity sweep.
-    fig, ax = plt.subplots(1, 2, figsize=(9, 3.6))
+    fig, ax = plt.subplots(2, 1, figsize=(10, 9))
     for r, color in ((5, "C0"), (20, "C1")):
         x, y, h = series(summary, "capacity", "time_avg_occupancy", lambda p: p.get("fresh") == r, "C")
         ax[0].errorbar(x, y, yerr=h, marker="o", color=color, label=f"{r:g} fresh/s", capsize=3)
@@ -371,7 +375,7 @@ def sim_figures(summary, meta_of, figdir):
         a.set_xscale("log")
         a.set_xlabel("cache capacity C")
         a.grid(alpha=.3)
-        a.legend(fontsize=8)
+        a.legend()
     ax[0].set_yscale("log")
     ax[0].set_ylabel("time-averaged occupancy")
     ax[1].set_ylabel("occupancy / C")
@@ -458,7 +462,7 @@ def microbench(root, docs, figdir):
         ("RemoveNode", "N", {}, "RemoveNode (absent ID) vs N"),
     ]
     frows, fmd = [], []
-    fig, axes = plt.subplots(2, 4, figsize=(15, 6.5))
+    fig, axes = plt.subplots(4, 2, figsize=(12, 18))
     for ax, (fam, xk, fixed, label) in zip(axes.flat, fits):
         pts = []
         for name in res:
@@ -492,10 +496,10 @@ def microbench(root, docs, figdir):
             ax.plot(xx, a + b * xx, "--", lw=1, label=f"{rng}: {a:.0f} + {b:.2f}·{xk} ns")
         ax.set_xscale("symlog", linthresh=16)
         ax.set_yscale("log")
-        ax.set_title(label, fontsize=9)
+        ax.set_title(label)
         ax.set_xlabel(xk)
         ax.set_ylabel("ns/op")
-        ax.legend(fontsize=7)
+        ax.legend()
         ax.grid(alpha=.3)
     savefig(fig, figdir, "microbench_complexity")
     write_csv(os.path.join(gen, "micro_fits.csv"), ["label", "family", "x", "range", "fixed", "intercept_ns", "slope_ns", "slope_ci95", "r2"], frows)
@@ -511,7 +515,7 @@ def memory(root, docs, figdir):
         return
     gen = os.path.join(docs, "generated")
     rows, md = [], []
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(10, 6))
     for path in paths:
         meta, _, _, recs = read_run(path)
         if admissibility(meta):
@@ -549,7 +553,7 @@ def memory(root, docs, figdir):
     ax.set_xlabel("occupancy (ads)")
     ax.set_ylabel("post-GC heap above empty table (MB)")
     ax.grid(alpha=.3)
-    ax.legend(fontsize=7)
+    ax.legend()
     savefig(fig, figdir, "memory_fill")
     write_csv(os.path.join(gen, "memory.csv"), ["run", "variant", "C", "bytes_per_ad", "ci95", "reps", "ipv4_tree_nodes_per_ad", "bytes_per_topic_bound", "bytes_at_capacity"], rows)
     write_md_table(os.path.join(gen, "memory.md"), ["run", "ENR", "C", "bytes per cached ad", "IPv4 tree vertices per ad", "bytes per topic bound", "MiB at occupancy = C"], md)
@@ -770,7 +774,7 @@ def micro_extra(root, docs, figdir):
         pts[p["op"]].append((p["N"] / p["C"], m[0], m[1], p["N"], p["T"]))
         put(f"occ.{p['op']}.N{int(p['N'])}.ns", {"mean": m[0], "ci": m[1], "n": m[2]})
     if pts:
-        fig, ax = plt.subplots(figsize=(6.5, 4))
+        fig, ax = plt.subplots(figsize=(10, 6))
         labels = {"register-wait": "REGTOPIC → wait ticket", "register-admit": "REGTOPIC → admitted", "lookup": "TOPICQUERY lookup (16 results)"}
         rows = []
         for op, xs in sorted(pts.items()):
@@ -782,7 +786,7 @@ def micro_extra(root, docs, figdir):
         ax.set_ylabel("ns per call (registrar core)")
         ax.set_yscale("log")
         ax.grid(alpha=.3)
-        ax.legend(fontsize=8)
+        ax.legend()
         savefig(fig, figdir, "latency_vs_occupancy")
         write_md_table(os.path.join(gen, "micro_occupancy.md"), ["operation", "N/C", "N", "T", "ns/call"], rows)
     # Share of a full REGTOPIC (handler work modelled as the sum of its parts).
@@ -828,7 +832,7 @@ def bounds_vs_occupancy(root, docs, figdir):
         return
     occ, tb, ib, tree = map(np.array, (occ, tb, ib, tree))
     bins = np.arange(0, 1001, 50)
-    fig, ax = plt.subplots(figsize=(6.5, 4))
+    fig, ax = plt.subplots(figsize=(10, 6))
     rows = []
     for label, ys in (("live topic lower bounds", tb), ("live IP lower bounds (tree vertices)", ib), ("IPv4 tree vertices", tree)):
         mx, my, mmax = [], [], []
@@ -844,7 +848,7 @@ def bounds_vs_occupancy(root, docs, figdir):
     ax.set_xlabel("ads cached N (C = 1000; 10 s samples of all simulated runs)")
     ax.set_ylabel("entries (dotted: maximum)")
     ax.grid(alpha=.3)
-    ax.legend(fontsize=8)
+    ax.legend()
     savefig(fig, figdir, "bounds_vs_occupancy")
     put("bounds.samples", len(occ))
     put("bounds.max_occupancy", int(occ.max()))
@@ -948,29 +952,52 @@ def realtime(root, docs, figdir):
             put("rt.first_saturated_served", over[0]["requests_rps"])
         put("rt.max_busy", max(v["busy"] for v in sweep))
         put("rt.max_served", max(v["requests_rps"] for v in sweep))
-        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    # Knee per capacity: query points at 100 fresh/s with the hybrid clock.
+    bycap = defaultdict(list)
+    for st, _, v in pts:
+        if st in ("a-query", "d-capacity") and v["mode"] == "hybrid" and v["offered_fresh"] == 100:
+            bycap[v["capacity"]].append(v)
+    for C, vs in bycap.items():
+        vs.sort(key=lambda v: v["offered_query"])
+        ok = [v for v in vs if v["query_rps"] >= 0.98 * v["offered_query"] and v["qd_p99_us"] < 1e4]
+        bad = [v for v in vs if v not in ok]
+        put(f"rt.C{C}.points", len(vs))
+        put(f"rt.C{C}.max_offered_query", vs[-1]["offered_query"])
+        if ok:
+            put(f"rt.C{C}.served_offered_query", ok[-1]["offered_query"])
+            put(f"rt.C{C}.served_requests_rps", ok[-1]["requests_rps"])
+        if bad:
+            v = bad[0]
+            put(f"rt.C{C}.sat_offered_query", v["offered_query"])
+            put(f"rt.C{C}.sat_offered_rps", v["offered_query"] + v["offered_fresh"])
+            put(f"rt.C{C}.sat_served_rps", v["requests_rps"])
+            put(f"rt.C{C}.sat_busy", v["busy"])
+            put(f"rt.C{C}.sat_qd_p50_s", v["qd_p50_us"] / 1e6)
+            put(f"rt.C{C}.sat_q_mean_ns", v["q_mean_ns"])
+            put(f"rt.C{C}.sat_utilisation", v["utilisation"])
+        top = [v for v in vs if v["offered_query"] == vs[-1]["offered_query"]][0]
+        put(f"rt.C{C}.top_q_mean_ns", top["q_mean_ns"])
+    if sweep:
+        fig, axes = plt.subplots(3, 1, figsize=(10, 14))
+        for C, marker in sorted(((C, m) for C, m in zip(sorted(bycap), "osd^"))):
+            vs = bycap[C]
+            x = [v["offered_query"] + v["offered_fresh"] for v in vs]
+            ls = "-" if len(vs) > 2 else ":"
+            axes[0].plot(x, [v["requests_rps"] for v in vs], marker=marker, ls=ls, label=f"served, C = {C}")
+            axes[1].plot(x, [100 * v["busy"] for v in vs], marker=marker, ls=ls, label=f"C = {C}")
+            axes[2].plot(x, [max(v["qd_p50_us"], 0.05) for v in vs], marker=marker, ls=ls, label=f"p50, C = {C}")
+            axes[2].plot(x, [max(v["qd_p99_us"], 0.05) for v in vs], marker=marker, ls="--", label=f"p99, C = {C}")
         x = [v["offered_query"] + v["offered_fresh"] for v in sweep]
-        axes[0].plot(x, [v["requests_rps"] for v in sweep], "o-", label="served")
         axes[0].plot(x, x, "--", color="grey", lw=.8, label="offered")
-        axes[0].set_ylabel("requests/s")
-        axes[0].set_title("Throughput vs offered rate")
-        axes[1].plot([v["requests_rps"] for v in sweep], [100 * v["busy"] for v in sweep], "o-")
+        axes[0].set_ylabel("served requests/s")
         axes[1].set_ylabel("registrar busy, % of one core")
-        axes[1].set_title("CPU utilisation (busy fraction) vs request rate")
-        axes[2].plot(x, [v["qd_p50_us"] for v in sweep], "o-", label="p50")
-        axes[2].plot(x, [v["qd_p99_us"] for v in sweep], "s-", label="p99")
         axes[2].set_ylabel("queue delay (µs)")
-        axes[2].set_title("Queueing vs offered rate")
         for ax in axes:
             ax.set_xscale("log")
+            ax.set_yscale("log")
             ax.set_xlabel("offered requests/s (100 fresh/s + queries)")
             ax.grid(alpha=.3)
-        axes[1].set_xlabel("served requests/s")
-        axes[1].set_yscale("log")
-        axes[2].set_yscale("log")
-        axes[0].set_yscale("log")
-        axes[0].legend(fontsize=8)
-        axes[2].legend(fontsize=8)
+            ax.legend()
         savefig(fig, figdir, "realtime_throughput")
     # Hybrid-vs-realtime validation pair.
     pair = {v["mode"]: v for st, _, v in pts if st == "d-validation"}
@@ -1393,6 +1420,33 @@ def render_one(docs, name):
     while COND_RE.search(text):
         text = COND_RE.sub(cond, text)
 
+    # Figures are numbered in order across the documents, in render order.
+    # {{fig:x}}caption{{endfig}} embeds figures/x.png at page width with
+    # "Figure N: caption" below it; {{figref:x}} is "Figure N", using this
+    # document's number for x if it embeds x, else the first one.
+    own = {}
+
+    def fig(mm):
+        name, caption = mm.group(1), mm.group(2).strip()
+        if not os.path.exists(os.path.join(docs, "figures", name + ".png")):
+            missing.append("figure:" + name)
+        n = FIGURES["next"]
+        FIGURES["next"] += 1
+        own.setdefault(name, n)
+        FIGURES["first"].setdefault(name, n)
+        return f'<img src="figures/{name}.png" width="100%">\n\n*Figure {n}: {caption}*'
+
+    text = re.sub(r"\{\{fig:([\w.-]+)\}\}(.*?)\{\{endfig\}\}", fig, text, flags=re.S)
+
+    def figref(mm):
+        n = own.get(mm.group(1)) or FIGURES["first"].get(mm.group(1))
+        if n is None:
+            missing.append("figref:" + mm.group(1))
+            return "Figure ?"
+        return f"Figure {n}"
+
+    text = re.sub(r"\{\{figref:([\w.-]+)\}\}", figref, text)
+
     def table(mm):
         p = os.path.join(docs, "generated", mm.group(1) + ".md")
         if not os.path.exists(p):
@@ -1412,6 +1466,9 @@ def render_one(docs, name):
     header = f"<!-- Generated by topicindex/cmd/registrarbench/study/study.py from {name}.md.in. Do not edit. -->\n"
     open(os.path.join(docs, name + ".md"), "w").write(header + text)
     return [f"{name}: {m}" for m in missing]
+
+
+FIGURES = {"next": 1, "first": {}}
 
 
 def render(docs):

@@ -14,8 +14,8 @@ report text gives REGTOPIC load only in bytes. They are approximate.
 {{eval10k.rt_hot_5|f:0}} REGTOPIC/s and {{eval10k.tq_hot_5|f:1}} TOPICQUERY/s), the full REGTOPIC cost
 of §6.1 (validation included, {{share.cgo.total_ns|sig:2}} ns) and the lookup cost at 25%
 occupancy ({{occ.lookup.N250.ns|f:0}} ns) add up to {{eval10k.hot_5_busy|pct:2}} of one core. For the
-single-topic run the figure is {{eval10k.hot_1_busy|pct:3}}.{{if:eval10k.knee_over_hot5}} The realtime knee
-(§6.4.2) is {{eval10k.knee_over_hot5|sig:2}} times the hottest registrar's request rate.{{endif}}
+single-topic run the figure is {{eval10k.hot_1_busy|pct:3}}.{{if:eval10k.knee_over_hot5}} The highest rate served
+in full at C = 1000 (§6.4.2) is {{eval10k.knee_over_hot5|sig:2}} times the hottest registrar's request rate.{{endif}}
 A typical registrar (the far distance bin) receives
 {{eval10k.tq_far_1|f:2}} TOPICQUERY/s and almost no REGTOPIC.{{endif}}
 

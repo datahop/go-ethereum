@@ -1,6 +1,6 @@
-![Occupancy, admission rate and abandonment vs demand](figures/occupancy_vs_demand.png)
+{{fig:occupancy_vs_demand}}Time-averaged occupancy (top), admission rate (middle) and the abandoned and waiting fractions (bottom) against fresh registration attempts/s, at C = 1000 and C = 5000 with production advertisers (200,000 advertisers, 20 queries/s, 18 h runs with 6 h warm-up, 5 seeds, mean ± 95% CI; dotted: C). Occupancy settles at {{demand.C1000-fresh0.25.utilisation|pct:0}}–{{demand.C1000-fresh100.utilisation|pct:0}} of C at C = 1000 and admissions saturate at about {{demand.C1000-fresh100.admission_rps|f:2}}/s; extra demand is abandoned.{{endfig}}
 
-Full per-point tables (mean ± 95% CI over 5 seeds) are in §10.1. Every run satisfies
+{{figref:occupancy_vs_demand}} shows the demand sweep. Full per-point tables (mean ± 95% CI over 5 seeds) are in §10.1. Every run satisfies
 Little's law: time-averaged occupancy / (admission rate · E) lies between
 {{sim.little_min|f:3}} and {{sim.little_max|f:3}}.
 
@@ -55,9 +55,9 @@ cache. The largest topic list seen during measurement has
 (mean over seeds). These T values are what the
 per-operation costs of §6.1 should be read at.
 
-![Occupancy vs capacity](figures/occupancy_vs_capacity.png)
+{{fig:occupancy_vs_capacity}}Time-averaged occupancy (top) and occupancy as a fraction of C (bottom) against cache capacity C = 500 … 10,000, at 5 and 20 fresh attempts/s (production advertisers, 18 h runs, 5 seeds, mean ± 95% CI). The fraction stays between {{capacity.C10000-fresh5.utilisation|pct:0}} and {{capacity.C500-fresh20.utilisation|pct:0}}: occupancy scales with C.{{endfig}}
 
-**Capacity.** Over C = 500 … 10,000 (§10.1, `capacity`) the occupancy fraction stays
+**Capacity.** Over C = 500 … 10,000 ({{figref:occupancy_vs_capacity}}; §10.1, `capacity`) the occupancy fraction stays
 between {{capacity.C10000-fresh5.utilisation|pct:1}} and {{capacity.C500-fresh20.utilisation|pct:1}}. The
 admission rate scales with C:
 * {{capacity.C500-fresh20.admission_rps|f:2}}/s at C = 500;

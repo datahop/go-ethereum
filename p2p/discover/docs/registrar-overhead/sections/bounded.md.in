@@ -27,9 +27,9 @@ and dropped with the topic's last ad (#177). The handler also keeps a replay mem
 credited tickets (`UsedTickets`), capped at 16,384 entries of 15 s each.
 
 {{if:figure:bounds_vs_occupancy}}**Lower-bound state against occupancy.** Every 10 s sample of the C = 1000 runs
-({{bounds.samples|f:0}} samples, occupancy up to {{bounds.max_occupancy|f:0}} ads):
+({{bounds.samples|f:0}} samples, occupancy up to {{bounds.max_occupancy|f:0}} ads), {{figref:bounds_vs_occupancy}}:
 
-![Lower-bound state vs occupancy](figures/bounds_vs_occupancy.png)
+{{fig:bounds_vs_occupancy}}Live topic lower bounds, live IP lower bounds and IPv4 tree vertices against the number of cached ads, binned over every 10 s sample of the simulated C = 1000 runs ({{bounds.samples|f:0}} samples; solid: mean, dotted: maximum; dashed: one per cached ad). Lower-bound state stays at or below {{bounds.max_ip_bounds_per_ad|f:2}} entries per cached ad.{{endfig}}
 
 At most {{bounds.max_topic_bounds_per_ad|f:2}} live topic bounds and {{bounds.max_ip_bounds_per_ad|f:2}} live IP
 bounds per cached ad were observed, and at most {{bounds.max_tree_nodes_per_ad|f:2}} IPv4 tree

@@ -25,9 +25,11 @@ All results describe the production code after the fixes merged into `topdisc`
   default cache (C = 1000) of maximum-size records holds
   {{mem.C1000-empirical-maxenr.independent.at_capacity_mib|f:2}} MiB (§6.3). Lower-bound state stays
   bounded by the cache contents (§6.6).
-* **Throughput.** {{if:rt.knee_requests_rps}}On one core the harness served up to {{rt.knee_requests_rps|sig:3}} requests/s
-  without queueing (§6.4.2); the registrar core used at most {{rt.max_busy|pct:1}} of that core
-  in the sweep.{{else}}*Provisional:* the realtime block produced no knee. From per-call costs, one core could
+* **Throughput.** {{if:rt.knee_requests_rps}}On one core, at C = 1000, the harness served every offered rate in full up
+  to {{rt.knee_requests_rps|sig:3}} requests/s{{if:rt.C1000.sat_offered_query}}{{else}}, the highest offered, so the knee was not reached{{endif}}; the registrar core used at most
+  {{rt.max_busy|pct:1}} of that core (§6.4.2, {{figref:realtime_throughput}}).{{if:rt.C5000.sat_offered_query}} At C = 5000 the worker saturated at or below
+  {{rt.C5000.sat_offered_query|sig:2}} queries/s ({{rt.C5000.sat_served_rps|f:0}} requests/s served, registrar core busy {{rt.C5000.sat_busy|pct:1}}),
+  because lookups visit longer topic lists ({{rt.C5000.sat_q_mean_ns|f:0}} ns against {{rt.C1000.top_q_mean_ns|f:0}} ns per `TOPICQUERY`).{{endif}}{{else}}*Provisional:* the realtime block produced no knee. From per-call costs, one core could
   serve roughly {{cap.implied_min|sig:2}}–{{cap.implied_max|sig:2}} registrar-core requests/s.{{endif}}
   {{if:eval10k.hot_5_busy}}The hottest registrar of the 10k-node runs would keep a core
   {{eval10k.hot_5_busy|pct:2}} busy (§6.7).{{endif}}

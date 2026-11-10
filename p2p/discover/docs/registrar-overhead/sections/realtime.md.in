@@ -73,19 +73,33 @@ divided by wall time: (registrations/s × mean ns per registration + queries/s �
 ns per query) / 10⁹. It is the registrar core's share of one core; the harness's own
 work (arrival generation, bookkeeping) is excluded.
 
-{{if:figure:realtime_throughput}}![Throughput, busy fraction and queueing vs offered rate](figures/realtime_throughput.png)
+{{if:figure:realtime_throughput}}{{figref:realtime_throughput}} plots throughput, busy fraction and queueing against the offered rate.
+
+{{fig:realtime_throughput}}Served requests/s (top), registrar-core busy fraction of one core (middle) and queue delay p50/p99
+(bottom) against offered requests/s: the query sweep at C = 1000 and the two points at C = 5000 (hybrid clock, 3 h
+simulated warm-up, 10 min wall-clock windows, 100 fresh attempts/s, Poisson arrivals, one seed). {{if:rt.C1000.sat_offered_query}}C = 1000
+saturates at {{rt.C1000.sat_offered_query|sig:2}} queries/s{{else}}C = 1000 is served in full up to the highest rate offered{{endif}}{{if:rt.C5000.sat_offered_query}}; C = 5000
+saturates at {{rt.C5000.sat_offered_query|sig:2}} queries/s, where the queue delay jumps to seconds{{endif}}.{{endfig}}
 {{endif}}
-{{if:rt.knee_offered_query}}**Saturation.** The highest offered rate that was served in full (≥ 98% of the offered
-queries, queue-delay p99 below 10 ms) was {{rt.knee_offered_query|sig:2}} queries/s plus 100
-fresh attempts/s, i.e. {{rt.knee_requests_rps|sig:3}} requests/s served. At that point the
-registrar core was busy {{rt.knee_busy|pct:1}} of the time and the p99 queue delay was
-{{rt.knee_qd_p99_us|f:1}} µs. {{if:rt.first_saturated_offered}}At {{rt.first_saturated_offered|sig:2}} offered queries/s the process served only
-{{rt.first_saturated_served|sig:3}} requests/s. The limit is the single worker thread,
-harness included: the registrar core accounts for at most {{rt.max_busy|pct:1}} of the
-thread's time in the sweep, so the knee is a bound set by the harness and dispatch
-loop, not by `TopicTable`.{{else}}No offered rate in the sweep saturated the worker; the
-knee lies above the highest rate offered, and the registrar core used at most
-{{rt.max_busy|pct:1}} of one core.{{endif}}{{else}}*No query-sweep point was served in full, or the sweep did not run; no knee is reported.*{{endif}}
+{{if:rt.knee_offered_query}}**Saturation, per capacity.** A point counts as served in full when at least 98% of the
+offered queries are served and the queue-delay p99 is below 10 ms.
+
+* **C = 1000:** {{if:rt.C1000.sat_offered_query}}the knee lies between {{rt.C1000.served_offered_query|sig:2}} and
+  {{rt.C1000.sat_offered_query|sig:2}} offered queries/s; at the latter the process served {{rt.C1000.sat_served_rps|f:0}} requests/s with the
+  registrar core busy {{rt.C1000.sat_busy|pct:1}}.{{else}}knee not reached. Every offered rate up to {{rt.C1000.max_offered_query|sig:2}} queries/s
+  plus 100 fresh attempts/s was served in full, so the knee is at or above {{rt.knee_requests_rps|sig:3}} requests/s.
+  At that rate the registrar core was busy {{rt.knee_busy|pct:1}} of the time and the p99 queue delay was
+  {{rt.knee_qd_p99_us|f:1}} µs.{{endif}}
+* **C = 5000:** {{if:rt.C5000.sat_offered_query}}knee reached at or below {{rt.C5000.sat_offered_query|sig:2}} offered queries/s.
+  {{rt.C5000.served_offered_query|sig:2}} queries/s was served in full; at {{rt.C5000.sat_offered_query|sig:2}} queries/s the process served only
+  {{rt.C5000.sat_served_rps|f:0}} of {{rt.C5000.sat_offered_rps|f:0}} offered requests/s, with the registrar core busy
+  {{rt.C5000.sat_busy|pct:1}} and a median queue delay of {{rt.C5000.sat_qd_p50_s|f:1}} s (the backlog grew through the window).
+  Registrations wait in the same queue, so occupancy fell to {{rt.C5000.sat_utilisation|pct:1}} of C.
+  The cause is the longer topic lists: with five times the capacity each topic holds about five times as many ads, and a
+  lookup visits every ad of its topic (§6.1). The mean `TOPICQUERY` cost was {{rt.C5000.sat_q_mean_ns|f:0}} ns against
+  {{rt.C1000.top_q_mean_ns|f:0}} ns at C = 1000 at the same offered rate. The worker thread saturated before the
+  registrar core reached 100%; the rest of its time is harness work (arrival generation, clock reads, bookkeeping).{{else}}no
+  offered rate saturated the worker ({{rt.C5000.points|f:0}} points, up to {{rt.C5000.max_offered_query|sig:2}} queries/s).{{endif}}{{else}}*No query-sweep point was served in full, or the sweep did not run; no knee is reported.*{{endif}}
 
 {{if:rt.validation.utilisation_ratio}}**Hybrid clock validation.** A fully realtime run (45 min real warm-up, so its
 occupancy may still be rising) with the same configuration as a hybrid point gave an occupancy ratio (realtime/hybrid) of
@@ -93,7 +107,7 @@ occupancy may still be rising) with the same configuration as a hybrid point gav
 registration cost ratio of {{rt.validation.r_mean_ns_ratio|f:2}}.{{else}}*Provisional: the fully realtime validation point did not run; the hybrid clock is
 validated only by `TestHybridTableEquivalence`.*{{endif}}
 
-{{if:table:pprof_cpu}}**CPU profile** at the knee (top functions by flat time, measurement phase only):
+{{if:table:pprof_cpu}}**CPU profile** at the highest C = 1000 rate, 640,000 queries/s (top functions by flat time, measurement phase only):
 
 {{table:pprof_cpu}}
 

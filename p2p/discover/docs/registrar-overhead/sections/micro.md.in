@@ -1,8 +1,8 @@
 `testing.B` benchmarks (`topicindex/bench_test.go`) were run natively on arm64, 10 runs
 each; values are mean ± 95% CI. N is the cache occupancy and T the number of cached ads
-for the requested topic. Full table: §10.1.
+for the requested topic. Full table: §10.1. {{figref:microbench_complexity}} shows each operation against N or T.
 
-![Per-operation cost](figures/microbench_complexity.png)
+{{fig:microbench_complexity}}Cost per call of each `TopicTable` operation against cache occupancy N or topic size T (arm64, 10 runs per point, mean ± s.d.; dashed: linear fits). Registration and lookup grow with the topic's ad count T ({{fit.RegisterFresh.T.small.slope|f:2}} and {{fit.RandomNodes.T.all.slope|f:1}} ns per ad), not with N.{{endfig}}
 
 {{table:micro_fits}}
 
@@ -38,15 +38,16 @@ Per expired entry this is {{audit.expiry_bytes_per_entry|ci:0}} B in
 {{audit.expiry_allocations_per_entry|f:2}} allocations, matching the microbenchmark.
 
 **Latency against occupancy.** At the default capacity C = 1000, with the requested
-topic holding a tenth of the cached ads (`BenchmarkOccupancy`):
+topic holding a tenth of the cached ads (`BenchmarkOccupancy`, {{figref:latency_vs_occupancy}}):
 
-{{if:figure:latency_vs_occupancy}}![Registration and lookup latency vs occupancy](figures/latency_vs_occupancy.png)
+{{if:figure:latency_vs_occupancy}}{{fig:latency_vs_occupancy}}Registrar-core latency per call against occupancy N/C at C = 1000, with the requested topic holding N/10 ads (arm64, 10 runs, mean ± 95% CI). Wait replies stay at {{occ.register-wait.N100.ns|f:0}}–{{occ.register-wait.N950.ns|f:0}} ns and admissions at {{occ.register-admit.N100.ns|f:0}}–{{occ.register-admit.N950.ns|f:0}} ns; a lookup grows linearly with the topic's ad count to {{occ.lookup.N950.ns|f:0}} ns at 95%.{{endfig}}
 
 {{table:micro_occupancy}}
 
 A wait response costs {{occ.register-wait.N100.ns|f:0}}–{{occ.register-wait.N950.ns|f:0}} ns from 10% to 95%
-occupancy and an admission {{occ.register-admit.N100.ns|f:0}}–{{occ.register-admit.N950.ns|f:0}} ns; neither
-grows with the occupancy factor, which only changes the computed number. The lookup
+occupancy and an admission {{occ.register-admit.N100.ns|f:0}}–{{occ.register-admit.N950.ns|f:0}} ns. Both grow
+only through the topic size T = N/10 (the duplicate scan); the occupancy factor itself only changes the
+computed number. The lookup
 grows with the topic size T = N/10: {{occ.lookup.N100.ns|f:0}} ns at 10% and
 {{occ.lookup.N950.ns|f:0}} ns at 95%. At N = 0 a registration is always admitted (no wait).
 {{else}}*Provisional: the occupancy benchmarks did not run.*{{endif}}
