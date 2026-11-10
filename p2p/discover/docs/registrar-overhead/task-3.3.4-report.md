@@ -20,14 +20,14 @@ behaviour, packet I/O and adversarial load are out of scope. Loads observed in t
 
 | issue requirement | where (full document) | result |
 |---|---|---|
-| memory vs cache capacity / occupancy | §6.3, `figures/memory_fill` | 859 B per cached ad (typical record), 1,370 B (300-byte record); linear in occupancy |
-| registration latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | 337 ns for a wait reply at 25% occupancy, 1,614 ns for an admission; growing slowly to 472 and 2,332 ns at 95% |
-| lookup latency vs occupancy | §6.1, `figures/latency_vs_occupancy` | 951 ns at 25%, 3,927 ns at 95%; linear in the topic's ad count |
-| CPU utilisation vs request rate | §6.4.2, `figures/realtime_throughput` | registrar core busy at most 20.4% of one core in the sweep |
-| throughput vs offered rate | §6.4.2, `figures/realtime_throughput` | served in full up to 640,000 requests/s on one core (harness included), the highest rate offered: no saturation reached |
-| lower-bound state vs occupancy | §6.6, `figures/bounds_vs_occupancy` | at most 1.00 topic and 1.52 IP bounds per cached ad |
+| memory vs cache capacity / occupancy | §6.3, Figure 5 | 859 B per cached ad (typical record), 1,370 B (300-byte record); linear in occupancy |
+| registration latency vs occupancy | §6.1, Figure 8 | 337 ns for a wait reply at 25% occupancy, 1,614 ns for an admission; growing slowly to 472 and 2,332 ns at 95% |
+| lookup latency vs occupancy | §6.1, Figure 8 | 951 ns at 25%, 3,927 ns at 95%; linear in the topic's ad count |
+| CPU utilisation vs request rate | §6.4.2, Figure 9 | registrar core busy at most 20.4% of one core in the C = 1000 sweep; 69.8% at C = 5000 when saturated |
+| throughput vs offered rate | §6.4.2, Figure 9 | one core, harness included. C = 1000: knee not reached, ≥ 640,000 requests/s served in full. C = 5000: knee at or below 640,000 queries/s (620,471 served, queue delay p50 25.8 s), because lookups visit longer topic lists |
+| lower-bound state vs occupancy | §6.6, Figure 7 | at most 1.00 topic and 1.52 IP bounds per cached ad |
 | validation latency / cost | §6.1, validation table | full `REGTOPIC` ≈ 20,000 ns; registrar core 1.7% of it; ENR signature check 94% |
-| varying capacity, occupancy, IP distribution, registration and lookup rate | §6.2, §6.5, `figures/occupancy_vs_demand`, `figures/occupancy_vs_capacity` | occupancy 22%–27% of C from 0.25 to 100 fresh attempts/s; lookup rate has no effect on admission |
+| varying capacity, occupancy, IP distribution, registration and lookup rate | §6.2, §6.5, Figure 10, Figure 4 | occupancy 22%–27% of C from 0.25 to 100 fresh attempts/s; lookup rate has no effect on admission |
 | inputs from the 10k runs | §6.7 | hottest registrar ≈ 355 REGTOPIC/s, 5.3 TOPICQUERY/s → 0.72% of a core |
 | pprof | §6.4.2 | CPU profile at the highest served rate; dominated by allocator and clock overhead (see below) |
 
@@ -42,11 +42,27 @@ behaviour, packet I/O and adversarial load are out of scope. Loads observed in t
   rest of the demand abandons (99.7% at 100 attempts/s).
 * **Memory:** 1.31 MiB for a full default cache of
   maximum-size records.
-* **Throughput:** 640,000 requests/s served without queueing on one core (the highest rate offered, so a lower bound), with the registrar core busy 20.4% of it.
+* **Throughput:** at C = 1000, 640,000 requests/s served without queueing on one core (the highest rate offered, so a lower bound), with the registrar core busy 20.4% of it. At C = 5000 the worker saturates at or below 640,000 queries/s: a `TOPICQUERY` costs 1,125 ns there against 318 ns at C = 1000.
 
-![Latency vs occupancy](figures/latency_vs_occupancy.png)
-![Throughput, CPU and queueing vs offered rate](figures/realtime_throughput.png)
-![Occupancy and admissions vs demand](figures/occupancy_vs_demand.png)
+<img src="figures/latency_vs_occupancy.png" width="100%">
+
+*Figure 8: Registrar-core latency per call against occupancy at C = 1000,
+with the requested topic holding N/10 ads (arm64, 10 runs, mean ± 95% CI). Registrations stay below
+2,332 ns; a lookup grows with the topic's ad count to 3,927 ns at 95% occupancy.*
+
+<img src="figures/realtime_throughput.png" width="100%">
+
+*Figure 9: Served requests/s, registrar-core busy fraction and queue delay
+against offered requests/s on one core, at C = 1000 (query sweep) and C = 5000 (two points); hybrid clock, 10 min windows,
+100 fresh attempts/s, one seed. C = 1000 is served in full up to the highest rate offered;
+C = 5000 saturates at 640,000 queries/s.*
+
+<img src="figures/occupancy_vs_demand.png" width="100%">
+
+*Figure 10: Occupancy, admission rate and abandoned/waiting fractions against fresh attempts/s at
+C = 1000 and 5000 (production advertisers, 18 h runs, 5 seeds, mean ± 95% CI). Occupancy settles at
+22%–27% of C at C = 1000; admissions saturate at
+about 0.30/s and extra demand is abandoned.*
 
 ## Findings and fixes
 
@@ -62,6 +78,7 @@ behaviour, packet I/O and adversarial load are out of scope. Loads observed in t
 
 ## Missing or provisional
 
+* The C = 1000 knee was not reached: the sweep's highest offered rate was served in full.
 * The CPU profile is dominated by overhead outside the registrar logic: span
   clearing in the allocator (40%, reached from the result slice of
   `RandomNodes`, not visible in the timed per-call cost) and clock reads

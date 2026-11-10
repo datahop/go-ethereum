@@ -40,9 +40,11 @@ All results describe the production code after the fixes merged into `topdisc`
   default cache (C = 1000) of maximum-size records holds
   1.31 MiB (§6.3). Lower-bound state stays
   bounded by the cache contents (§6.6).
-* **Throughput.** On one core the harness served up to 640,000 requests/s
-  without queueing (§6.4.2); the registrar core used at most 20.4% of that core
-  in the sweep.
+* **Throughput.** On one core, at C = 1000, the harness served every offered rate in full up
+  to 640,000 requests/s, the highest offered, so the knee was not reached; the registrar core used at most
+  20.4% of that core (§6.4.2, Figure 6). At C = 5000 the worker saturated at or below
+  640,000 queries/s (620,471 requests/s served, registrar core busy 69.8%),
+  because lookups visit longer topic lists (1,125 ns against 318 ns per `TOPICQUERY`).
   The hottest registrar of the 10k-node runs would keep a core
   0.72% busy (§6.7).
 * **Findings (§4).** F1 (waiting-time overflow), F2 (IP-tree counters under churn)
@@ -66,16 +68,18 @@ Measured:
 * the admission dynamics a registrar experiences under a population of advertisers
   that behave like the production client (§5.3): occupancy, waiting times, retry and
   abandonment rates;
-* the throughput of the registrar core on one CPU core (provisional, §6.4.2).
+* the validation steps of a `REGTOPIC` outside the registrar core: ENR decoding and
+  signature verification, the endpoint check, and ticket MAC computation, encoding and
+  replay check (§6.1, validation cost);
+* the throughput of the registrar core on one CPU core under offered load (§6.4.2).
 
-Not measured: UDP I/O, Discovery v5 packet encoding, session cryptography and
-handshakes, ticket MAC computation and encoding, ENR signature verification of incoming
-records, auxiliary-ENR selection, response packetisation, and multi-registrar
-(network-level) behaviour. Adversarial workloads are out of scope; the only
+Not measured: UDP I/O, Discovery v5 packet decryption and encoding, session handling
+(cryptography and handshakes), auxiliary-ENR selection, response encoding and
+packetisation, and multi-registrar (network-level) behaviour. Adversarial workloads are out of scope; the only
 correctness check under unusual load is the bounded-state verification of §6.6.
 
-The registrar core is a lower bound on the per-request cost of a full `REGTOPIC` or
-`TOPICQUERY` handler. A wire-level handler benchmark is listed as deferred work (§10.3).
+The registrar core plus validation is a lower bound on the per-request cost of a full
+`REGTOPIC` or `TOPICQUERY` handler. A wire-level handler benchmark is listed as deferred work (§10.3).
 
 ## 3. System under test
 
@@ -392,9 +396,11 @@ Results come from these revisions. The production registrar code
 
 `testing.B` benchmarks (`topicindex/bench_test.go`) were run natively on arm64, 10 runs
 each; values are mean ± 95% CI. N is the cache occupancy and T the number of cached ads
-for the requested topic. Full table: §10.1.
+for the requested topic. Full table: §10.1. Figure 1 shows each operation against N or T.
 
-![Per-operation cost](figures/microbench_complexity.png)
+<img src="figures/microbench_complexity.png" width="100%">
+
+*Figure 1: Cost per call of each `TopicTable` operation against cache occupancy N or topic size T (arm64, 10 runs per point, mean ± s.d.; dashed: linear fits). Registration and lookup grow with the topic's ad count T (1.88 and 46.6 ns per ad), not with N.*
 
 | operation | fit range | intercept (ns) | slope (ns per entry) | R² |
 |---|---|---|---|---|
@@ -452,9 +458,11 @@ Per expired entry this is 119 ± 0 B in
 5.00 allocations, matching the microbenchmark.
 
 **Latency against occupancy.** At the default capacity C = 1000, with the requested
-topic holding a tenth of the cached ads (`BenchmarkOccupancy`):
+topic holding a tenth of the cached ads (`BenchmarkOccupancy`, Figure 2):
 
-![Registration and lookup latency vs occupancy](figures/latency_vs_occupancy.png)
+<img src="figures/latency_vs_occupancy.png" width="100%">
+
+*Figure 2: Registrar-core latency per call against occupancy N/C at C = 1000, with the requested topic holding N/10 ads (arm64, 10 runs, mean ± 95% CI). Wait replies stay at 299–472 ns and admissions at 1,558–2,332 ns; a lookup grows linearly with the topic's ad count to 3,927 ns at 95%.*
 
 | operation | N/C | N | T | ns/call |
 |---|---|---|---|---|
@@ -481,8 +489,9 @@ topic holding a tenth of the cached ads (`BenchmarkOccupancy`):
 | register-wait | 95% | 950 | 95 | 472 ± 2 |
 
 A wait response costs 299–472 ns from 10% to 95%
-occupancy and an admission 1,558–2,332 ns; neither
-grows with the occupancy factor, which only changes the computed number. The lookup
+occupancy and an admission 1,558–2,332 ns. Both grow
+only through the topic size T = N/10 (the duplicate scan); the occupancy factor itself only changes the
+computed number. The lookup
 grows with the topic size T = N/10: 375 ns at 10% and
 3,927 ns at 95%. At N = 0 a registration is always admitted (no wait).
 
@@ -528,9 +537,11 @@ and response encoding come on top and are not measured.
 
 ### 6.2 Admission dynamics and equilibrium occupancy
 
-![Occupancy, admission rate and abandonment vs demand](figures/occupancy_vs_demand.png)
+<img src="figures/occupancy_vs_demand.png" width="100%">
 
-Full per-point tables (mean ± 95% CI over 5 seeds) are in §10.1. Every run satisfies
+*Figure 3: Time-averaged occupancy (top), admission rate (middle) and the abandoned and waiting fractions (bottom) against fresh registration attempts/s, at C = 1000 and C = 5000 with production advertisers (200,000 advertisers, 20 queries/s, 18 h runs with 6 h warm-up, 5 seeds, mean ± 95% CI; dotted: C). Occupancy settles at 22%–27% of C at C = 1000 and admissions saturate at about 0.30/s; extra demand is abandoned.*
+
+Figure 3 shows the demand sweep. Full per-point tables (mean ± 95% CI over 5 seeds) are in §10.1. Every run satisfies
 Little's law: time-averaged occupancy / (admission rate · E) lies between
 0.988 and 1.011.
 
@@ -585,9 +596,11 @@ cache. The largest topic list seen during measurement has
 (mean over seeds). These T values are what the
 per-operation costs of §6.1 should be read at.
 
-![Occupancy vs capacity](figures/occupancy_vs_capacity.png)
+<img src="figures/occupancy_vs_capacity.png" width="100%">
 
-**Capacity.** Over C = 500 … 10,000 (§10.1, `capacity`) the occupancy fraction stays
+*Figure 4: Time-averaged occupancy (top) and occupancy as a fraction of C (bottom) against cache capacity C = 500 … 10,000, at 5 and 20 fresh attempts/s (production advertisers, 18 h runs, 5 seeds, mean ± 95% CI). The fraction stays between 24% and 28%: occupancy scales with C.*
+
+**Capacity.** Over C = 500 … 10,000 (Figure 4; §10.1, `capacity`) the occupancy fraction stays
 between 23.6% and 27.5%. The
 admission rate scales with C:
 * 0.15/s at C = 500;
@@ -603,7 +616,11 @@ two ways:
   `handleRegtopic` decodes the ENR from the packet;
 * `shared`: the ENR is shared, so only the registrar's own structures are charged.
 
-![Heap vs occupancy](figures/memory_fill.png)
+Figure 5 shows the fills.
+
+<img src="figures/memory_fill.png" width="100%">
+
+*Figure 5: Post-GC live heap above the empty table against occupancy, filling the cache with `TopicTable.Add` from 0 to 100% of C at C = 1000 and C = 5000 (first of five repetitions; empirical and diverse addresses, typical and 300-byte records, shared and independent ENRs). The heap is linear in occupancy: 859 B per ad with typical records, 1,370 B with 300-byte records.*
 
 | run | ENR | C | bytes per cached ad | IPv4 tree vertices per ad | bytes per topic bound | MiB at occupancy = C |
 |---|---|---|---|---|---|---|
@@ -759,22 +776,38 @@ divided by wall time: (registrations/s × mean ns per registration + queries/s �
 ns per query) / 10⁹. It is the registrar core's share of one core; the harness's own
 work (arrival generation, bookkeeping) is excluded.
 
-![Throughput, busy fraction and queueing vs offered rate](figures/realtime_throughput.png)
+Figure 6 plots throughput, busy fraction and queueing against the offered rate.
 
-**Saturation.** The highest offered rate that was served in full (≥ 98% of the offered
-queries, queue-delay p99 below 10 ms) was 640,000 queries/s plus 100
-fresh attempts/s, i.e. 640,000 requests/s served. At that point the
-registrar core was busy 20.4% of the time and the p99 queue delay was
-7.2 µs. No offered rate in the sweep saturated the worker; the
-knee lies above the highest rate offered, and the registrar core used at most
-20.4% of one core.
+<img src="figures/realtime_throughput.png" width="100%">
+
+*Figure 6: Served requests/s (top), registrar-core busy fraction of one core (middle) and queue delay p50/p99
+(bottom) against offered requests/s: the query sweep at C = 1000 and the two points at C = 5000 (hybrid clock, 3 h
+simulated warm-up, 10 min wall-clock windows, 100 fresh attempts/s, Poisson arrivals, one seed). C = 1000 is served in full up to the highest rate offered; C = 5000
+saturates at 640,000 queries/s, where the queue delay jumps to seconds.*
+
+**Saturation, per capacity.** A point counts as served in full when at least 98% of the
+offered queries are served and the queue-delay p99 is below 10 ms.
+
+* **C = 1000:** knee not reached. Every offered rate up to 640,000 queries/s
+  plus 100 fresh attempts/s was served in full, so the knee is at or above 640,000 requests/s.
+  At that rate the registrar core was busy 20.4% of the time and the p99 queue delay was
+  7.2 µs.
+* **C = 5000:** knee reached at or below 640,000 offered queries/s.
+  16,000 queries/s was served in full; at 640,000 queries/s the process served only
+  620,471 of 640,100 offered requests/s, with the registrar core busy
+  69.8% and a median queue delay of 25.8 s (the backlog grew through the window).
+  Registrations wait in the same queue, so occupancy fell to 17.8% of C.
+  The cause is the longer topic lists: with five times the capacity each topic holds about five times as many ads, and a
+  lookup visits every ad of its topic (§6.1). The mean `TOPICQUERY` cost was 1,125 ns against
+  318 ns at C = 1000 at the same offered rate. The worker thread saturated before the
+  registrar core reached 100%; the rest of its time is harness work (arrival generation, clock reads, bookkeeping).
 
 **Hybrid clock validation.** A fully realtime run (45 min real warm-up, so its
 occupancy may still be rising) with the same configuration as a hybrid point gave an occupancy ratio (realtime/hybrid) of
 0.979, a mean query cost ratio of 0.84 and a mean
 registration cost ratio of 1.12.
 
-**CPU profile** at the knee (top functions by flat time, measurement phase only):
+**CPU profile** at the highest C = 1000 rate, 640,000 queries/s (top functions by flat time, measurement phase only):
 
 | flat | flat % | cum | cum % | function |
 |---|---|---|---|---|
@@ -925,9 +958,11 @@ and dropped with the topic's last ad (#177). The handler also keeps a replay mem
 credited tickets (`UsedTickets`), capped at 16,384 entries of 15 s each.
 
 **Lower-bound state against occupancy.** Every 10 s sample of the C = 1000 runs
-(246,271 samples, occupancy up to 530 ads):
+(246,271 samples, occupancy up to 530 ads), Figure 7:
 
-![Lower-bound state vs occupancy](figures/bounds_vs_occupancy.png)
+<img src="figures/bounds_vs_occupancy.png" width="100%">
+
+*Figure 7: Live topic lower bounds, live IP lower bounds and IPv4 tree vertices against the number of cached ads, binned over every 10 s sample of the simulated C = 1000 runs (246,271 samples; solid: mean, dotted: maximum; dashed: one per cached ad). Lower-bound state stays at or below 1.52 entries per cached ad.*
 
 At most 1.00 live topic bounds and 1.52 live IP
 bounds per cached ad were observed, and at most 2.04 IPv4 tree
@@ -961,8 +996,8 @@ report text gives REGTOPIC load only in bytes. They are approximate.
 355 REGTOPIC/s and 5.3 TOPICQUERY/s), the full REGTOPIC cost
 of §6.1 (validation included, 20,000 ns) and the lookup cost at 25%
 occupancy (951 ns) add up to 0.72% of one core. For the
-single-topic run the figure is 0.096%. The realtime knee
-(§6.4.2) is 1,800 times the hottest registrar's request rate.
+single-topic run the figure is 0.096%. The highest rate served
+in full at C = 1000 (§6.4.2) is 1,800 times the hottest registrar's request rate.
 A typical registrar (the far distance bin) receives
 0.10 TOPICQUERY/s and almost no REGTOPIC.
 
