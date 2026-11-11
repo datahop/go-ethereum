@@ -76,6 +76,12 @@ Run `devp2p discv5 resolve <ENR>` to find the most recent node record of a node 
 the discv5 DHT.
 
 Run `devp2p discv5 listen` to run a Discovery v5 node.
+The node always serves topic discovery as a registrar. Add `--topic-register <topic>` to
+register a topic, or `--topic-search <topic>` to log the nodes found for it. Both can be
+repeated and take comma-separated lists. With `--rpc <addr>`, the node also serves
+`discv5_registerTopic`, `discv5_unregisterTopic`, `discv5_topicNodes` and
+`discv5_topicSearch`. Flags and RPC methods take a topic as a string: `0x` followed by 64 hex digits is the topic hash itself, any other string is a name
+and the topic is its SHA-256.
 
 Run `devp2p discv5 crawl <nodes.json path>` to create or update a JSON node set containing
 discv5 nodes.

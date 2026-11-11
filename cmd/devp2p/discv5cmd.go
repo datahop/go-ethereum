@@ -18,15 +18,19 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/devp2p/internal/v5test"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -83,6 +87,8 @@ var (
 		Action: discv5Listen,
 		Flags: slices.Concat(discoveryNodeFlags, []cli.Flag{
 			nodeConfigFlag,
+			topicRegisterFlag,
+			topicSearchFlag,
 			httpAddrFlag,
 		}),
 	}
@@ -92,6 +98,14 @@ var (
 	nodeConfigFlag = &cli.StringFlag{
 		Name:  "config",
 		Usage: "Path to JSON config file for topic discovery parameters",
+	}
+	topicRegisterFlag = &cli.StringSliceFlag{
+		Name:  "topic-register",
+		Usage: "Registers a topic, by name (SHA-256) or 0x-prefixed hash",
+	}
+	topicSearchFlag = &cli.StringSliceFlag{
+		Name:  "topic-search",
+		Usage: "Searches a topic, by name (SHA-256) or 0x-prefixed hash, and logs the nodes found",
 	}
 )
 
@@ -157,10 +171,28 @@ func discv5Listen(ctx *cli.Context) error {
 		extConfig = cfg
 	}
 
+	register := mustParseTopics(ctx.StringSlice(topicRegisterFlag.Name))
+	searchNames := ctx.StringSlice(topicSearchFlag.Name)
+	search := mustParseTopics(searchNames)
+
 	disc, _ := startV5(ctx, extConfig)
 	defer disc.Close()
 
 	fmt.Println(disc.Self())
+
+	for _, topic := range register {
+		disc.RegisterTopic(topic, 0)
+	}
+	for i, name := range searchNames {
+		it := disc.TopicSearch(search[i], 0)
+		defer it.Close()
+		go func() {
+			for it.Next() {
+				n := it.Node()
+				log.Info("Found topic node", "topic", name, "id", n.ID(), "enr", n.String())
+			}
+		}()
+	}
 
 	api := &discAPI{
 		discv5API:     &discv5API{disc},
@@ -200,6 +232,32 @@ func startV5(ctx *cli.Context, extConfig *discv5NodeConfig) (*discover.UDPv5, di
 		exit(err)
 	}
 	return disc, config
+}
+
+// parseTopic returns the topic given by s: 0x followed by 64 hex digits is the
+// topic hash itself, any other string is a name hashed with SHA-256.
+func parseTopic(s string) (topicindex.TopicID, error) {
+	if s == "" {
+		return topicindex.TopicID{}, errors.New("empty topic")
+	}
+	if len(s) == 66 && strings.HasPrefix(s, "0x") {
+		if b, err := hex.DecodeString(s[2:]); err == nil {
+			return topicindex.TopicID(b), nil
+		}
+	}
+	return sha256.Sum256([]byte(s)), nil
+}
+
+func mustParseTopics(names []string) []topicindex.TopicID {
+	topics := make([]topicindex.TopicID, len(names))
+	for i, name := range names {
+		topic, err := parseTopic(name)
+		if err != nil {
+			exit(fmt.Errorf("invalid topic %q: %v", name, err))
+		}
+		topics[i] = topic
+	}
+	return topics
 }
 
 type discv5API struct {
@@ -263,33 +321,51 @@ type discAPI struct {
 	searchTimeout time.Duration
 }
 
-func (api *discAPI) RegisterTopic(topic common.Hash, opID *uint64) {
+func (api *discAPI) RegisterTopic(topic string, opID *uint64) error {
+	id, err := parseTopic(topic)
+	if err != nil {
+		return err
+	}
 	var op uint64
 	if opID != nil {
 		op = *opID
 	}
-	api.host.RegisterTopic(topicindex.TopicID(topic), op)
+	api.host.RegisterTopic(id, op)
+	return nil
 }
 
-func (api *discAPI) UnregisterTopic(topic common.Hash) {
-	api.host.StopRegisterTopic(topicindex.TopicID(topic))
+func (api *discAPI) UnregisterTopic(topic string) error {
+	id, err := parseTopic(topic)
+	if err != nil {
+		return err
+	}
+	api.host.StopRegisterTopic(id)
+	return nil
 }
 
 func (api *discAPI) NodeTable() []*enode.Node {
 	return api.host.AllNodes()
 }
 
-func (api *discAPI) TopicNodes(topic common.Hash) []*enode.Node {
-	return api.host.LocalTopicNodes(topicindex.TopicID(topic))
+func (api *discAPI) TopicNodes(topic string) ([]*enode.Node, error) {
+	id, err := parseTopic(topic)
+	if err != nil {
+		return nil, err
+	}
+	return api.host.LocalTopicNodes(id), nil
 }
 
-func (api *discAPI) TopicSearch(topic common.Hash, numNodes int, opID *uint64) []enode.ID {
+func (api *discAPI) TopicSearch(topic string, numNodes int, opID *uint64) ([]enode.ID, error) {
+	id, err := parseTopic(topic)
+	if err != nil {
+		return nil, err
+	}
 	var op uint64
 	if opID != nil {
 		op = *opID
 	}
 
-	it := api.host.TopicSearch(topicindex.TopicID(topic), op)
+	it := api.host.TopicSearch(id, op)
 	defer it.Close()
 
 	var (
@@ -328,7 +404,7 @@ func (api *discAPI) TopicSearch(topic common.Hash, numNodes int, opID *uint64) [
 		close(searchDone)
 	}()
 
-	return <-nodesCh
+	return <-nodesCh, nil
 }
 
 func (api *discAPI) LocalNode() *enode.Node {
