@@ -180,6 +180,28 @@ func TestSearchBucketIPLimit(t *testing.T) {
 	}
 }
 
+// TestSearchOnePerBucketAfterIPLimit checks that a node refused by the IP
+// limit does not use up its bucket's one-per-bucket slot for the reply.
+func TestSearchOnePerBucketAfterIPLimit(t *testing.T) {
+	s := NewSearch(topic1, testConfig(t))
+	var full []*enode.Node
+	for i := 0; i < searchBucketIPLimit; i++ {
+		full = append(full, nodeAtDistance(enode.ID(topic1), 256, net.IP{1, 0, 2, byte(i + 1)}))
+	}
+	s.AddNodes(nil, full)
+
+	src := enode.SignNull(new(enr.Record), enode.ID{})
+	a := nodeAtDistance(enode.ID(topic1), 256, net.IP{1, 0, 2, 100})
+	b := nodeAtDistance(enode.ID(topic1), 256, intIP(9))
+	s.AddNodes(src, []*enode.Node{a, b})
+	if s.buckets[0].contains(a.ID()) {
+		t.Fatal("node from a full /24 was added")
+	}
+	if !s.buckets[0].contains(b.ID()) {
+		t.Fatal("node after an IP-limited one was refused by the one-per-bucket rule")
+	}
+}
+
 // TestSearchHandleErrorResponse checks that a failed topic query drops the
 // queried node from the table and frees its bucket slot and IP-limit entry.
 func TestSearchHandleErrorResponse(t *testing.T) {
