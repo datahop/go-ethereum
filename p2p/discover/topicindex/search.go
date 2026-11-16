@@ -248,7 +248,6 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 				s.cfg.Log.Debug("Ignoring search node", "id", n.ID(), "reason", "one-per-bucket-rule")
 				continue
 			}
-			s.bucketCheck[bi] = struct{}{}
 		}
 		// Apply IP restriction.
 		ip := n.IP()
@@ -258,6 +257,9 @@ func (s *Search) AddNodes(src *enode.Node, nodes []*enode.Node) {
 		}
 
 		// All checks passed, add the node.
+		if src != nil {
+			s.bucketCheck[bi] = struct{}{}
+		}
 		b.new[id] = n
 	}
 }
