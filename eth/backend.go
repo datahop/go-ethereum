@@ -57,6 +57,7 @@ import (
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/dnsdisc"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
@@ -591,13 +592,47 @@ func (s *Ethereum) setupDiscovery() error {
 
 	// Add DHT nodes from discv5.
 	if s.p2pServer.DiscoveryV5() != nil {
-		filter := eth.NewNodeFilter(s.blockchain)
-		iter := enode.Filter(s.p2pServer.DiscoveryV5().RandomNodes(), filter)
-		iter = enode.NewBufferIter(iter, discoveryPrefetchBuffer)
-		s.discmix.AddSource(iter)
+		topic, useTopic := discv5Topic(s.config, s.blockchain.Config(), s.blockchain.Genesis().Hash())
+		addDiscv5Sources(s.discmix, s.p2pServer.DiscoveryV5(), useTopic, topic, eth.NewNodeFilter(s.blockchain))
+	} else if s.config.DiscoveryTopic {
+		log.Warn("Topic discovery requires discv5, ignoring", "flag", "discovery.topic")
 	}
 
 	return nil
+}
+
+// discv5Topic returns the eth topic and whether to register and search it.
+func discv5Topic(config *ethconfig.Config, chain *params.ChainConfig, genesis common.Hash) (topicindex.TopicID, bool) {
+	if !config.DiscoveryTopic {
+		return topicindex.TopicID{}, false
+	}
+	if chain.ChainID == nil {
+		log.Warn("Topic discovery requires a chain ID, ignoring", "flag", "discovery.topic")
+		return topicindex.TopicID{}, false
+	}
+	return eth.DiscoveryTopic(chain.ChainID, genesis), true
+}
+
+type discv5Sources interface {
+	RandomNodes() enode.Iterator
+	RegisterTopic(topic topicindex.TopicID, opid uint64)
+	TopicSearch(topic topicindex.TopicID, opid uint64) enode.Iterator
+}
+
+// addDiscv5Sources adds the discv5 random nodes to the mix and, if useTopic is set,
+// registers the eth topic and adds its search results. Registration ends when
+// discv5 closes.
+func addDiscv5Sources(mix *enode.FairMix, disc discv5Sources, useTopic bool, topic topicindex.TopicID, filter func(*enode.Node) bool) {
+	iter := enode.Filter(disc.RandomNodes(), filter)
+	iter = enode.NewBufferIter(iter, discoveryPrefetchBuffer)
+	mix.AddSource(iter)
+
+	if useTopic {
+		disc.RegisterTopic(topic, 0)
+		iter := enode.Filter(disc.TopicSearch(topic, 0), filter)
+		iter = enode.NewBufferIter(iter, discoveryPrefetchBuffer)
+		mix.AddSource(enode.WithSourceName("discv5-topic", iter))
+	}
 }
 
 // Stop implements node.Lifecycle, terminating all internal goroutines used by the

@@ -26,9 +26,11 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/urfave/cli/v2"
 )
@@ -69,6 +71,60 @@ func TestParseTopic(t *testing.T) {
 	}
 }
 
+func TestParseEthTopic(t *testing.T) {
+	mainnetRaw := "1/" + params.MainnetGenesisHash.Hex()
+	mainnet := eth.DiscoveryTopic(params.MainnetChainConfig.ChainID, params.MainnetGenesisHash)
+	byName, err := parseTopic("eth/1/0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
+	if err != nil || byName != mainnet {
+		t.Fatalf("topic name parse: got %x (%v), want %x", byName, err, mainnet)
+	}
+	tests := []struct {
+		in   string
+		want topicindex.TopicID
+	}{
+		{in: "mainnet", want: mainnet},
+		{in: mainnetRaw, want: mainnet},
+		{in: "1/0x" + strings.ToUpper(params.MainnetGenesisHash.Hex()[2:]), want: mainnet},
+		{in: "sepolia", want: eth.DiscoveryTopic(params.SepoliaChainConfig.ChainID, params.SepoliaGenesisHash)},
+		{in: "hoodi", want: eth.DiscoveryTopic(params.HoodiChainConfig.ChainID, params.HoodiGenesisHash)},
+		{in: "560048/" + params.HoodiGenesisHash.Hex(), want: eth.DiscoveryTopic(params.HoodiChainConfig.ChainID, params.HoodiGenesisHash)},
+	}
+	for _, test := range tests {
+		var got topicindex.TopicID
+		cmd := *discv5ListenCommand
+		cmd.Action = func(ctx *cli.Context) (err error) {
+			got, err = parseEthTopic(ctx.String(ethTopicFlag.Name))
+			return err
+		}
+		app := &cli.App{Commands: []*cli.Command{&cmd}}
+		if err := app.Run([]string{"devp2p", cmd.Name, "--eth-topic", test.in}); err != nil {
+			t.Fatalf("%q: %v", test.in, err)
+		}
+		if got != test.want {
+			t.Errorf("%q: got %x, want %x", test.in, got, test.want)
+		}
+	}
+	invalid := []string{
+		"", "Mainnet", "holesky",
+		params.MainnetGenesisHash.Hex(),
+		"1/" + params.MainnetGenesisHash.Hex()[2:],
+		mainnetRaw + "0",
+		"1/0x" + strings.Repeat("g", 64),
+		"/" + params.MainnetGenesisHash.Hex(),
+		"01/" + params.MainnetGenesisHash.Hex(),
+		"+1/" + params.MainnetGenesisHash.Hex(),
+		"-1/" + params.MainnetGenesisHash.Hex(),
+		"0x1/" + params.MainnetGenesisHash.Hex(),
+		"eth/" + mainnetRaw,
+		mainnetRaw + "/",
+	}
+	for _, in := range invalid {
+		if _, err := parseEthTopic(in); err == nil {
+			t.Errorf("%q accepted", in)
+		}
+	}
+}
+
 func TestTopicFlags(t *testing.T) {
 	tests := []struct {
 		cmd          *cli.Command
@@ -101,6 +157,59 @@ func TestTopicFlags(t *testing.T) {
 		if !slices.Equal(search, test.wantSearch) {
 			t.Errorf("%s %v: search %v, want %v", cmd.Name, test.args, search, test.wantSearch)
 		}
+	}
+}
+
+func TestListenTopics(t *testing.T) {
+	mainnet, _ := parseEthTopic("mainnet")
+	a, _ := parseTopic("a")
+	b, _ := parseTopic("b")
+	tests := []struct {
+		args         []string
+		wantRegister []topicindex.TopicID
+		wantSearch   []topicindex.TopicID
+		wantNames    []string
+	}{
+		{args: nil},
+		{args: []string{"--eth-topic", "mainnet"}, wantRegister: []topicindex.TopicID{mainnet}, wantSearch: []topicindex.TopicID{mainnet}, wantNames: []string{"mainnet"}},
+		{
+			args:         []string{"--topic-register", "a", "--topic-search", "b", "--eth-topic", "mainnet"},
+			wantRegister: []topicindex.TopicID{a, mainnet},
+			wantSearch:   []topicindex.TopicID{b, mainnet},
+			wantNames:    []string{"b", "mainnet"},
+		},
+	}
+	for _, test := range tests {
+		var register, search []topicindex.TopicID
+		var names []string
+		cmd := *discv5ListenCommand
+		cmd.Action = func(ctx *cli.Context) (err error) {
+			register, search, names, err = listenTopics(ctx)
+			return err
+		}
+		app := &cli.App{Commands: []*cli.Command{&cmd}}
+		if err := app.Run(append([]string{"devp2p", cmd.Name}, test.args...)); err != nil {
+			t.Fatalf("%v: %v", test.args, err)
+		}
+		if !slices.Equal(register, test.wantRegister) {
+			t.Errorf("%v: register %v, want %v", test.args, register, test.wantRegister)
+		}
+		if !slices.Equal(search, test.wantSearch) {
+			t.Errorf("%v: search %v, want %v", test.args, search, test.wantSearch)
+		}
+		if !slices.Equal(names, test.wantNames) {
+			t.Errorf("%v: names %v, want %v", test.args, names, test.wantNames)
+		}
+	}
+
+	cmd := *discv5ListenCommand
+	cmd.Action = func(ctx *cli.Context) error {
+		_, _, _, err := listenTopics(ctx)
+		return err
+	}
+	app := &cli.App{Commands: []*cli.Command{&cmd}}
+	if err := app.Run([]string{"devp2p", cmd.Name, "--eth-topic", "1/0xbad"}); err == nil {
+		t.Error("invalid --eth-topic accepted")
 	}
 }
 

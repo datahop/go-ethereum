@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"slices"
 	"strings"
@@ -30,10 +31,12 @@ import (
 
 	"github.com/ethereum/go-ethereum/cmd/devp2p/internal/v5test"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/urfave/cli/v2"
 )
 
@@ -89,6 +92,7 @@ var (
 			nodeConfigFlag,
 			topicRegisterFlag,
 			topicSearchFlag,
+			ethTopicFlag,
 			httpAddrFlag,
 		}),
 	}
@@ -106,6 +110,10 @@ var (
 	topicSearchFlag = &cli.StringSliceFlag{
 		Name:  "topic-search",
 		Usage: "Searches a topic, by name (SHA-256) or 0x-prefixed hash, and logs the nodes found",
+	}
+	ethTopicFlag = &cli.StringFlag{
+		Name:  "eth-topic",
+		Usage: "Registers and searches the eth topic of a chain: mainnet, sepolia, hoodi or <chain id>/<0x-prefixed genesis hash>",
 	}
 )
 
@@ -171,9 +179,10 @@ func discv5Listen(ctx *cli.Context) error {
 		extConfig = cfg
 	}
 
-	register := mustParseTopics(ctx.StringSlice(topicRegisterFlag.Name))
-	searchNames := ctx.StringSlice(topicSearchFlag.Name)
-	search := mustParseTopics(searchNames)
+	register, search, searchNames, err := listenTopics(ctx)
+	if err != nil {
+		return err
+	}
 
 	disc, _ := startV5(ctx, extConfig)
 	defer disc.Close()
@@ -202,6 +211,24 @@ func discv5Listen(ctx *cli.Context) error {
 		api.searchTimeout = time.Duration(extConfig.SearchTimeoutSeconds) * time.Second
 	}
 	return runRPCServer(ctx.String(httpAddrFlag.Name), map[string]any{"discv5": api})
+}
+
+// listenTopics returns the topics to register and to search, and the names the
+// searched topics are logged under.
+func listenTopics(ctx *cli.Context) (register, search []topicindex.TopicID, searchNames []string, err error) {
+	register = mustParseTopics(ctx.StringSlice(topicRegisterFlag.Name))
+	searchNames = ctx.StringSlice(topicSearchFlag.Name)
+	search = mustParseTopics(searchNames)
+	if chain := ctx.String(ethTopicFlag.Name); chain != "" {
+		topic, err := parseEthTopic(chain)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		register = append(register, topic)
+		search = append(search, topic)
+		searchNames = append(searchNames, chain)
+	}
+	return register, search, searchNames, nil
 }
 
 // startV5 starts an ephemeral discovery v5 node.
@@ -246,6 +273,28 @@ func parseTopic(s string) (topicindex.TopicID, error) {
 		}
 	}
 	return sha256.Sum256([]byte(s)), nil
+}
+
+// parseEthTopic returns the eth topic of the chain given by s: a network name or
+// <chain id>/<0x-prefixed genesis hash>.
+func parseEthTopic(s string) (topicindex.TopicID, error) {
+	switch s {
+	case "mainnet":
+		return eth.DiscoveryTopic(params.MainnetChainConfig.ChainID, params.MainnetGenesisHash), nil
+	case "sepolia":
+		return eth.DiscoveryTopic(params.SepoliaChainConfig.ChainID, params.SepoliaGenesisHash), nil
+	case "hoodi":
+		return eth.DiscoveryTopic(params.HoodiChainConfig.ChainID, params.HoodiGenesisHash), nil
+	}
+	id, hash, ok := strings.Cut(s, "/")
+	chainID, isNum := new(big.Int).SetString(id, 10)
+	// The chain id must be in canonical decimal form, so that each topic has one spelling.
+	if ok && isNum && chainID.Sign() >= 0 && chainID.String() == id && len(hash) == 66 && strings.HasPrefix(hash, "0x") {
+		if b, err := hex.DecodeString(hash[2:]); err == nil {
+			return eth.DiscoveryTopic(chainID, common.BytesToHash(b)), nil
+		}
+	}
+	return topicindex.TopicID{}, fmt.Errorf("invalid eth topic %q: want mainnet, sepolia, hoodi or <chain id>/<0x-prefixed genesis hash>", s)
 }
 
 func mustParseTopics(names []string) []topicindex.TopicID {
