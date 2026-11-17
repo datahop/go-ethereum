@@ -205,6 +205,11 @@ func (tab *TopicTable) Expire() {
 	tab.expireAt(tab.config.Clock.Now())
 }
 
+// ExpireAt removes registrations that are inactive as of now.
+func (tab *TopicTable) ExpireAt(now mclock.AbsTime) {
+	tab.expireAt(now)
+}
+
 func (tab *TopicTable) expireAt(now mclock.AbsTime) {
 	// Capture Next() before remove; list.Remove nils the element's next/prev
 	// pointers, so e.Next() after remove would return nil.

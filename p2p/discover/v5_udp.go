@@ -1509,6 +1509,7 @@ func (t *UDPv5) handleRegtopic(fromID enode.ID, fromAddr netip.AddrPort, p *v5wi
 	// Attempt to register.
 	var ev AdmissionEvent
 	if waitStatsOn {
+		t.topicTable.ExpireAt(now)
 		ev = AdmissionEvent{AtMs: time.Now().UnixMilli(), Registrar: t.Self().ID(), Advertiser: fromID, Topic: topicindex.TopicID(p.Topic).String(),
 			FromIP: fromAddr.Addr().Unmap().String(), WaitedMs: waitTime.Milliseconds(), Renewal: t.topicTable.IsRegistered(n, p.Topic),
 			RequiredMs: t.topicTable.WaitTimeAt(n, p.Topic, now).Milliseconds(), TopicHeld: t.topicTable.TopicSize(p.Topic)}

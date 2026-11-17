@@ -201,6 +201,49 @@ func TestTopicTableWaitTimeExpired(t *testing.T) {
 	}
 }
 
+// TestTopicTableExpireAtWaitTime checks that after ExpireAt, WaitTimeAt quotes
+// the wait RegisterAt applies when an ad expires at exactly now.
+func TestTopicTableExpireAtWaitTime(t *testing.T) {
+	simclock := new(mclock.Simulated)
+	cfg := testConfig(t)
+	cfg.Clock = simclock
+	tab := NewTopicTable(cfg)
+
+	tab.Add(newNode(), topic1)
+	simclock.Run(time.Minute)
+	for i := 0; i < 9; i++ {
+		tab.Add(newNode(), topic1)
+	}
+	simclock.Run(tab.AdLifetime() - time.Minute)
+	now := simclock.Now()
+	if now != tab.NextExpiryTime() {
+		t.Fatalf("now = %v, want the oldest ad's expiry %v", now, tab.NextExpiryTime())
+	}
+
+	n := newNode()
+	stale := tab.WaitTimeAt(n, topic1, now)
+	if held, _ := tab.Occupancy(); held != 10 {
+		t.Fatalf("before ExpireAt: %d ads held, want 10", held)
+	}
+	tab.ExpireAt(now)
+	if held, _ := tab.Occupancy(); held != 9 {
+		t.Fatalf("after ExpireAt: %d ads held, want 9", held)
+	}
+	req := tab.WaitTimeAt(n, topic1, now)
+	if req >= stale {
+		t.Fatalf("WaitTimeAt after ExpireAt = %v, want below the stale quote %v", req, stale)
+	}
+	if req <= topicTableWaitTimeFloor+time.Second {
+		t.Fatalf("required wait %v too small for the test", req)
+	}
+	if wt := tab.RegisterAt(n, topic1, req-topicTableWaitTimeFloor-time.Second, now); wt == 0 {
+		t.Fatal("RegisterAt admitted a node that waited too little")
+	}
+	if wt := tab.RegisterAt(n, topic1, req, now); wt != 0 {
+		t.Fatalf("RegisterAt with the quoted wait %v returned %v, want 0", req, wt)
+	}
+}
+
 // TestLowerBoundDecay checks the decay and max-aggregation semantics of the
 // per-component lower bound (§6, "Lower Bound").
 func TestLowerBoundDecay(t *testing.T) {
