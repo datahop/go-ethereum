@@ -952,6 +952,11 @@ var (
 		Usage:    "Restricts network communication to the given IP networks (CIDR masks)",
 		Category: flags.NetworkingCategory,
 	}
+	DiscoveryTopicFlag = &cli.BoolFlag{
+		Name:     "discovery.topic",
+		Usage:    "Registers and searches the eth topic in discv5 topic discovery",
+		Category: flags.NetworkingCategory,
+	}
 	DNSDiscoveryFlag = &cli.StringFlag{
 		Name:     "discovery.dns",
 		Usage:    "Sets DNS discovery entry points (use \"\" to disable DNS)",
@@ -1786,6 +1791,12 @@ func setTransactionHistory(ctx *cli.Context, cfg *ethconfig.Config) {
 	}
 }
 
+func setDiscoveryTopic(ctx *cli.Context, cfg *ethconfig.Config) {
+	if ctx.IsSet(DiscoveryTopicFlag.Name) {
+		cfg.DiscoveryTopic = ctx.Bool(DiscoveryTopicFlag.Name)
+	}
+}
+
 // SetEthConfig applies eth-related command line flags to the config.
 func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	// Avoid conflicting network flags
@@ -1995,6 +2006,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 			cfg.EthDiscoveryURLs = SplitAndTrim(urls)
 		}
 	}
+	setDiscoveryTopic(ctx, cfg)
 	if ctx.IsSet(SnapV2Flag.Name) {
 		cfg.SnapV2 = ctx.Bool(SnapV2Flag.Name)
 	}

@@ -17,8 +17,13 @@
 package eth
 
 import (
+	"crypto/sha256"
+	"math/big"
+
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/forkid"
+	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/rlp"
 )
@@ -78,4 +83,11 @@ func NewNodeFilter(chain *core.BlockChain) func(*enode.Node) bool {
 		err := filter(entry.ForkID)
 		return err == nil
 	}
+}
+
+// DiscoveryTopic returns the discv5 topic of the eth protocol on the given chain:
+// SHA-256 of "eth/<chain id>/<genesis hash>", with the chain id in decimal and the
+// hash 0x-prefixed.
+func DiscoveryTopic(chainID *big.Int, genesis common.Hash) topicindex.TopicID {
+	return sha256.Sum256([]byte("eth/" + chainID.String() + "/" + genesis.Hex()))
 }

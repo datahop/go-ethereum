@@ -23,6 +23,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		HistoryMode             history.HistoryPolicy
 		EthDiscoveryURLs        []string
 		SnapDiscoveryURLs       []string
+		DiscoveryTopic          bool
 		NoPruning               bool
 		NoPrefetch              bool
 		NoPrecompileCache       bool
@@ -80,6 +81,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.HistoryMode = c.HistoryMode
 	enc.EthDiscoveryURLs = c.EthDiscoveryURLs
 	enc.SnapDiscoveryURLs = c.SnapDiscoveryURLs
+	enc.DiscoveryTopic = c.DiscoveryTopic
 	enc.NoPruning = c.NoPruning
 	enc.NoPrefetch = c.NoPrefetch
 	enc.NoPrecompileCache = c.NoPrecompileCache
@@ -141,6 +143,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		HistoryMode             *history.HistoryPolicy
 		EthDiscoveryURLs        []string
 		SnapDiscoveryURLs       []string
+		DiscoveryTopic          *bool
 		NoPruning               *bool
 		NoPrefetch              *bool
 		NoPrecompileCache       *bool
@@ -212,6 +215,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.SnapDiscoveryURLs != nil {
 		c.SnapDiscoveryURLs = dec.SnapDiscoveryURLs
+	}
+	if dec.DiscoveryTopic != nil {
+		c.DiscoveryTopic = *dec.DiscoveryTopic
 	}
 	if dec.NoPruning != nil {
 		c.NoPruning = *dec.NoPruning

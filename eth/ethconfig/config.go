@@ -103,6 +103,9 @@ type Config struct {
 	EthDiscoveryURLs  []string
 	SnapDiscoveryURLs []string
 
+	// DiscoveryTopic registers and searches the eth topic in discv5 topic discovery.
+	DiscoveryTopic bool
+
 	// State options.
 	NoPruning         bool // Whether to disable pruning and flush everything to disk
 	NoPrefetch        bool // Whether to disable prefetching and only load state on demand

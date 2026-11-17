@@ -155,6 +155,26 @@ func TestSetTransactionHistory(t *testing.T) {
 	}
 }
 
+func TestSetDiscoveryTopic(t *testing.T) {
+	tests := []struct {
+		args []string
+		toml bool // DiscoveryTopic from the config file
+		want bool
+	}{
+		{want: false},
+		{toml: true, want: true},
+		{args: []string{"--discovery.topic"}, want: true},
+		{args: []string{"--discovery.topic=false"}, toml: true, want: false},
+	}
+	for _, test := range tests {
+		cfg := ethconfig.Config{DiscoveryTopic: test.toml}
+		setDiscoveryTopic(newTestContext(t, test.args, DiscoveryTopicFlag), &cfg)
+		if cfg.DiscoveryTopic != test.want {
+			t.Errorf("args %v, config %v: DiscoveryTopic = %v, want %v", test.args, test.toml, cfg.DiscoveryTopic, test.want)
+		}
+	}
+}
+
 func newTestContext(t *testing.T, args []string, flags ...cli.Flag) *cli.Context {
 	t.Helper()
 

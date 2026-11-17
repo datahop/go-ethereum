@@ -57,6 +57,7 @@ import (
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/discover/topicindex"
 	"github.com/ethereum/go-ethereum/p2p/dnsdisc"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
@@ -595,9 +596,30 @@ func (s *Ethereum) setupDiscovery() error {
 		iter := enode.Filter(s.p2pServer.DiscoveryV5().RandomNodes(), filter)
 		iter = enode.NewBufferIter(iter, discoveryPrefetchBuffer)
 		s.discmix.AddSource(iter)
+
+		if topic, ok := discv5Topic(s.config, s.blockchain.Config(), s.blockchain.Genesis().Hash()); ok {
+			s.p2pServer.DiscoveryV5().RegisterTopic(topic, 0)
+			iter := enode.Filter(s.p2pServer.DiscoveryV5().TopicSearch(topic, 0), filter)
+			iter = enode.NewBufferIter(iter, discoveryPrefetchBuffer)
+			s.discmix.AddSource(enode.WithSourceName("discv5-topic", iter))
+		}
+	} else if s.config.DiscoveryTopic {
+		log.Warn("Topic discovery requires discv5, ignoring", "flag", "discovery.topic")
 	}
 
 	return nil
+}
+
+// discv5Topic returns the eth topic and whether to register and search it.
+func discv5Topic(config *ethconfig.Config, chain *params.ChainConfig, genesis common.Hash) (topicindex.TopicID, bool) {
+	if !config.DiscoveryTopic {
+		return topicindex.TopicID{}, false
+	}
+	if chain.ChainID == nil {
+		log.Warn("Topic discovery requires a chain ID, ignoring", "flag", "discovery.topic")
+		return topicindex.TopicID{}, false
+	}
+	return eth.DiscoveryTopic(chain.ChainID, genesis), true
 }
 
 // Stop implements node.Lifecycle, terminating all internal goroutines used by the
