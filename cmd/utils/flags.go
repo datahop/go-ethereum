@@ -294,10 +294,10 @@ var (
 		Category: flags.StateCategory,
 	}
 	SnapV2Flag = &cli.BoolFlag{
-		Name:     "snap.v2",
-		Usage:    "Enable the experimental snap/2 (EIP-8189, BAL-based) sync protocol (advertises and syncs via snap/2; not safe on public networks)",
-		Value:    ethconfig.Defaults.SnapV2,
-		Category: flags.StateCategory,
+		Name:        "snap.v2",
+		Usage:       "Enable or disable the snap/2 (EIP-8189, BAL-based) state syncer, which needs Amsterdam active",
+		DefaultText: "automatic",
+		Category:    flags.StateCategory,
 	}
 	BinTrieGroupDepthFlag = &cli.IntFlag{
 		Name:     "bintrie.groupdepth",
@@ -2008,7 +2008,8 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	setDiscoveryTopic(ctx, cfg)
 	if ctx.IsSet(SnapV2Flag.Name) {
-		cfg.SnapV2 = ctx.Bool(SnapV2Flag.Name)
+		snapV2 := ctx.Bool(SnapV2Flag.Name)
+		cfg.SnapV2 = &snapV2
 	}
 	// Override any default configs for hard coded networks.
 	switch {
