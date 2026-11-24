@@ -47,6 +47,8 @@ const (
 	totalNodesResponseLimit = 5  // applies in waitForNodes
 	regtopicNodesLimit      = 8
 	topicNodesResultLimit   = topicindex.TopicNodesLimit // applies in TOPICQUERY handler
+	auxENRLimit             = 8                          // auxiliary ENRs kept per TOPICQUERY
+	topicQueryRespLimit     = topicNodesResultLimit + auxENRLimit
 )
 
 // codecV5 is implemented by v5wire.Codec (and testCodec).
@@ -663,8 +665,10 @@ func (t *UDPv5) topicQuery(quit <-chan struct{}, n *enode.Node, topic topicindex
 		packets    int // all packets delivered, of any type
 		total      = -1
 	)
+	// The reply is complete only if the whole announced total arrives. Reaching
+	// topicQueryRespLimit first ends it early with errTooManyResponses.
 	for result.err == nil && (total < 0 || received < total) {
-		if packets >= topicNodesResultLimit {
+		if packets >= topicQueryRespLimit {
 			result.err = errTooManyResponses
 			break
 		}
@@ -677,11 +681,11 @@ func (t *UDPv5) topicQuery(quit <-chan struct{}, n *enode.Node, topic topicindex
 			switch resp := responseMsg.(type) {
 			case *v5wire.Nodes:
 				if total == -1 {
-					total = min(int(resp.RespCount), topicNodesResultLimit)
+					total = int(resp.RespCount)
 				}
 				received++
 				for _, record := range resp.Nodes {
-					if len(auxNodes) >= topicNodesResultLimit {
+					if len(auxNodes) >= auxENRLimit {
 						break
 					}
 					node, err := t.verifyResponseNode(c, record, nil, auxSeen)
@@ -693,7 +697,7 @@ func (t *UDPv5) topicQuery(quit <-chan struct{}, n *enode.Node, topic topicindex
 				}
 			case *v5wire.TopicNodes:
 				if total == -1 {
-					total = min(int(resp.RespCount), topicNodesResultLimit)
+					total = int(resp.RespCount)
 				}
 				received++
 				for _, record := range resp.Nodes {

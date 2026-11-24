@@ -19,6 +19,7 @@ package discover
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"errors"
 	"net"
 	"net/netip"
 	"slices"
@@ -771,6 +772,63 @@ func TestTopicSearchTimeoutNotReasked(t *testing.T) {
 	}
 }
 
+// TestTopicSearchQueryCapLiveness checks a TOPICQUERY reply that reaches the
+// packet limit before its announced total: without records the registrar
+// fails and keeps its failure count, with records its failures are cleared.
+func TestTopicSearchQueryCapLiveness(t *testing.T) {
+	t.Parallel()
+
+	emptyTopicNodes := func(count, total int) (packets []v5wire.Packet) {
+		for i := 0; i < count; i++ {
+			packets = append(packets, &v5wire.TopicNodes{RespCount: uint8(total)})
+		}
+		return packets
+	}
+	for _, tt := range []struct {
+		name    string
+		packets []v5wire.Packet
+		failed  bool
+	}{
+		{"without records", emptyTopicNodes(topicQueryRespLimit, 40), true},
+		{"with records", topicQueryPackets(auxENRLimit, topicNodesResultLimit, 40), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			test := newUDPV5Test(t)
+			defer test.close()
+
+			key := newkey()
+			ln := test.getNode(key, netip.MustParseAddrPort("10.0.2.57:30303"))
+			ln.Set(topicindex.TopicDiscoveryVersion)
+			n := ln.Node()
+			test.table.addFoundNode(n, true)
+			test.db.UpdateFindFails(n.ID(), n.IPAddr(), 1)
+
+			it := test.udp.TopicSearch(testTopic1, 0)
+			defer it.Close()
+			test.waitPacketOut(func(p *v5wire.TopicQuery, a netip.AddrPort, _ v5wire.Nonce) {
+				for _, packet := range tt.packets {
+					packet.SetRequestID(p.ReqID)
+					test.packetInFrom(key, a, packet)
+				}
+			})
+			if !tt.failed {
+				waitForCond(t, "partial reply cleared the wire-failure tally", func() bool {
+					return test.db.FindFails(n.ID(), n.IPAddr()) == 0
+				})
+				return
+			}
+			// The next pass starts after a gap of 2*regloopMinTime and skips the node.
+			time.Sleep(2*regloopMinTime + time.Second)
+			if q := pipeQueued(test); q != 0 {
+				t.Fatalf("%d packets sent to a failed node", q)
+			}
+			if fails := test.db.FindFails(n.ID(), n.IPAddr()); fails != 1 {
+				t.Fatalf("wire failures %d after the capped reply, want 1", fails)
+			}
+		})
+	}
+}
+
 func pipeQueued(test *udpV5Test) int {
 	test.pipe.mu.Lock()
 	defer test.pipe.mu.Unlock()
@@ -838,6 +896,54 @@ func TestTopicRegSuccessResetsFailures(t *testing.T) {
 		})
 	})
 	waitForCond(t, "successful REGTOPIC reset the wire-failure tally", func() bool {
+		return test.db.FindFails(n.ID(), n.IPAddr()) == 0
+	})
+}
+
+// TestTopicRegConfirmedErrorResetsFailures checks that a REGTOPIC that got its
+// REGCONFIRMATION and then ended in an error other than a timeout still resets
+// the registrar's wire-failure counter.
+func TestTopicRegConfirmedErrorResetsFailures(t *testing.T) {
+	t.Parallel()
+	test := newUDPV5Test(t)
+	defer test.close()
+
+	ln := test.getNode(newkey(), netip.MustParseAddrPort("10.0.3.46:30303"))
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	n := ln.Node()
+	test.db.UpdateFindFails(n.ID(), n.IPAddr(), 1)
+
+	// Drive the registration loop by hand: the test takes the sender's place.
+	sys := test.udp.topicSys
+	reg := &topicReg{
+		state:       topicindex.NewRegistration(testTopic1, sys.config),
+		clock:       sys.config.Clock,
+		quit:        make(chan struct{}),
+		regRequest:  make(chan topicRegJob, regSenders),
+		regResponse: make(chan topicRegResult),
+		evictCh:     make(chan enode.ID, 1),
+		newNodesCh:  make(chan *enode.Node, 1),
+	}
+	reg.state.AddNodes(nil, []*enode.Node{n})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reg.runRegistration(sys)
+	}()
+	defer func() { close(reg.quit); <-done }()
+
+	var job topicRegJob
+	select {
+	case job = <-reg.regRequest:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no registration attempt")
+	}
+	reg.regResponse <- topicRegResult{
+		msg: &v5wire.Regconfirmation{Ticket: []byte("ticket"), WaitTime: 1000},
+		err: errors.New("broken reply"),
+		att: job.attempt,
+	}
+	waitForCond(t, "confirmed REGTOPIC reset the wire-failure tally", func() bool {
 		return test.db.FindFails(n.ID(), n.IPAddr()) == 0
 	})
 }

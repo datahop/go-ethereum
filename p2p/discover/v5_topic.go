@@ -328,7 +328,11 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			}
 			if resp.err != nil {
 				reg.state.HandleErrorResponse(resp.att, resp.err)
-				if resp.err == errTimeout {
+				switch {
+				case resp.msg != nil:
+					// The registrar confirmed before the error: it answered.
+					sys.transport.trackTopicRequest(resp.att.Node, true)
+				case resp.err == errTimeout:
 					// Count the timeout toward the global eviction counter
 					sys.transport.trackTopicRequest(resp.att.Node, false)
 				}

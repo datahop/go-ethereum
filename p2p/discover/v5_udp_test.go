@@ -660,7 +660,7 @@ func TestUDPv5_TopicQueryUnexpectedPackets(t *testing.T) {
 
 	done := test.startTopicQuery()
 	test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {
-		for i := 0; i < topicNodesResultLimit; i++ {
+		for i := 0; i < topicQueryRespLimit; i++ {
 			test.packetIn(&v5wire.TalkResponse{ReqID: p.ReqID})
 		}
 	})
@@ -673,57 +673,101 @@ func TestUDPv5_TopicQueryUnexpectedPackets(t *testing.T) {
 	}
 }
 
-// This test checks that records received before TOPICQUERY reaches the packet limit
-// are returned with the error.
+// topicQueryPackets returns one NODES packet per aux node and one TOPICNODES
+// packet per topic node, each announcing total.
+func topicQueryPackets(aux, topic, total int) (packets []v5wire.Packet) {
+	nodes := nodesAtDistance(enode.ID(testTopic1), 200, aux+topic)
+	for _, n := range nodes[:aux] {
+		packets = append(packets, &v5wire.Nodes{RespCount: uint8(total), Nodes: []*enr.Record{n.Record()}})
+	}
+	for _, n := range nodes[aux:] {
+		packets = append(packets, &v5wire.TopicNodes{RespCount: uint8(total), Nodes: []*enr.Record{n.Record()}})
+	}
+	return packets
+}
+
+// This test checks that a TOPICQUERY reply reaching the packet limit before its
+// announced total ends with an error and keeps the records received so far.
 func TestUDPv5_TopicQueryPartialAtLimit(t *testing.T) {
 	t.Parallel()
-	test := newUDPV5Test(t)
-	defer test.close()
 
-	nodes := nodesAtDistance(enode.ID(testTopic1), 200, 2)
-	done := test.startTopicQuery()
-	test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {
-		test.packetIn(&v5wire.Nodes{ReqID: p.ReqID, RespCount: 16, Nodes: []*enr.Record{nodes[0].Record()}})
-		test.packetIn(&v5wire.TopicNodes{ReqID: p.ReqID, RespCount: 16, Nodes: []*enr.Record{nodes[1].Record()}})
-		for i := 0; i < 14; i++ {
-			test.packetIn(&v5wire.TalkResponse{ReqID: p.ReqID})
+	talk := func(count int) (packets []v5wire.Packet) {
+		for i := 0; i < count; i++ {
+			packets = append(packets, &v5wire.TalkResponse{})
 		}
-	})
-	res := <-done
-	if res.err != errTooManyResponses {
-		t.Fatalf("want errTooManyResponses, got %v", res.err)
+		return packets
 	}
-	if len(res.auxNodes) != 1 || len(res.topicNodes) != 1 {
-		t.Fatalf("got %d aux and %d topic nodes, want 1 and 1", len(res.auxNodes), len(res.topicNodes))
+	emptyTopicNodes := func(count, total int) (packets []v5wire.Packet) {
+		for i := 0; i < count; i++ {
+			packets = append(packets, &v5wire.TopicNodes{RespCount: uint8(total)})
+		}
+		return packets
+	}
+
+	for _, tt := range []struct {
+		name               string
+		packets            []v5wire.Packet
+		wantAux, wantTopic int
+	}{
+		{"records then unexpected types", slices.Concat(topicQueryPackets(1, 1, topicQueryRespLimit), talk(topicQueryRespLimit-2)), 1, 1},
+		{"total above the limit without records", emptyTopicNodes(topicQueryRespLimit, 40), 0, 0},
+		{"total above the limit with records", topicQueryPackets(auxENRLimit, topicNodesResultLimit, 40), auxENRLimit, topicNodesResultLimit},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// The clock is never advanced, so only the packet limit can end these calls.
+			test := newUDPV5TestClock(t, new(mclock.Simulated))
+			defer test.close()
+
+			done := test.startTopicQuery()
+			test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {
+				for _, packet := range tt.packets {
+					packet.SetRequestID(p.ReqID)
+					test.packetIn(packet)
+				}
+			})
+			var res topicQueryResult
+			select {
+			case res = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("call did not finish at the packet limit")
+			}
+			if res.err != errTooManyResponses {
+				t.Fatalf("want errTooManyResponses, got %v", res.err)
+			}
+			if len(res.auxNodes) != tt.wantAux || len(res.topicNodes) != tt.wantTopic {
+				t.Fatalf("got %d aux and %d topic nodes, want %d and %d", len(res.auxNodes), len(res.topicNodes), tt.wantAux, tt.wantTopic)
+			}
+		})
 	}
 }
 
 // This test checks that a TOPICQUERY reply of the announced size finishes without
-// error, also when the size equals the packet limit.
+// error, also when the size equals the packet limit, and that at most auxENRLimit
+// aux nodes are kept.
 func TestUDPv5_TopicQueryAnnouncedTotal(t *testing.T) {
 	t.Parallel()
 	test := newUDPV5Test(t)
 	defer test.close()
 
-	for _, tt := range []struct{ announced, packets int }{
-		{2, 2},
-		{topicNodesResultLimit, topicNodesResultLimit},
-		{200, topicNodesResultLimit}, // a total above the cap is complete at the cap
+	for _, tt := range []struct{ aux, topic, wantAux int }{
+		{1, 1, 1},
+		{auxENRLimit, topicNodesResultLimit, auxENRLimit}, // one record per packet up to the limit
+		{auxENRLimit + 4, 0, auxENRLimit},
 	} {
-		nodes := nodesAtDistance(enode.ID(testTopic1), 200, tt.packets)
+		total := tt.aux + tt.topic
 		done := test.startTopicQuery()
 		test.waitPacketOut(func(p *v5wire.TopicQuery, _ netip.AddrPort, _ v5wire.Nonce) {
-			test.packetIn(&v5wire.Nodes{ReqID: p.ReqID, RespCount: uint8(tt.announced), Nodes: []*enr.Record{nodes[0].Record()}})
-			for _, n := range nodes[1:] {
-				test.packetIn(&v5wire.TopicNodes{ReqID: p.ReqID, RespCount: uint8(tt.announced), Nodes: []*enr.Record{n.Record()}})
+			for _, packet := range topicQueryPackets(tt.aux, tt.topic, total) {
+				packet.SetRequestID(p.ReqID)
+				test.packetIn(packet)
 			}
 		})
 		res := <-done
 		if res.err != nil {
-			t.Fatalf("announced %d: unexpected error: %v", tt.announced, res.err)
+			t.Fatalf("announced %d: unexpected error: %v", total, res.err)
 		}
-		if len(res.auxNodes) != 1 || len(res.topicNodes) != tt.packets-1 {
-			t.Fatalf("announced %d: got %d aux and %d topic nodes", tt.announced, len(res.auxNodes), len(res.topicNodes))
+		if len(res.auxNodes) != tt.wantAux || len(res.topicNodes) != tt.topic {
+			t.Fatalf("announced %d: got %d aux and %d topic nodes, want %d and %d", total, len(res.auxNodes), len(res.topicNodes), tt.wantAux, tt.topic)
 		}
 	}
 }
