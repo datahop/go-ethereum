@@ -570,6 +570,133 @@ func TestTopicRegNodeTableUpdates(t *testing.T) {
 	})
 }
 
+// TestTopicRegRefill checks that a registrar dropped after its ad expired is
+// asked again after regRefillInterval while another ad keeps the registration
+// running, with no new routing-table node events.
+func TestTopicRegRefill(t *testing.T) {
+	t.Parallel()
+	clock := new(mclock.Simulated)
+	test := newUDPV5TestClock(t, clock)
+	defer test.close()
+
+	// Fire zero-delay timers without moving the clock.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Millisecond):
+				clock.Run(0)
+			}
+		}
+	}()
+
+	key1, addr1 := newkey(), netip.MustParseAddrPort("10.0.4.1:30303")
+	key2, addr2 := newkey(), netip.MustParseAddrPort("10.0.5.1:30303")
+	for _, n := range []struct {
+		key  *ecdsa.PrivateKey
+		addr netip.AddrPort
+	}{{key1, addr1}, {key2, addr2}} {
+		ln := test.getNode(n.key, n.addr)
+		ln.Set(topicindex.TopicDiscoveryVersion)
+		test.table.addFoundNode(ln.Node(), true)
+	}
+	test.udp.RegisterTopic(testTopic1, 1)
+
+	// addr1's ad lasts the full lifetime, addr2's expires after 5s.
+	for range 2 {
+		test.waitPacketOut(func(p *v5wire.Regtopic, addr netip.AddrPort, _ v5wire.Nonce) {
+			key, wt := key1, uint(900000)
+			if addr == addr2 {
+				key, wt = key2, 5000
+			}
+			test.packetInFrom(key, addr, &v5wire.Regconfirmation{ReqID: p.ReqID, WaitTime: wt})
+		})
+	}
+
+	for range 5 {
+		clock.Run(10 * time.Second)
+		time.Sleep(50 * time.Millisecond)
+	}
+	if q := pipeQueued(test); q != 0 {
+		t.Fatalf("%d packets sent before the refill interval", q)
+	}
+
+	clock.Run(10 * time.Second)
+	test.waitPacketOut(func(p *v5wire.Regtopic, addr netip.AddrPort, _ v5wire.Nonce) {
+		if addr != addr2 {
+			t.Fatalf("REGTOPIC sent to wrong node: got %v, want %v", addr, addr2)
+		}
+	})
+}
+
+// TestTopicRegRefillTableLocked checks that a refill does not stall the
+// registration loop while the table holds its mutex and waits for the loop to
+// drain the node feed, and that the registration can still be stopped.
+func TestTopicRegRefillTableLocked(t *testing.T) {
+	t.Parallel()
+	clock := new(mclock.Simulated)
+	test := newUDPV5TestClock(t, clock)
+	defer test.close()
+
+	// Fire zero-delay timers without moving the clock.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Millisecond):
+				clock.Run(0)
+			}
+		}
+	}()
+
+	key, addr := newkey(), netip.MustParseAddrPort("10.0.4.1:30303")
+	ln := test.getNode(key, addr)
+	ln.Set(topicindex.TopicDiscoveryVersion)
+	test.table.addFoundNode(ln.Node(), true)
+	test.udp.RegisterTopic(testTopic1, 1)
+	test.waitPacketOut(func(p *v5wire.Regtopic, _ netip.AddrPort, _ v5wire.Nonce) {
+		test.packetInFrom(key, addr, &v5wire.Regconfirmation{ReqID: p.ReqID, WaitTime: 900000})
+	})
+
+	// Fire the refill with the table mutex held, then send more node events
+	// than newNodesCh buffers, as nodeAdded does under the mutex.
+	other := test.getNode(newkey(), netip.MustParseAddrPort("10.0.5.1:30303")).Node()
+	test.table.mutex.Lock()
+	clock.Run(regRefillInterval)
+	time.Sleep(50 * time.Millisecond)
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		for range 200 {
+			test.table.nodeFeed.Send(other)
+		}
+	}()
+	select {
+	case <-sent:
+	case <-time.After(5 * time.Second):
+		t.Error("registration loop stopped draining node events during refill")
+	}
+	test.table.mutex.Unlock()
+	<-sent
+
+	stopped := make(chan struct{})
+	go func() {
+		test.udp.StopRegisterTopic(testTopic1)
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopRegisterTopic did not return")
+	}
+}
+
 // TestTopicDiscoveryENRFlag verifies that the topic-discovery ENR entry is
 // set on nodes and that the support check works correctly.
 func TestTopicDiscoveryENRFlag(t *testing.T) {

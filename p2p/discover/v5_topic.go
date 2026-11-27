@@ -244,6 +244,11 @@ func shuffleNodes(nodes []*enode.Node) {
 
 const regloopMinTime = 2 * time.Second
 
+// regRefillInterval is how often a running registration offers the routing
+// table to the registration table again, so registrars dropped after their ad
+// expired come back without waiting for the table to empty.
+const regRefillInterval = time.Minute
+
 // pause ensures that top-level registration loop iterations take at least regLoopMinTime.
 // This prevents the loop from running too hot when the local node table is very empty.
 func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
@@ -269,6 +274,10 @@ func (reg *topicReg) pause(lastTime mclock.AbsTime) bool {
 
 func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 	updateEv := mclock.NewAlarm(reg.clock)
+	refillEv := mclock.NewAlarm(reg.clock)
+	defer refillEv.Stop()
+	refillEv.Schedule(reg.clock.Now().Add(regRefillInterval))
+	refillCh := make(chan []*enode.Node, 1)
 
 	for {
 		if reg.state.NodeCount() == 0 {
@@ -292,6 +301,19 @@ func (reg *topicReg) runRegistration(sys *topicSystem) (exit bool) {
 			if topicindex.SupportsTopicDiscovery(n) {
 				reg.state.AddNodes(nil, []*enode.Node{n})
 			}
+
+		case <-refillEv.C():
+			if len(reg.state.BucketsWithFreeSpace(nil)) == 0 {
+				refillEv.Schedule(reg.clock.Now().Add(regRefillInterval))
+				continue
+			}
+			// Off the loop: the table holds its mutex while it sends on newNodesCh.
+			go func() { refillCh <- filterTopicDiscovery(sys.transport.tab.allNodes()) }()
+
+		case nodes := <-refillCh:
+			shuffleNodes(nodes)
+			reg.state.AddNodes(nil, nodes)
+			refillEv.Schedule(reg.clock.Now().Add(regRefillInterval))
 
 		case id := <-reg.evictCh:
 			reg.state.RemoveNode(id)
